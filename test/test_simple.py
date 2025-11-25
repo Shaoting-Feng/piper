@@ -42,6 +42,3 @@ grad_ref = actors[1].backward_compile.remote(stage_id=1, mb_idx=None, inp=grad_r
 grad_ref = actors[0].backward_compile.remote(stage_id=0, mb_idx=None, inp=grad_ref)
 
 ray.wait([grad_ref])
-
-import time
-time.sleep(2) # wait for logs to print
