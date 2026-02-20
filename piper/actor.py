@@ -586,6 +586,63 @@ class PiperActor:
         reverse_edges = construct_reverse_graph(output_nodes)
         param_groups = get_param_groups(input_nodes, param_nodes, reverse_edges)
 
+        pgs = param_groups
+        with_int = [pg for pg in pgs if pg.get("intermediates")]
+        self.logger.info(
+            f"stage {stage_id} mb {mb_idx}: groups={len(pgs)} with_intermediates={len(with_int)} "
+            f"intermediates_sizes={[len(pg.get('intermediates', [])) for pg in with_int]}"
+        )
+
+        # Check if any intermediate Node object appears in >1 group (should be 0)
+        seen = set()
+        overlap = 0
+        for pg in pgs:
+            for n in (pg.get("intermediates", []) or []):
+                k = id(n)
+                overlap += int(k in seen)
+                seen.add(k)
+        self.logger.info(f"stage {stage_id} mb {mb_idx}: intermediate_overlaps={overlap}")
+
+        def ancestors(start_nodes, reverse_edges):
+            # reverse_edges: dict[node] -> list[node]
+            seen = set()
+            stack = list(start_nodes)
+            while stack:
+                n = stack.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                for p in reverse_edges.get(n, []):
+                    stack.append(p)
+            return seen
+
+        # Build ancestor sets for a handful of groups (keep it cheap)
+        anc_sets = []
+        for pg in pgs[:10]:  # sample first 10 groups
+            ints = pg.get("intermediates", [])
+            anc_sets.append(ancestors(ints, reverse_edges))
+
+        shared = 0
+        for i in range(len(anc_sets)):
+            for j in range(i + 1, len(anc_sets)):
+                shared += int(len(anc_sets[i].intersection(anc_sets[j])) > 0)
+
+        self.logger.info(f"stage {stage_id} mb {mb_idx}: sampled_pairs_with_shared_ancestors={shared}")
+
+        self.logger.info(
+            f"stage {stage_id} mb {mb_idx}: stage_params="
+            f"{len(stage_params)} unique={len({id(p) for p in stage_params})} "
+            f"leaf={sum(int(p.is_leaf) for p in stage_params)} "
+            f"has_grad_fn={sum(int(p.grad_fn is not None) for p in stage_params)}"
+        )
+
+        # also log the grad-acc node ids you group on
+        nodes = [ _get_grad_fn_or_grad_acc(p) for p in stage_params ]
+        self.logger.info(
+            f"stage {stage_id} mb {mb_idx}: param_nodes="
+            f"{sum(n is not None for n in nodes)} unique={len({id(n) for n in nodes if n is not None})}"
+        )
+
         # Hooks to capture grads at intermediate nodes. In backward_weight,
         # we'll backprop from these intermediate values
         handles = []
@@ -711,6 +768,20 @@ class PiperActor:
             grad_acc_to_weight[node] = param
 
         param_groups = self._bw_param_groups[stage_id][mb_idx]
+
+        self.logger.info(
+            f"stage {stage_id} mb {mb_idx}: stage_params="
+            f"{len(stage_params)} unique={len({id(p) for p in stage_params})} "
+            f"leaf={sum(int(p.is_leaf) for p in stage_params)} "
+            f"has_grad_fn={sum(int(p.grad_fn is not None) for p in stage_params)}"
+        )
+
+        # also log the grad-acc node ids you group on
+        nodes = [ _get_grad_fn_or_grad_acc(p) for p in stage_params ]
+        self.logger.info(
+            f"stage {stage_id} mb {mb_idx}: param_nodes="
+            f"{sum(n is not None for n in nodes)} unique={len({id(n) for n in nodes if n is not None})}"
+        )
 
         # Perform the weight updates separately for each param_group, beginning
         # backprop from each the intermediate node(s) of each group

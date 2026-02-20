@@ -1,3 +1,5 @@
+from . import patches
+
 import ray
 import torch
 from piper.actor import PiperActor
