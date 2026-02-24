@@ -8,7 +8,7 @@ import itertools
 
 from torch._dynamo.backends.debugging import eager
 
-from .piper_actor import _create_actors
+from .piper_overlap_actor import _create_actors
 from .piper_utils import piper_metadata, create_logger, LOG_LEVEL
 from .piper_exec import CompType, Schedule2D, Task
 from .piper import piper
@@ -125,6 +125,7 @@ def piper_setup(
     """
 
     stage_to_device = schedule.stage_to_device()
+    assert len(stage_to_device) > 0
     piper_metadata.stage_to_device = stage_to_device
 
     num_mbs = schedule.num_mbs()
@@ -138,7 +139,8 @@ def piper_setup(
         stage_to_device=stage_to_device
     )
     _create_actors(
-        num_devices, optim_fn, num_mbs, num_stages, p2p_schedules, naive_gradient_sync
+        num_devices, optim_fn, num_mbs, num_stages, p2p_schedules, naive_gradient_sync,
+        profile=True, mode="sequential",
     )
 
     last_stage_rank = stage_to_device[num_stages - 1]

@@ -57,7 +57,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
         ctx.actor_self = piper_metadata.actor_self
         ctx.group = ctx.actor_self.dp_group
         ctx.global_rank = ctx.actor_self.global_rank
-        ctx.stream = ctx.actor_self.a2a_stream
+        ctx.stream = ctx.actor_self.comp_stream
 
         logger.debug(f"Dispatch AllToAllSingleFunction forward rank={ctx.global_rank}, shape={input_tensor.shape}")
         
