@@ -778,7 +778,7 @@ class PiperActor:
             for i, inp in zip(self.input_idxs[fwd_stage_id], self.inputs):
                 self.forward_args[fwd_stage_id][i] = inp
         else:
-            self._exec_p2p_op(fwd_stage_id - 1, fwd_stage_id, fwd_mb_idx, False, p2p_stream=fwd_p2p_stream)
+            self._exec_p2p_op(fwd_stage_id - 1, fwd_stage_id, fwd_mb_idx, False, None, p2p_stream=fwd_p2p_stream)
             inputs_from_prev_stage = self.p2p_cache.pop(
                 (fwd_stage_id - 1, fwd_stage_id, fwd_mb_idx, False)
             )
@@ -813,7 +813,7 @@ class PiperActor:
         # PREPARE BACKWARD PASS
         out_activation = self.out_activation[bwd_stage_id][bwd_mb_idx]
         if bwd_stage_id < self.num_stages - 1:
-            self._exec_p2p_op(bwd_stage_id + 1, bwd_stage_id, bwd_mb_idx, False, p2p_stream=bwd_p2p_stream)
+            self._exec_p2p_op(bwd_stage_id + 1, bwd_stage_id, bwd_mb_idx, False, None, p2p_stream=bwd_p2p_stream)
 
             input_grad = self.p2p_cache.pop(
                 (bwd_stage_id + 1, bwd_stage_id, bwd_mb_idx, False)
@@ -863,11 +863,11 @@ class PiperActor:
             send_p2p_op = (fwd_stage_id, fwd_stage_id + 1, fwd_mb_idx, True)
             assert send_p2p_op not in self.p2p_cache
             self.p2p_cache[send_p2p_op] = output
-            self._exec_p2p_op(fwd_stage_id, fwd_stage_id + 1, fwd_mb_idx, True, p2p_stream=fwd_p2p_stream)
+            self._exec_p2p_op(fwd_stage_id, fwd_stage_id + 1, fwd_mb_idx, True, None, p2p_stream=fwd_p2p_stream)
 
         # POST BACKWARD P2P OPERATIONS
         if bwd_stage_id > 0:
-            self._exec_p2p_op(bwd_stage_id, bwd_stage_id - 1, bwd_mb_idx, True, p2p_stream=bwd_p2p_stream)
+            self._exec_p2p_op(bwd_stage_id, bwd_stage_id - 1, bwd_mb_idx, True, None, p2p_stream=bwd_p2p_stream)
 
         if CLEANUP_MEMORY:
             gc.collect()
@@ -890,7 +890,7 @@ class PiperActor:
                         )
 
     def _update(self, *deps):
-        self._wait_pending_sends()
+        # self._wait_pending_sends()
         self.logger.debug(f"Actor {self.global_rank} waiting for backward sync events")
 
         # if dp degree > 1, make sure all gradients are synchronized before optimizer step
