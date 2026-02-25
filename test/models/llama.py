@@ -99,6 +99,20 @@ LLAMA_8B = ModelArgs(
     max_seq_len=2048,
 )
 
+LLAMA_70B = ModelArgs(
+    dim=8192,
+    n_layers=80,
+    n_heads=64,
+    n_kv_heads=8,          # GQA (Grouped Query Attention)
+    vocab_size=128256,
+    multiple_of=4096,
+    ffn_dim_multiplier=1.3,
+    norm_eps=1e-5,
+    rope_theta=500000,
+    max_batch_size=32,
+    max_seq_len=8192,      # Llama 3 default context length
+)
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
