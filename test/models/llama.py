@@ -401,15 +401,18 @@ class Transformer(nn.Module):
         )
         log_size(self.output)
 
-        self.freqs_cis = precompute_freqs_cis(
+        # Register freq_cis and mask as buffers so they are moved with the model
+        freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
             self.seq_len,
             params.rope_theta,
-        ).to('cuda')
+        )
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
         mask = torch.full((self.seq_len, self.seq_len), float("-inf"))
         mask = torch.triu(mask, diagonal=1)
-        self.mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask]).to('cuda')
+        mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask])
+        self.register_buffer("mask", mask, persistent=False)
 
     """
     forward method for pp4-1f1b or pp2-interleaved-1f1b
