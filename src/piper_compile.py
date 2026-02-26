@@ -140,7 +140,7 @@ def piper_setup(
     )
     _create_actors(
         num_devices, optim_fn, num_mbs, num_stages, p2p_schedules, naive_gradient_sync,
-        profile=True, mode="sequential",
+        profile=True, mode="overlapped",
     )
 
     last_stage_rank = stage_to_device[num_stages - 1]

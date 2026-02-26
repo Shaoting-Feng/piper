@@ -45,7 +45,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
     def forward(ctx, output, input_tensor):
         """
         Forward pass: performs all_to_all_single communication.
-        
+
         Args:
             ctx: Context for storing information for backward pass
             output: Output buffer (will be modified in-place)
@@ -57,21 +57,35 @@ class AllToAllSingleFunction(torch.autograd.Function):
         ctx.actor_self = piper_metadata.actor_self
         ctx.group = ctx.actor_self.dp_group
         ctx.global_rank = ctx.actor_self.global_rank
-        ctx.stream = ctx.actor_self.comp_stream
+        ctx.stream = ctx.actor_self.a2a_stream
+
+        comp_stream = torch.cuda.current_stream()
 
         logger.debug(f"Dispatch AllToAllSingleFunction forward rank={ctx.global_rank}, shape={input_tensor.shape}")
-        
+
+        # PRE-HOOK: record event so bwd knows fwd comp reached this A2A
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+            idx = ctx.actor_self.fwd_a2a_counter
+            ctx.actor_self.fwd_a2a_pre_events[idx].record(comp_stream)
+
         ctx.actor_self._start_timing(ctx.stream, "fwd_a2a")
 
         # Ensure input_tensor is contiguous (all_to_all_single requires contiguous tensors)
-        # TODO: performance cost?
         input_tensor = input_tensor.contiguous()
-        
-        # Perform the communication (modifies output in-place)
+
+        # Execute A2A on a2a_stream
+        ctx.stream.wait_stream(comp_stream)
         with torch.cuda.stream(ctx.stream):
             dist.all_to_all_single(output, input_tensor, group=ctx.group)
+        comp_stream.wait_stream(ctx.stream)
 
         ctx.actor_self._stop_timing(ctx.stream, "fwd_a2a")
+
+        # POST-HOOK: wait for bwd to reach its corresponding A2A
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+            idx = ctx.actor_self.fwd_a2a_counter
+            comp_stream.wait_event(ctx.actor_self.bwd_a2a_pre_events[idx])
+            ctx.actor_self.fwd_a2a_counter += 1
 
         return output
     
@@ -79,31 +93,45 @@ class AllToAllSingleFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         """
         Backward pass: performs reverse all_to_all_single to propagate gradients.
-        
+
         The backward of all_to_all_single is another all_to_all_single operation
         that reverses the communication pattern.
         """
         logger.debug(f"Dispatch AllToAllSingleFunction backward rank={ctx.global_rank}, shape={grad_output.shape}")
 
-        ctx.actor_self._start_timing(ctx.stream, "bwd_a2a")
-
         if grad_output is None:
             return None, None, None
-        
+
+        comp_stream = torch.cuda.current_stream()
+
+        # PRE-HOOK: record event so fwd post-hook knows bwd comp reached this A2A
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+            idx = ctx.actor_self.bwd_a2a_counter
+            ctx.actor_self.bwd_a2a_pre_events[idx].record(comp_stream)
+
+        ctx.actor_self._start_timing(ctx.stream, "bwd_a2a")
+
         # Ensure grad_output is contiguous (all_to_all_single requires contiguous tensors)
-        # TODO: performance cost?
         grad_output = grad_output.contiguous()
-        
+
         # Create a buffer for the gradient input
         grad_input = torch.empty_like(grad_output)
-        
-        # Reverse the communication: all_to_all_single in backward
-        # This propagates gradients from output back to input
+
+        # Execute A2A on a2a_stream
+        ctx.stream.wait_stream(comp_stream)
         with torch.cuda.stream(ctx.stream):
             dist.all_to_all_single(grad_input, grad_output, group=ctx.group)
+        comp_stream.wait_stream(ctx.stream)
 
         ctx.actor_self._stop_timing(ctx.stream, "bwd_a2a")
-        
+
+        # POST-HOOK: wait for fwd to reach the next A2A
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+            idx = ctx.actor_self.bwd_a2a_counter
+            if idx + 1 < ctx.actor_self.n_a2a_ops:
+                comp_stream.wait_event(ctx.actor_self.fwd_a2a_pre_events[idx + 1])
+            ctx.actor_self.bwd_a2a_counter += 1
+
         # Return gradients: grad_output flows to grad_input, None for group
         return grad_input, grad_input, None
 
