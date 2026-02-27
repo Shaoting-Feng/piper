@@ -1,0 +1,118 @@
+digraph PipelineDAG_1F1B {
+  rankdir=LR;
+  node [shape=box, fontname="Helvetica", fontsize=10];
+
+  // -----------------------
+  // Nodes (durations used in calculations)
+  // -----------------------
+  subgraph cluster_s0 {
+    label="Stage 0 (rank 0)";
+    style=rounded;
+
+    S0_F0 [label="S0 F mb0\nt=000 274.75ms"];
+    S0_F1 [label="S0 F mb1\nt=003 274.75ms"];
+    S0_B0 [label="S0 B mb0\nt=004 551ms"];
+    S0_F2 [label="S0 F mb2\nt=005 274.75ms"];
+    S0_B1 [label="S0 B mb1\nt=006 551ms"];
+    S0_F3 [label="S0 F mb3\nt=007 274.75ms"];
+    S0_B2 [label="S0 B mb2\nt=008 551ms"];
+    S0_B3 [label="S0 B mb3\nt=010 551ms"];
+
+    Update0 [shape=box, style="rounded", label="Update (rank 0)\n40ms"];
+  }
+
+  subgraph cluster_s1 {
+    label="Stage 1 (rank 1)";
+    style=rounded;
+
+    S1_F1 [label="S1 F mb1\nt=001 274.75ms"];
+    S1_B0 [label="S1 B mb0\nt=002 551ms"];
+    S1_F2 [label="S1 F mb2\nt=003 274.75ms"];
+    S1_B1 [label="S1 B mb1\nt=004 551ms"];
+    S1_F3 [label="S1 F mb3\nt=005 274.75ms"];
+    S1_B2 [label="S1 B mb2\nt=006 551ms"];
+    S1_F4 [label="S1 F mb4\nt=007 274.75ms"];
+    S1_B3 [label="S1 B mb3\nt=008 551ms"];
+
+    Update1 [shape=box, style="rounded", label="Update (rank 1)\n40ms"];
+  }
+
+  Done [shape=oval, label="Done\n0ms"];
+
+  // -----------------------
+  // Temporal edges (serialization on each stage)
+  // -----------------------
+  edge [color=black, penwidth=1.2];
+
+  // Stage 0 order
+  S0_F0 -> S0_F1 -> S0_B0 -> S0_F2 -> S0_B1 -> S0_F3 -> S0_B2 -> S0_B3 -> Update0;
+
+  // Stage 1 order
+  S1_F1 -> S1_B0 -> S1_F2 -> S1_B1 -> S1_F3 -> S1_B2 -> S1_F4 -> S1_B3 -> Update1;
+
+  // -----------------------
+  // Intra-microbatch logical deps (within a stage)
+  // -----------------------
+  edge [color=gray50, style=dashed, penwidth=1.0];
+
+  // Stage 0: Fm -> Bm
+  S0_F0 -> S0_B0;
+  S0_F1 -> S0_B1;
+  S0_F2 -> S0_B2;
+  S0_F3 -> S0_B3;
+
+  // Stage 1: F(m+1) -> Bm (offseted microbatch labeling in your trace)
+  S1_F1 -> S1_B0;
+  S1_F2 -> S1_B1;
+  S1_F3 -> S1_B2;
+  S1_F4 -> S1_B3;
+
+  // -----------------------
+  // Cross-stage data deps
+  // -----------------------
+  // Forward activations (offset mapping): S0_Fm -> S1_F(m+1)
+  edge [color=blue, penwidth=2.0];
+  S0_F0 -> S1_F1;
+  S0_F1 -> S1_F2;
+  S0_F2 -> S1_F3;
+  S0_F3 -> S1_F4;
+
+  // Backward grads: S1_Bm -> S0_Bm
+  edge [color=red, penwidth=2.0];
+  S1_B0 -> S0_B0;
+  S1_B1 -> S0_B1;
+  S1_B2 -> S0_B2;
+  S1_B3 -> S0_B3;
+
+  // -----------------------
+  // Done joins both updates
+  // -----------------------
+  edge [color=purple, style=dashed, penwidth=1.5];
+  Update0 -> Done;
+  Update1 -> Done;
+
+  // ============================================================
+  // Highlight critical path edges (longest path to Done)
+  // Chain sums to 4168.75ms with F=274.75, B=551, U=40
+  // ============================================================
+  edge [color=green, penwidth=4.0];
+
+  // activation + stage1 compute + grad back
+  S0_F0 -> S1_F1;
+  S1_F1 -> S1_B0;
+  S1_B0 -> S0_B0;
+
+  // stage0 tail (forced by temporal order + future grad dependency)
+  S0_B0 -> S0_F2;
+  S0_F2 -> S0_B1;
+  S0_B1 -> S0_F3;
+
+  // activation to stage1 last forward, then last backward, then final stage0 backward
+  S0_F3 -> S1_F4;
+  S1_F4 -> S1_B3;
+  S1_B3 -> S0_B3;
+
+  // update + done
+  S0_B3 -> Update0;
+  Update0 -> Done;
+}

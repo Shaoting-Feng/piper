@@ -10,8 +10,6 @@ from collections import defaultdict
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from typing import Any, Optional
 
-import src.piper_patches
-
 LOG_LEVEL = "INFO"
 
 """ 

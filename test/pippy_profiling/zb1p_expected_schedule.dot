@@ -1,0 +1,122 @@
+digraph PipelineDAG {
+  rankdir=LR;
+  node [shape=box, fontname="Helvetica", fontsize=10];
+
+  // -----------------------
+  // Nodes (durations used in calculations)
+  // -----------------------
+  subgraph cluster_s0 {
+    label="Stage 0 (rank 0)";
+    style=rounded;
+
+    S0_F0 [label="S0 F mb0\nt=000 274.75ms"];
+    S0_F1 [label="S0 F mb1\nt=002 274.75ms"];
+    S0_I0 [label="S0 I mb0\nt=003 0ms"];
+    S0_W0 [label="S0 W mb0\nt=004 551ms"];
+    S0_F2 [label="S0 F mb2\nt=005 274.75ms"];
+    S0_I1 [label="S0 I mb1\nt=006 0ms"];
+    S0_W1 [label="S0 W mb1\nt=007 551ms"];
+    S0_F3 [label="S0 F mb3\nt=008 274.75ms"];
+    S0_I2 [label="S0 I mb2\nt=009 0ms"];
+    S0_W2 [label="S0 W mb2\nt=010 551ms"];
+    S0_I3 [label="S0 I mb3\nt=011 0ms"];
+    S0_W3 [label="S0 W mb3\nt=012 551ms"];
+  }
+
+  subgraph cluster_s1 {
+    label="Stage 1 (rank 1)";
+    style=rounded;
+
+    S1_F0 [label="S1 F mb0\nt=001 274.75ms"];
+    S1_I0 [label="S1 I mb0\nt=002 275.5ms"];
+    S1_F1 [label="S1 F mb1\nt=003 274.75ms"];
+    S1_I1 [label="S1 I mb1\nt=004 275.5ms"];
+    S1_W0 [label="S1 W mb0\nt=005 275.5ms"];
+    S1_F2 [label="S1 F mb2\nt=006 274.75ms"];
+    S1_I2 [label="S1 I mb2\nt=007 275.5ms"];
+    S1_W1 [label="S1 W mb1\nt=008 275.5ms"];
+    S1_F3 [label="S1 F mb3\nt=009 274.75ms"];
+    S1_I3 [label="S1 I mb3\nt=010 275.5ms"];
+    S1_W2 [label="S1 W mb2\nt=011 275.5ms"];
+    S1_W3 [label="S1 W mb3\nt=012 275.5ms"];
+  }
+
+  // Iteration end when both ranks complete their last op
+  Done [shape=oval, label="Done\n0ms"];
+
+  // -----------------------
+  // Temporal edges (serialization on each stage)
+  // -----------------------
+  edge [color=black, penwidth=1.2];
+
+  // Stage 0 order
+  S0_F0 -> S0_F1 -> S0_I0 -> S0_W0 -> S0_F2 -> S0_I1 -> S0_W1 -> S0_F3 -> S0_I2 -> S0_W2 -> S0_I3 -> S0_W3;
+
+  // Stage 1 order
+  S1_F0 -> S1_I0 -> S1_F1 -> S1_I1 -> S1_W0 -> S1_F2 -> S1_I2 -> S1_W1 -> S1_F3 -> S1_I3 -> S1_W2 -> S1_W3;
+
+  // -----------------------
+  // Intra-microbatch logical deps (within a stage)
+  // -----------------------
+  edge [color=gray50, style=dashed, penwidth=1.0];
+
+  // Stage 0: F -> I -> W
+  S0_F0 -> S0_I0 -> S0_W0;
+  S0_F1 -> S0_I1 -> S0_W1;
+  S0_F2 -> S0_I2 -> S0_W2;
+  S0_F3 -> S0_I3 -> S0_W3;
+
+  // Stage 1: F -> I -> W
+  S1_F0 -> S1_I0 -> S1_W0;
+  S1_F1 -> S1_I1 -> S1_W1;
+  S1_F2 -> S1_I2 -> S1_W2;
+  S1_F3 -> S1_I3 -> S1_W3;
+
+  // -----------------------
+  // Cross-stage data deps
+  // -----------------------
+  edge [color=blue, penwidth=2.0];
+  S0_F0 -> S1_F0;
+  S0_F1 -> S1_F1;
+  S0_F2 -> S1_F2;
+  S0_F3 -> S1_F3;
+
+  edge [color=red, penwidth=2.0];
+  S1_I0 -> S0_I0;
+  S1_I1 -> S0_I1;
+  S1_I2 -> S0_I2;
+  S1_I3 -> S0_I3;
+
+  // -----------------------
+  // Join (Done)
+  // -----------------------
+  edge [color=purple, style=dashed, penwidth=1.5];
+  S0_W3 -> Done;
+  S1_W3 -> Done;
+
+  // ============================================================
+  // Highlight critical path edges (longest path to Done)
+  // ============================================================
+  edge [color=green, penwidth=4.0];
+
+  // activation dep mb0
+  S0_F0 -> S1_F0;
+
+  // stage1 temporal + grad dep back to stage0
+  S1_F0 -> S1_I0;
+  S1_I0 -> S0_I0;
+
+  // stage0 temporal tail to end (critical)
+  S0_I0 -> S0_W0;
+  S0_W0 -> S0_F2;
+  S0_F2 -> S0_I1;
+  S0_I1 -> S0_W1;
+  S0_W1 -> S0_F3;
+  S0_F3 -> S0_I2;
+  S0_I2 -> S0_W2;
+  S0_W2 -> S0_I3;
+  S0_I3 -> S0_W3;
+
+  // done
+  S0_W3 -> Done;
+}

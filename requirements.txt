@@ -1,5 +1,4 @@
 numpy
-ray==2.53.0
+ray
 torch==2.9.1+cu128
 cupy-cuda12x
-graphviz

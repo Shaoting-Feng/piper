@@ -1,5 +1,7 @@
 import ray
 import torch
+from torch._dynamo.backends.debugging import eager
+import torch.distributed as dist
 import threading
 import os
 import gc
@@ -8,7 +10,7 @@ import itertools
 
 from torch._dynamo.backends.debugging import eager
 
-from .piper_overlap_actor import _create_actors
+from .piper_actor import _create_actors
 from .piper_utils import piper_metadata, create_logger, LOG_LEVEL
 from .piper_exec import CompType, Schedule2D, Task
 from .piper import piper
@@ -16,17 +18,23 @@ from .piper import piper
 logger = create_logger("piper_compile", LOG_LEVEL)
 
 def _sort_by_task(executable_tasks: list[tuple[int, Task]]) -> list[tuple[int, Task]]:
-    """Sort executable tasks by type so that BWD comes before FWD (then FWD_BWD)."""
-    type_order = {CompType.BWD: 2, CompType.FWD: 1, CompType.FWD_BWD: 0}
+    """Sort executable tasks by type so that BWD/BWD_I come before FWD (then BWD_W, FWD_BWD)."""
+    type_order = {
+        CompType.BWD: 0,
+        CompType.BWD_I: 0,
+        CompType.FWD_BWD: 1,
+        CompType.FWD: 2,
+        CompType.BWD_W: 3,
+    }
     return sorted(
         executable_tasks,
-        key=lambda item: type_order.get(item[1].type, 3),
+        key=lambda item: type_order.get(item[1].type, 4),
     )
 
 
 def order_p2p_comms(schedule: Schedule2D, num_devices: int, num_stages: int, stage_to_device: dict[int, int]):
     schedule = schedule.grid
-    # Filter to fwd/bwd tasks and split FWD_BWD into two consecutive tasks (FWD then BWD).
+    # Filter to fwd/bwd tasks (exclude UPD). Include BWD_I, BWD_W, FWD_BWD.
     schedule = [[task for task in row if task is not None and task.type != CompType.UPD] for row in schedule]
 
     assert num_devices == len(schedule), "Some rank has no fwd/bwd tasks"
@@ -52,7 +60,7 @@ def order_p2p_comms(schedule: Schedule2D, num_devices: int, num_stages: int, sta
                     batch = task.batches[0]
                     if batch.stage_id > 0:
                         dependee.append((batch.stage_id - 1, batch.stage_id, batch.mb_idx))
-                elif task.type == CompType.BWD:
+                elif task.type in (CompType.BWD, CompType.BWD_I):
                     batch = task.batches[0]
                     if batch.stage_id < num_stages - 1:
                         dependee.append((batch.stage_id + 1, batch.stage_id, batch.mb_idx))
@@ -63,7 +71,7 @@ def order_p2p_comms(schedule: Schedule2D, num_devices: int, num_stages: int, sta
                     if bwd_batch.stage_id < num_stages - 1:
                         dependee.append((bwd_batch.stage_id + 1, bwd_batch.stage_id, bwd_batch.mb_idx))
 
-                can_exec = dependee is [] or all(dependee in p2p_comms for dependee in dependee)
+                can_exec = dependee == [] or all(dep in p2p_comms for dep in dependee)
                 if can_exec:
                     executable_tasks.append((rank, task))
 
@@ -76,7 +84,7 @@ def order_p2p_comms(schedule: Schedule2D, num_devices: int, num_stages: int, sta
                 batch = task.batches[0]
                 if batch.stage_id < num_stages - 1:
                     p2p_comms.append((batch.stage_id, batch.stage_id + 1, batch.mb_idx))
-            elif task.type == CompType.BWD:
+            elif task.type == CompType.BWD or task.type == CompType.BWD_I:
                 batch = task.batches[0]
                 if batch.stage_id > 0:
                     p2p_comms.append((batch.stage_id, batch.stage_id - 1, batch.mb_idx))
@@ -118,6 +126,7 @@ def piper_setup(
     example_outputs,
     schedule: Schedule2D,
     naive_gradient_sync=False,
+    mode="overlapped",
 ):
     """
     Compile a model with the piper backend.
@@ -140,7 +149,7 @@ def piper_setup(
     )
     _create_actors(
         num_devices, optim_fn, num_mbs, num_stages, p2p_schedules, naive_gradient_sync,
-        profile=True, mode="overlapped",
+        profile=True, mode=mode,
     )
 
     last_stage_rank = stage_to_device[num_stages - 1]

@@ -1,5 +1,3 @@
-from . import piper_patches
-
 import ray
 import torch
 import os
@@ -38,7 +36,7 @@ def piper(gm, example_inputs, **kwargs):
 
     refs = []
     actor_stages = []
-    for (stage_id, stage_gm, input_idxs, graphargs, placeholders) in submodules:
+    for (stage_id, stage_gm, input_idxs, param_idxs, graphargs, placeholders) in submodules:
         stage_gm(*graphargs)
         start = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -49,8 +47,9 @@ def piper(gm, example_inputs, **kwargs):
         torch.cuda.synchronize()
         print(f"Stage {stage_id} time measured on controller: {start.elapsed_time(end) / 5:.2f} ms")
 
+        n_a2a_ops = 0
         if dp_degree > 1:
-            stage_gm = _insert_a2a_ops(stage_gm)
+            stage_gm, n_a2a_ops = _insert_a2a_ops(stage_gm)
 
         actor_id = piper_metadata.stage_to_device[stage_id]
         actor = _get_actor(actor_id)
@@ -62,6 +61,8 @@ def piper(gm, example_inputs, **kwargs):
             stage_gm_data,
             graphargs,
             input_idxs,
+            param_idxs,
+            n_a2a_ops,
         ))
 
         del stage_gm

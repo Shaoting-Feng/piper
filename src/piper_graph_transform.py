@@ -57,34 +57,35 @@ class AllToAllSingleFunction(torch.autograd.Function):
         ctx.actor_self = piper_metadata.actor_self
         ctx.group = ctx.actor_self.dp_group
         ctx.global_rank = ctx.actor_self.global_rank
-        ctx.stream = ctx.actor_self.a2a_stream
+        
+        stream = ctx.actor_self.comp_stream
 
-        comp_stream = torch.cuda.current_stream()
+        # comp_stream = torch.cuda.current_stream()
 
         logger.debug(f"Dispatch AllToAllSingleFunction forward rank={ctx.global_rank}, shape={input_tensor.shape}")
 
         # PRE-HOOK: record event so bwd knows fwd comp reached this A2A
-        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.overlap_a2a_ops:
             idx = ctx.actor_self.fwd_a2a_counter
-            ctx.actor_self.fwd_a2a_pre_events[idx].record(comp_stream)
+            ctx.actor_self.fwd_a2a_pre_events[idx].record(stream)
 
-        ctx.actor_self._start_timing(ctx.stream, "fwd_a2a")
+        ctx.actor_self._start_timing(stream, "fwd_a2a")
 
         # Ensure input_tensor is contiguous (all_to_all_single requires contiguous tensors)
         input_tensor = input_tensor.contiguous()
 
-        # Execute A2A on a2a_stream
-        ctx.stream.wait_stream(comp_stream)
-        with torch.cuda.stream(ctx.stream):
+        # Execute A2A
+        # stream.wait_stream(comp_stream)
+        with torch.cuda.stream(stream):
             dist.all_to_all_single(output, input_tensor, group=ctx.group)
-        comp_stream.wait_stream(ctx.stream)
+        # comp_stream.wait_stream(stream)
 
-        ctx.actor_self._stop_timing(ctx.stream, "fwd_a2a")
+        ctx.actor_self._stop_timing(stream, "fwd_a2a")
 
         # POST-HOOK: wait for bwd to reach its corresponding A2A
-        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.overlap_a2a_ops:
             idx = ctx.actor_self.fwd_a2a_counter
-            comp_stream.wait_event(ctx.actor_self.bwd_a2a_pre_events[idx])
+            stream.wait_event(ctx.actor_self.bwd_a2a_pre_events[idx])
             ctx.actor_self.fwd_a2a_counter += 1
 
         return output
@@ -102,14 +103,14 @@ class AllToAllSingleFunction(torch.autograd.Function):
         if grad_output is None:
             return None, None, None
 
-        comp_stream = torch.cuda.current_stream()
+        stream = ctx.actor_self.overlapped_comp_stream
 
         # PRE-HOOK: record event so fwd post-hook knows bwd comp reached this A2A
-        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.overlap_a2a_ops:
             idx = ctx.actor_self.bwd_a2a_counter
-            ctx.actor_self.bwd_a2a_pre_events[idx].record(comp_stream)
+            ctx.actor_self.bwd_a2a_pre_events[idx].record(stream)
 
-        ctx.actor_self._start_timing(ctx.stream, "bwd_a2a")
+        ctx.actor_self._start_timing(stream, "bwd_a2a")
 
         # Ensure grad_output is contiguous (all_to_all_single requires contiguous tensors)
         grad_output = grad_output.contiguous()
@@ -117,19 +118,19 @@ class AllToAllSingleFunction(torch.autograd.Function):
         # Create a buffer for the gradient input
         grad_input = torch.empty_like(grad_output)
 
-        # Execute A2A on a2a_stream
-        ctx.stream.wait_stream(comp_stream)
-        with torch.cuda.stream(ctx.stream):
+        # Execute A2A
+        # stream.wait_stream(comp_stream)
+        with torch.cuda.stream(stream):
             dist.all_to_all_single(grad_input, grad_output, group=ctx.group)
-        comp_stream.wait_stream(ctx.stream)
+        # comp_stream.wait_stream(stream)
 
-        ctx.actor_self._stop_timing(ctx.stream, "bwd_a2a")
+        ctx.actor_self._stop_timing(stream, "bwd_a2a")
 
         # POST-HOOK: wait for fwd to reach the next A2A
-        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.n_a2a_ops > 0:
+        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.overlap_a2a_ops:
             idx = ctx.actor_self.bwd_a2a_counter
-            if idx + 1 < ctx.actor_self.n_a2a_ops:
-                comp_stream.wait_event(ctx.actor_self.fwd_a2a_pre_events[idx + 1])
+            if idx + 1 < len(ctx.actor_self.fwd_a2a_pre_events):
+                stream.wait_event(ctx.actor_self.fwd_a2a_pre_events[idx + 1])
             ctx.actor_self.bwd_a2a_counter += 1
 
         # Return gradients: grad_output flows to grad_input, None for group
@@ -196,7 +197,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         prev_stage_outputs = set()
         for prev_stage_id in range(stage_annotation_id):
             if prev_stage_id in stage_modules:
-                _, _, _, prev_outputs, _, _, _, _, _ = stage_modules[prev_stage_id]
+                _, _, _, prev_outputs, _, _, _, _, _, _ = stage_modules[prev_stage_id]
                 prev_stage_outputs.update(prev_outputs)
         
         # Find all inputs needed by this stage (nodes that are not in the stage set)
@@ -281,7 +282,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         if stage_annotation_id > 0:
             prev_stage_id = stage_annotation_id - 1
             if prev_stage_id in stage_modules:
-                _, _, _, prev_stage_outputs_list, _, _, _, _, _ = stage_modules[prev_stage_id]
+                _, _, _, prev_stage_outputs_list, _, _, _, _, _, _ = stage_modules[prev_stage_id]
                 prev_stage_outputs_ordered = prev_stage_outputs_list
         
         # For stages > 0, first add inputs that come from previous stage outputs
@@ -328,7 +329,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         prev_stage_outputs = set()
         for prev_stage_id in range(stage_annotation_id):
             if prev_stage_id in stage_modules:
-                _, _, _, prev_outputs, _, _, _, _, _ = stage_modules[prev_stage_id]
+                _, _, _, prev_outputs, _, _, _, _, _, _ = stage_modules[prev_stage_id]
                 prev_stage_outputs.update(prev_outputs)
         
         # Find all nodes computed in this stage (dependencies of stage_nodes)
@@ -409,7 +410,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
                 if not user_in_other_stage:
                     for other_stage_id in range(stage_annotation_id):
                         if other_stage_id in stage_modules:
-                            _, _, _, _, _, other_ordered_nodes, _, _, _ = stage_modules[other_stage_id]
+                            _, _, _, _, _, other_ordered_nodes, _, _, _, _ = stage_modules[other_stage_id]
                             if user in other_ordered_nodes:
                                 user_in_other_stage = True
                                 break
@@ -469,6 +470,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         # Load the module on the corresponding actor
         # Track which inputs come from previous stage outputs
         input_idxs = []
+        param_idxs = []
         graphargs = []
         placeholders = stage_gm.graph.find_nodes(op="placeholder")
         
@@ -479,14 +481,21 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         prev_stage_outputs = set()
         prev_stage_id = stage_annotation_id - 1
         if prev_stage_id in stage_modules:
-            _, _, _, prev_stage_outputs_list, _, _, _, _, _ = stage_modules[prev_stage_id]
+            _, _, _, prev_stage_outputs_list, _, _, _, _, _, _ = stage_modules[prev_stage_id]
             prev_stage_outputs = set(prev_stage_outputs_list)
         
         for i, placeholder in enumerate(placeholders):
             if "grapharg" in placeholder.meta:
-                graphargs.append(placeholder.meta["grapharg"]._example())
+                example = placeholder.meta["grapharg"]._example()
             else:
-                graphargs.append(torch.zeros(placeholder.meta["example_value"].shape, dtype=placeholder.meta["example_value"].dtype, requires_grad=placeholder.meta["example_value"].requires_grad, device=placeholder.meta["example_value"].device))
+                example = torch.zeros(
+                    placeholder.meta["example_value"].shape, 
+                    dtype=placeholder.meta["example_value"].dtype, 
+                    requires_grad=placeholder.meta["example_value"].requires_grad, 
+                    device=placeholder.meta["example_value"].device)
+            graphargs.append(example)
+            if isinstance(example, torch.nn.Parameter):
+                param_idxs.append(i)
             # For the first stage, the input indices are everything that's not an attribute
             if stage_annotation_id == 0:
                 if 'self' not in placeholder.name:
@@ -498,6 +507,8 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
                 if is_from_prev_stage:
                     input_idxs.append(i)
 
+        assert set(input_idxs) & set(param_idxs) == set(), "Input and parameter indices should be disjoint"
+
         stage_modules[stage_annotation_id] = (
             stage_gm,
             input_placeholders,
@@ -507,6 +518,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
             ordered_stage_nodes,
             stage_annotation_id,
             input_idxs,
+            param_idxs,
             graphargs,
         )
 
@@ -555,7 +567,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
                 in_stage = True
                 
                 # Get the stage module info
-                stage_gm, input_placeholders, input_order, stage_outputs, stage_nodes, ordered_stage_nodes, _, _, _ = stage_modules[stage_annotation_id]
+                stage_gm, input_placeholders, input_order, stage_outputs, stage_nodes, ordered_stage_nodes, _, _, _, _= stage_modules[stage_annotation_id]
                 
                 # Check if we've already created the call_module for this stage call
                 if stage_annotation_id not in stage_call_replaced:
@@ -628,10 +640,10 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
     # Create root module and add stage modules as submodules
     root_module = torch.nn.Module()
     submodule_list = []
-    for stage_annotation_id, (stage_gm, placeholders, _, _, _, _, _, input_idxs, params) in stage_modules.items():
+    for stage_annotation_id, (stage_gm, placeholders, _, _, _, _, _, input_idxs, param_idxs, params) in stage_modules.items():
         module_name = f"stage_{stage_annotation_id}"
         root_module.add_module(module_name, stage_gm)
-        submodule_list.append((stage_annotation_id, stage_gm, input_idxs, params, placeholders))
+        submodule_list.append((stage_annotation_id, stage_gm, input_idxs, param_idxs, params, placeholders))
     
     new_gm = fx.GraphModule(root_module, new_graph)
     
@@ -654,7 +666,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
 
 
 
-def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
+def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
     """
     Transform a graph module by inserting communication operations on annotated nodes.
     
@@ -698,8 +710,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
                     annotated_nodes.append((idx, node, annotation_key, reshape))
     
     if not annotated_nodes:
-        logger.debug("No communication annotations found in graph")
-        return gm
+        return gm, 0
     
     # Group annotated nodes into contiguous blocks
     # A contiguous block is a sequence of nodes with the same annotation_key
@@ -726,7 +737,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
 
     annotation_blocks = list(blocks_by_key.values())
     
-    logger.debug(f"Found {len(annotation_blocks)} comm annotation blocks")
+    n_a2a_ops = len(annotation_blocks)
     
     # For each contiguous block, find the output node (the one used outside the annotation)
     # This is the node that should have communication applied to it
@@ -753,13 +764,11 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
             if output_candidates:
                 # Use the first output candidate (should be the output of the annotated block)
                 annotated_output_nodes.append(output_candidates[0])
-                logger.debug(f"Block {block_idx}: Using output node {output_candidates[0][0].name}")
             else:
                 # No external users found, use the last node in topological order within the block
                 # This happens if the annotated block's output isn't used yet
                 last_node = max(nodes_in_block, key=lambda x: node_list.index(x[0]))
                 annotated_output_nodes.append(last_node)
-                logger.debug(f"Block {block_idx}: No external users found, using last node: {last_node[0].name}")
     
     # Create a new graph to build the transformed version
     new_graph = fx.Graph()
@@ -819,7 +828,6 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
                         torch.reshape,
                         (new_node, reshape_shape)
                     )
-                    logger.debug(f"Applied input reshape {reshape_shape} for node {node.name}")
             
             # Insert communication operations after this node
             # Following the exact pattern from the comments in mixtral.py:
@@ -853,13 +861,10 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
                         torch.reshape,
                         (buf_node, reshape_shape)
                     )
-                    logger.debug(f"Applied output reshape {reshape_shape} for node {node.name}")
             
             # 3. Replace all uses of the original node with the buffer
             # The buffer now contains the result after communication (and optional reshape)
             node_mapping[node] = buf_node
-            
-            logger.debug(f"Inserted all_to_all_single communication for node {node.name}")
         else:
             # Regular node, just copy it
             new_node = new_graph.node_copy(
@@ -899,7 +904,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
     
     new_gm.recompile()
     
-    return new_gm
+    return new_gm, n_a2a_ops
 
 def _insert_p2p_ops(
     gm: fx.GraphModule,

@@ -7,7 +7,7 @@ import socket
 from .piper_utils import create_logger, LOG_LEVEL
 
 
-@ray.remote(num_gpus=0.1)
+@ray.remote(num_gpus=0.6)
 def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, master_addr, master_port, training_func: Callable, *args, **kwargs):
     logger = create_logger("piper_coordinator", LOG_LEVEL)
     logger.debug(f"Running DP rank {dp_rank+1} of {dp_degree}")
