@@ -123,6 +123,10 @@ class PiperActor:
         self.overlapped_comp_stream = torch.cuda.Stream()
         self.overlapped_p2p_stream = torch.cuda.Stream()
 
+        # fields for deferred initialization
+        self.forward_args_meta = dict()
+        self.stage_materialized = defaultdict(bool)
+
         # map stage id -> compiled fx.Graph function
         self.forward_fns = dict()
         # map stage id -> original GraphModule (for hook registration)
@@ -326,51 +330,123 @@ class PiperActor:
                         self.comm_op_handles[stage_id][tid].wait()
                         done = True
 
-    def _load_stage(
-        self, stage_id: int, gm_data, forward_args,input_idxs
-    ):
+    # def _load_stage(
+    #     self, stage_id: int, gm_data, forward_args,input_idxs
+    # ):
+    #     self.logger.debug(f"Loading stage {stage_id} graph on actor {self.global_rank}")
+
+    #     # compile the graph with the given graphargs
+    #     gm = _deserialize_graphmodule(gm_data)
+
+    #     # Store GraphModule reference
+    #     self.graph_modules[stage_id] = gm
+    #     self.forward_fns[stage_id] = gm.forward
+
+    #     # place parameters on the device
+    #     def move_to_device(idx, arg):
+    #         if arg.requires_grad:
+    #             return arg.to(self.device).detach().requires_grad_(True)
+    #         else:
+    #             return arg.to(self.device)
+    #     forward_args = list(map(move_to_device, range(len(forward_args)), forward_args))
+
+    #     # save parameters
+    #     self.forward_args[stage_id] = forward_args
+    #     self.stage_id = stage_id
+    #     self.input_idxs[stage_id] = input_idxs
+
+    #     for i in self.input_idxs[stage_id]:
+    #         self.forward_input_meta[stage_id][i] = (
+    #             forward_args[i].shape,
+    #             forward_args[i].dtype,
+    #             forward_args[i].requires_grad,
+    #         )
+    #         self.forward_args[stage_id][i] = None
+
+    #     # prepare tensors with DP comm ops
+    #     if not self.naive_gradient_sync and self.dp_degree > 1:
+    #         self._prepare_dp_comm_ops(stage_id)
+
+    #     # add the parameters to the optimizer for this stage
+    #     params = [param for param in forward_args if param is not None and param.requires_grad]
+    #     if stage_id not in self.optims:
+    #         self.optims[stage_id] = self.optim_class(params)
+    #     else:
+    #         self.optims[stage_id].add_param_group({"params": params})
+
+    #     del gm_data
+    def _load_stage(self, stage_id: int, gm_data, forward_args, input_idxs):
         self.logger.debug(f"Loading stage {stage_id} graph on actor {self.global_rank}")
 
-        # compile the graph with the given graphargs
         gm = _deserialize_graphmodule(gm_data)
 
-        # Store GraphModule reference
         self.graph_modules[stage_id] = gm
         self.forward_fns[stage_id] = gm.forward
 
-        # place parameters on the device
-        def move_to_device(idx, arg):
-            if arg.requires_grad:
-                return arg.to(self.device).detach().requires_grad_(True)
-            else:
-                return arg.to(self.device)
-        forward_args = list(map(move_to_device, range(len(forward_args)), forward_args))
-
-        # save parameters
-        self.forward_args[stage_id] = forward_args
-        self.stage_id = stage_id
+        forward_args = list(forward_args)
         self.input_idxs[stage_id] = input_idxs
 
+        # Save input meta and punch holes
         for i in self.input_idxs[stage_id]:
             self.forward_input_meta[stage_id][i] = (
                 forward_args[i].shape,
                 forward_args[i].dtype,
                 forward_args[i].requires_grad,
             )
-            self.forward_args[stage_id][i] = None
+            forward_args[i] = None
 
-        # prepare tensors with DP comm ops
+        self.forward_args_meta[stage_id] = forward_args
+        self.forward_args[stage_id] = list(forward_args)
+        self.stage_materialized[stage_id] = False
+
+        del gm_data
+
+    def materialize_stage(self, stage_id: int, init="random", seed=0):
+        if self.stage_materialized[stage_id]:
+            return 1
+
+        meta_args = self.forward_args_meta[stage_id]
+        realized = [None] * len(meta_args)
+
+        g = torch.Generator(device=self.device)
+        g.manual_seed(seed + 1000 * self.global_rank + stage_id)
+
+        for i, arg in enumerate(meta_args):
+            if arg is None:
+                continue
+
+            t = torch.empty(arg.shape, dtype=arg.dtype, device=self.device)
+
+            if arg.requires_grad:
+                t.requires_grad_(True)
+                if init == "random":
+                    torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
+            else:
+                t.zero_()
+
+            realized[i] = t
+
+        self.forward_args[stage_id] = realized
+        self.stage_materialized[stage_id] = True
+
+        # Now safe to setup hooks + optimizer
         if not self.naive_gradient_sync and self.dp_degree > 1:
             self._prepare_dp_comm_ops(stage_id)
 
-        # add the parameters to the optimizer for this stage
-        params = [param for param in forward_args if param is not None and param.requires_grad]
+        params = [t for t in realized if t is not None and t.requires_grad]
+
         if stage_id not in self.optims:
             self.optims[stage_id] = self.optim_class(params)
         else:
             self.optims[stage_id].add_param_group({"params": params})
 
-        del gm_data
+        return 1
+
+
+    def materialize_all_stages(self, init="random", seed=0):
+        for stage_id in list(self.forward_args_meta.keys()):
+            self.materialize_stage(stage_id, init=init, seed=seed)
+        return 1
 
     def _exec_p2p_op(
         self, src_stage: int, dst_stage: int, mb_idx: int, is_sender: bool, dep, p2p_stream=None
@@ -666,6 +742,10 @@ class PiperActor:
             f"Calling forward {stage_id} mb {mb_idx} on actor {self.global_rank}"
         )
 
+        assert (
+            self.stage_materialized[stage_id]
+        ), f"Stage {stage_id} not materialized on actor {self.global_rank}"
+
         if stage_id == 0:
             # For the first stage, load input tensors from self.inputs
             for i, inp in zip(self.input_idxs[stage_id], self.inputs):
@@ -744,6 +824,11 @@ class PiperActor:
         self.logger.debug(
             f"Calling backward {stage_id} mb {mb_idx} on actor {self.global_rank}"
         )
+
+        assert (
+            self.stage_materialized[stage_id]
+        ), f"Stage {stage_id} not materialized on actor {self.global_rank}"
+
         out_activation = self.out_activation[stage_id][mb_idx]
 
         if stage_id < self.num_stages - 1:

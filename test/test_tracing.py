@@ -68,6 +68,55 @@ def test_meta_device_compile():
         traceback.print_exc()
         return False
 
+def test_meta_device_fake_tensor():
+    """Test torch.compile on Llama model using meta params + fake inputs."""
+    logger.info("Testing torch.compile on Llama model with meta device + fake inputs...")
+
+    config = LLAMA_70B
+    seq_len = 256
+    batch_size = 16
+
+    try:
+        # Create model on meta device to avoid allocating memory
+        with torch.device("meta"):
+            start = time.perf_counter()
+            model = Transformer(config, seq_len)
+            end = time.perf_counter()
+            logger.info("✓ Model created on meta device")
+            logger.info(f"Model creation time: {(end - start)*1e3:.0f} ms")
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=False)
+
+        trace_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        # Create fake tokens (no storage) that pretend to be on trace_device
+        with fake_mode:
+            tokens = torch.empty((batch_size, seq_len), dtype=torch.long, device=trace_device)
+            logger.info(f"✓ Fake tokens created: shape={tuple(tokens.shape)} device={tokens.device} type={type(tokens)}")
+
+            start = time.perf_counter()
+            compiled_model = torch.compile(model)
+            end = time.perf_counter()
+            logger.info("✓ torch.compile succeeded (meta model + fake inputs)")
+            logger.info(f"Compilation time: {(end - start)*1e3:.0f} ms")
+
+            try:
+                output = compiled_model(tokens)
+                # output may also be fake
+                logger.info(f"✓ Forward pass succeeded, output shape: {tuple(output.shape)}")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                logger.warning(f"⚠ Forward pass produced error (still useful): {type(e).__name__}: {e}\n{tb}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"✗ Meta+fake compile test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def test_meta_device_fx_trace():
     """Test torch.fx.symbolic_trace on Llama model using meta device."""
@@ -138,6 +187,7 @@ if __name__ == "__main__":
     
     results = {
         "torch.compile (meta)": test_meta_device_compile(),
+        # "torch.compile + fake tensors (meta)": test_meta_device_fake_tensor(),
         # "torch.fx.symbolic_trace (meta)": test_meta_device_fx_trace(),
         # "GraphModule (meta)": test_meta_device_graph_module(),
         # "piper_backend (meta)": False,

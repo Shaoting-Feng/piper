@@ -38,8 +38,8 @@ def main(args):
 
     loss_fn = torch.nn.CrossEntropyLoss()
     
-    model = Transformer(llama_config, args.seq_len)
-    model.to('cuda')
+    # model = Transformer(llama_config, args.seq_len)
+    # model.to('cuda')
 
     x = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len)).to('cuda')
     y = torch.randn((args.batch_size, args.seq_len, llama_config.vocab_size)).to('cuda')
@@ -60,15 +60,16 @@ def main(args):
     print_schedule(schedule)
 
     piper_setup(
-        model,
-        torch.optim.Adam, 
-        [x],
-        y,
-        schedule,
-        args.naive_gradient_sync,
+        Transformer,
+        model_args=(llama_config, args.seq_len),
+        optim_fn=torch.optim.Adam,
+        example_inputs=[x],
+        example_outputs=y,
+        schedule=schedule,
+        naive_gradient_sync=args.naive_gradient_sync,
     )
 
-    del model
+    # del model
     del x
     del y 
     gc.collect()

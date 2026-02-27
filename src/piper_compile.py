@@ -103,11 +103,13 @@ def order_p2p_comms(schedule: Schedule2D, num_devices: int, num_stages: int, sta
 
 
 def piper_setup(
-    model,
-    optim_fn,
-    example_inputs,
-    example_outputs,
-    schedule: Schedule2D,
+    model_class,
+    model_args=(),
+    model_kwargs={},
+    optim_fn=None,
+    example_inputs=None,
+    example_outputs=None,
+    schedule: Schedule2D=None,
     naive_gradient_sync=False,
 ):
     """
@@ -132,9 +134,9 @@ def piper_setup(
         num_devices, optim_fn, num_mbs, num_stages, p2p_schedules, naive_gradient_sync
     )
 
-    last_stage_rank = stage_to_device[num_stages - 1]
-    ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
-    ray.get(piper_metadata.actors[last_stage_rank].load_labels.remote(example_outputs))
+    # last_stage_rank = stage_to_device[num_stages - 1]
+    # ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
+    # ray.get(piper_metadata.actors[last_stage_rank].load_labels.remote(example_outputs))
 
     ray.get(
         [
@@ -143,12 +145,45 @@ def piper_setup(
         ]
     )
 
+    # Build the model on meta device
+    with torch.device("meta"):
+        model = model_class(*model_args, **model_kwargs)
+
     compiled = torch.compile(model, backend=piper)
 
     dp_rank = int(os.environ["PIPER_DP_RANK"])
-    logger.info(f"DP rank {dp_rank+1} compiling...")
+    logger.info(f"DP rank {dp_rank+1} compiling (meta)...")
 
-    output = compiled(*example_inputs)
+    # Create meta tensors from our example_inputs to pass to the compiled graph
+    # meta_inputs = [torch.empty_like(t, device="meta") for t in example_inputs]
+    meta_inputs = [x.to(device="meta") for x in example_inputs]
+
+    # # 1) Verify meta model params are actually meta
+    # for n, p in model.named_parameters():
+    #     assert p.device.type == "meta", (n, p.device)
+
+    # for n, b in model.named_buffers():
+    #     assert b.device.type == "meta", (n, b.device)
+
+    # # 2) Verify meta inputs
+    # for i, x in enumerate(meta_inputs):
+    #     assert isinstance(x, torch.Tensor)
+    #     assert x.device.type == "meta", (i, x.device)
+
+    _ = compiled(*meta_inputs)
+
+    logger.info(f"DP rank {dp_rank+1} stage graphs loaded onto actors.")
+
+    ray.get([
+        actor.materialize_all_stages.remote(init=init, seed=seed)
+        for actor in piper_metadata.actors.values()
+    ])
+    logger.info(f"DP rank {dp_rank+1} stages materialized on actors.")
+
+    last_stage_rank = stage_to_device[num_stages - 1]
+    ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
+    ray.get(piper_metadata.actors[last_stage_rank].load_labels.remote(example_outputs))
+    logger.info(f"DP rank {dp_rank+1} real inputs/labels loaded onto actors.")
 
     logger.info(f"DP rank {dp_rank+1} done.")
 

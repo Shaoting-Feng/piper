@@ -248,6 +248,8 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # print(f"xq is None: {xq is None}, xk is None: {xk is None}, xv is None: {xv is None}")
+
         # [NOTE] Disable KV cache during training.
 
         # self.cache_k = self.cache_k.to(xq)
@@ -275,7 +277,9 @@ class Attention(nn.Module):
         values = values.transpose(
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        # print("Calculating scores")
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # print("Calculated scores")
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
@@ -352,8 +356,11 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
+        # print(f"TransformerBlock {self.layer_id} forward:")
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        # print(f"After attention: {h.shape}")
         out = h + self.feed_forward(self.ffn_norm(h))
+        # print(f"After feed forward: {out.shape}")
         return out
 
 
@@ -414,58 +421,76 @@ class Transformer(nn.Module):
         mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask])
         self.register_buffer("mask", mask, persistent=False)
 
-    """
-    forward method for pp4-1f1b or pp2-interleaved-1f1b
-    requires:
-    - 4 devices
-    - 4 stages
-    - n_layers is divisible by 4
-    """
-    def forward(self, tokens: torch.Tensor):
-
-        with torch.fx.traceback.annotate({"stage": 0}):
-            h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-            start_pos = 0
-            for layer in self.layers[:self.n_layers//4]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-        with torch.fx.traceback.annotate({"stage": 1}):
-            for layer in self.layers[self.n_layers//4:self.n_layers//2]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-        with torch.fx.traceback.annotate({"stage": 2}):
-            for layer in self.layers[self.n_layers//2:3*self.n_layers//4]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-        with torch.fx.traceback.annotate({"stage": 3}):
-            for layer in self.layers[3*self.n_layers//4:]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
-            h = self.norm(h) if self.norm else h
-            output = self.output(h).float() if self.output else h
-
-        return output
-
     # """
-    # forward method for 1f1b schedule
+    # forward method for pp4-1f1b or pp2-interleaved-1f1b
     # requires:
-    # - 2 stages
-    # - n_layers is divisible by 2
+    # - 4 devices
+    # - 4 stages
+    # - n_layers is divisible by 4
     # """
     # def forward(self, tokens: torch.Tensor):
 
     #     with torch.fx.traceback.annotate({"stage": 0}):
-    #         h = self.tok_embeddings(tokens)
+    #         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
     #         start_pos = 0
-    #         for layer in self.layers[:self.n_layers//2]:
+    #         for layer in self.layers[:self.n_layers//4]:
     #             h = layer(h, start_pos, self.freqs_cis, self.mask)
 
     #     with torch.fx.traceback.annotate({"stage": 1}):
-    #         for layer in self.layers[self.n_layers//2:]:
+    #         for layer in self.layers[self.n_layers//4:self.n_layers//2]:
     #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-    #         h = self.norm(h)
-    #         output = self.output(h).float()
+
+    #     with torch.fx.traceback.annotate({"stage": 2}):
+    #         for layer in self.layers[self.n_layers//2:3*self.n_layers//4]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 3}):
+    #         for layer in self.layers[3*self.n_layers//4:]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+    #         h = self.norm(h) if self.norm else h
+    #         output = self.output(h).float() if self.output else h
 
     #     return output
+
+    """
+    forward method for 1f1b schedule
+    requires:
+    - 2 stages
+    - n_layers is divisible by 2
+    """
+    def forward(self, tokens: torch.Tensor):
+        assert self.freqs_cis is not None, "freqs_cis is None"
+        assert self.mask is not None, "mask is None"
+        assert self.tok_embeddings is not None, "tok_embeddings is None"
+        assert self.layers is not None, "layers is None"
+        assert self.norm is not None, "norm is None"
+        assert self.output is not None, "output is None"
+        assert tokens is not None, "tokens is None"
+
+        # print(self.layers)
+
+        with torch.fx.traceback.annotate({"stage": 0}):
+            h = self.tok_embeddings(tokens)
+            start_pos = 0
+            for i, layer in enumerate(self.layers[:self.n_layers//2]):
+                # print(f"Stage 0, Layer {i}:")
+                # print(layer)
+                # print(f"freqs_cis shape: {self.freqs_cis.shape}")
+                # print(f"mask shape: {self.mask.shape}")
+                h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+        # print("Made it past stage 0 layers")
+        with torch.fx.traceback.annotate({"stage": 1}):
+            # print("Iterating through stage 1")
+            # print(self.layers[self.n_layers//2:])
+            for layer in self.layers[self.n_layers//2:]:
+                # print(layer)
+                h = layer(h, start_pos, self.freqs_cis, self.mask)
+            # print(self.norm(h))
+            h = self.norm(h)
+            output = self.output(h).float()
+
+        return output
 
     # """
     # forward method for no pp

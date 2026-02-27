@@ -118,6 +118,13 @@ def _dispatch_a2a_single(output: torch.Tensor, input_tensor: torch.Tensor) -> to
 # Allow the dispatch function in the graph
 torch.compiler.allow_in_graph(_dispatch_a2a_single)
 
+def _meta_tensor_like(example: torch.Tensor, *, requires_grad: bool, as_parameter: bool):
+    t = torch.empty(example.shape, dtype=example.dtype, device="meta")
+    t.requires_grad_(requires_grad)
+    if as_parameter:
+        return torch.nn.Parameter(t, requires_grad=requires_grad)
+    return t
+
 def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphModule, list[int], list]]]:
     """
     Transform a graph module with stage annotations by extracting
@@ -455,10 +462,19 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
             prev_stage_outputs = set(prev_stage_outputs_list)
         
         for i, placeholder in enumerate(placeholders):
-            if "grapharg" in placeholder.meta:
-                graphargs.append(placeholder.meta["grapharg"]._example())
-            else:
-                graphargs.append(torch.zeros(placeholder.meta["example_value"].shape, dtype=placeholder.meta["example_value"].dtype, requires_grad=placeholder.meta["example_value"].requires_grad, device=placeholder.meta["example_value"].device))
+            ex = placeholder.meta["example_value"]
+
+            # Parameter-like placeholders
+            is_param_like = ("grapharg" in placeholder.meta) or ("self" in placeholder.name)
+
+            graphargs.append(
+                _meta_tensor_like(
+                    ex,
+                    requires_grad=bool(getattr(ex, "requires_grad", False)),
+                    as_parameter=is_param_like,
+                )
+            )
+
             # For the first stage, the input indices are everything that's not an attribute
             if stage_annotation_id == 0:
                 if 'self' not in placeholder.name:
