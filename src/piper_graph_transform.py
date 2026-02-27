@@ -60,12 +60,12 @@ class AllToAllSingleFunction(torch.autograd.Function):
         
         stream = ctx.actor_self.comp_stream
 
-        # comp_stream = torch.cuda.current_stream()
+        comp_stream = torch.cuda.current_stream()
 
         logger.debug(f"Dispatch AllToAllSingleFunction forward rank={ctx.global_rank}, shape={input_tensor.shape}")
 
         # PRE-HOOK: record event so bwd knows fwd comp reached this A2A
-        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.overlap_a2a_ops:
+        if ctx.actor_self.overlap_a2a_ops:
             idx = ctx.actor_self.fwd_a2a_counter
             ctx.actor_self.fwd_a2a_pre_events[idx].record(stream)
 
@@ -75,18 +75,18 @@ class AllToAllSingleFunction(torch.autograd.Function):
         input_tensor = input_tensor.contiguous()
 
         # Execute A2A
-        # stream.wait_stream(comp_stream)
+        stream.wait_stream(comp_stream)
         with torch.cuda.stream(stream):
             dist.all_to_all_single(output, input_tensor, group=ctx.group)
-        # comp_stream.wait_stream(stream)
 
         ctx.actor_self._stop_timing(stream, "fwd_a2a")
 
         # POST-HOOK: wait for bwd to reach its corresponding A2A
-        if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.overlap_a2a_ops:
+        if ctx.actor_self.overlap_a2a_ops:
             idx = ctx.actor_self.fwd_a2a_counter
             stream.wait_event(ctx.actor_self.bwd_a2a_pre_events[idx])
             ctx.actor_self.fwd_a2a_counter += 1
+        comp_stream.wait_stream(stream)
 
         return output
     
@@ -104,6 +104,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
             return None, None, None
 
         stream = ctx.actor_self.overlapped_comp_stream
+        comp_stream = torch.cuda.current_stream()
 
         # PRE-HOOK: record event so fwd post-hook knows bwd comp reached this A2A
         if getattr(ctx.actor_self, 'mode', None) == "overlapped" and ctx.actor_self.overlap_a2a_ops:
@@ -119,10 +120,9 @@ class AllToAllSingleFunction(torch.autograd.Function):
         grad_input = torch.empty_like(grad_output)
 
         # Execute A2A
-        # stream.wait_stream(comp_stream)
+        stream.wait_stream(comp_stream)
         with torch.cuda.stream(stream):
             dist.all_to_all_single(grad_input, grad_output, group=ctx.group)
-        # comp_stream.wait_stream(stream)
 
         ctx.actor_self._stop_timing(stream, "bwd_a2a")
 
@@ -132,6 +132,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
             if idx + 1 < len(ctx.actor_self.fwd_a2a_pre_events):
                 stream.wait_event(ctx.actor_self.fwd_a2a_pre_events[idx + 1])
             ctx.actor_self.bwd_a2a_counter += 1
+        comp_stream.wait_stream(stream)
 
         # Return gradients: grad_output flows to grad_input, None for group
         return grad_input, grad_input, None

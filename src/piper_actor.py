@@ -129,7 +129,7 @@ class PiperActor:
         self.p2p_stream = torch.cuda.Stream()
         self.overlapped_comp_stream = torch.cuda.Stream()
         self.overlapped_p2p_stream = torch.cuda.Stream()
-        if mode == "naive":
+        if mode == "naive" or mode == "overlapped":
             self.per_mb_streams = [torch.cuda.Stream() for _ in range(2)]
         self.n_a2a_ops = dict()
         self.overlap_a2a_ops = False
@@ -669,15 +669,11 @@ class PiperActor:
     def _forward(self, stage_id: int, mb_idx: int, *deps):
         if self.mode == "sequential":
             comp_stream = self.comp_stream
-        elif self.mode == "naive":
+        elif self.mode == "naive" or self.mode == "overlapped":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
-        elif self.mode == "overlapped":
-            comp_stream = self.comp_stream
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
         
-        self.overlap_a2a_ops = False
-
         self.logger.debug(
             f"Calling forward {stage_id} mb {mb_idx} on actor {self.global_rank}"
         )
@@ -768,14 +764,10 @@ class PiperActor:
     def _backward(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
         if self.mode == "sequential":
             comp_stream = self.comp_stream
-        elif self.mode == "naive":
+        elif self.mode == "naive" or self.mode == "overlapped":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
-        elif self.mode == "overlapped":
-            comp_stream = self.comp_stream
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
-
-        self.overlap_a2a_ops = False
 
         self.logger.debug(
             f"Calling backward {stage_id} mb {mb_idx} on actor {self.global_rank}"
@@ -834,7 +826,7 @@ class PiperActor:
 
 
     def _backward_input(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        comp_stream = self.comp_stream
+        comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
 
         self.logger.debug(
             f"Calling backward I {stage_id} mb {mb_idx} on actor {self.global_rank}"
@@ -1091,8 +1083,8 @@ class PiperActor:
             bwd_comp_stream = self.per_mb_streams[(bwd_stage_id + bwd_mb_idx) % 2]
             self.overlap_a2a_ops = False
         elif self.mode == "overlapped":
-            fwd_comp_stream = self.comp_stream
-            bwd_comp_stream = self.overlapped_comp_stream
+            fwd_comp_stream = self.per_mb_streams[(fwd_stage_id + fwd_mb_idx) % 2]
+            bwd_comp_stream = self.per_mb_streams[(bwd_stage_id + bwd_mb_idx) % 2]
             self.overlap_a2a_ops = True
             # initialize A2A states
             self.fwd_a2a_pre_events = [torch.cuda.Event() for _ in range(self.n_a2a_ops[fwd_stage_id])]
@@ -1101,8 +1093,6 @@ class PiperActor:
             self.bwd_a2a_counter = 0
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
-        fwd_p2p_stream = self.p2p_stream
-        bwd_p2p_stream = self.p2p_stream
 
         self.logger.debug(
             f"Calling forward {fwd_stage_id} mb {fwd_mb_idx} backward {bwd_stage_id} mb {bwd_mb_idx} on actor {self.global_rank}"
@@ -1216,7 +1206,8 @@ class PiperActor:
         torch.cuda.synchronize()
 
         # clear A2A states
-        if self.overlap_a2a_ops and self.dp_degree > 1:
+        if self.overlap_a2a_ops:
+            self.overlap_a2a_ops = False
             self.fwd_a2a_pre_events.clear()
             self.bwd_a2a_pre_events.clear()
             self.fwd_a2a_counter = 0
