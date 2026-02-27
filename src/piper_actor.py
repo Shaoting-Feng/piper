@@ -1,8 +1,11 @@
+from contextlib import nullcontext
+
 import ray
 import torch
 import logging
 import os
 import time
+import threading
 from typing import Any, Dict, List, Set, Tuple
 import gc
 from torch._guards import CompileId
@@ -667,9 +670,9 @@ class PiperActor:
         self.inp_activation[stage_id][mb_idx] = None
     
     def _forward(self, stage_id: int, mb_idx: int, *deps):
-        if self.mode == "sequential":
+        if self.mode == "sequential" or self.mode == "overlapped":
             comp_stream = self.comp_stream
-        elif self.mode == "naive" or self.mode == "overlapped":
+        elif self.mode == "naive":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
@@ -762,9 +765,9 @@ class PiperActor:
         return 1
 
     def _backward(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        if self.mode == "sequential":
+        if self.mode == "sequential" or self.mode == "overlapped":
             comp_stream = self.comp_stream
-        elif self.mode == "naive" or self.mode == "overlapped":
+        elif self.mode == "naive":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
@@ -1083,14 +1086,9 @@ class PiperActor:
             bwd_comp_stream = self.per_mb_streams[(bwd_stage_id + bwd_mb_idx) % 2]
             self.overlap_a2a_ops = False
         elif self.mode == "overlapped":
-            fwd_comp_stream = self.per_mb_streams[(fwd_stage_id + fwd_mb_idx) % 2]
-            bwd_comp_stream = self.per_mb_streams[(bwd_stage_id + bwd_mb_idx) % 2]
+            fwd_comp_stream = self.comp_stream
+            bwd_comp_stream = self.comp_stream
             self.overlap_a2a_ops = True
-            # initialize A2A states
-            self.fwd_a2a_pre_events = [torch.cuda.Event() for _ in range(self.n_a2a_ops[fwd_stage_id])]
-            self.bwd_a2a_pre_events = [torch.cuda.Event() for _ in range(self.n_a2a_ops[bwd_stage_id])]
-            self.fwd_a2a_counter = 0
-            self.bwd_a2a_counter = 0
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
@@ -1146,29 +1144,58 @@ class PiperActor:
             assert loss_fn is not None
             labels = self.labels
             assert out_activation.shape == labels.shape
-
-        # RUN FORWARD PASS
+            
         if self.profile:
             forward_ctx_manager = torch.profiler.record_function(f"forward_stage_{fwd_stage_id}_mb_{fwd_mb_idx}")
-            forward_ctx_manager.__enter__()
-
-        with torch.cuda.stream(fwd_comp_stream):
-            output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
-
-        # RUN BACKWARD PASS
-        if self.profile:
-            forward_ctx_manager.__exit__(None, None, None)
             backward_ctx_manager = torch.profiler.record_function(f"backward_stage_{bwd_stage_id}_mb_{bwd_mb_idx}")
-            backward_ctx_manager.__enter__()
-        if self.overlap_a2a_ops and self.dp_degree > 1:
-            bwd_comp_stream.wait_event(self.fwd_a2a_pre_events[0])
-        if bwd_stage_id < self.num_stages - 1:
-            with torch.cuda.stream(bwd_comp_stream):
-                out_activation.backward(gradient=input_grad)
         else:
-            with torch.cuda.stream(bwd_comp_stream):
-                loss = loss_fn(out_activation, labels)
-                loss.backward()
+            forward_ctx_manager = nullcontext()
+            backward_ctx_manager = nullcontext()
+
+        # RUN FORWARD AND BACKWARD PASSES
+        if self.overlap_a2a_ops:
+            output = None
+            loss = None
+            # threading.Events for CPU-side thread coordination
+            n_a2a = self.n_a2a_ops[fwd_stage_id]
+            self.fwd_a2a_submitted = [threading.Event() for _ in range(n_a2a)]
+            self.bwd_a2a_submitted = [threading.Event() for _ in range(n_a2a)]
+            self.fwd_a2a_counter = 0
+            self.bwd_a2a_counter = 0
+
+            def run_fwd():
+                nonlocal output
+                with torch.cuda.stream(fwd_comp_stream), forward_ctx_manager:
+                    output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
+
+            def run_bwd():
+                nonlocal loss
+                self.fwd_a2a_submitted[0].wait()
+                if bwd_stage_id < self.num_stages - 1:
+                    with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                        out_activation.backward(gradient=input_grad)
+                else:
+                    with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                        loss = loss_fn(out_activation, labels)
+                        loss.backward()
+
+            fwd_thread = threading.Thread(target=run_fwd)
+            bwd_thread = threading.Thread(target=run_bwd)
+            fwd_thread.start()
+            bwd_thread.start()
+            fwd_thread.join()
+            bwd_thread.join()
+        else:
+            with torch.cuda.stream(fwd_comp_stream), forward_ctx_manager:
+                output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
+
+            if bwd_stage_id < self.num_stages - 1:
+                with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                    out_activation.backward(gradient=input_grad)
+            else:
+                with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                    loss = loss_fn(out_activation, labels)
+                    loss.backward()
 
         # POST PROCESS FORWARD PASS
         out_with_grad = [out for out in output if out.requires_grad]
@@ -1208,8 +1235,8 @@ class PiperActor:
         # clear A2A states
         if self.overlap_a2a_ops:
             self.overlap_a2a_ops = False
-            self.fwd_a2a_pre_events.clear()
-            self.bwd_a2a_pre_events.clear()
+            self.fwd_a2a_submitted.clear()
+            self.bwd_a2a_submitted.clear()
             self.fwd_a2a_counter = 0
             self.bwd_a2a_counter = 0
 
