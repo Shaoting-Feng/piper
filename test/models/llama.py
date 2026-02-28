@@ -409,88 +409,88 @@ class Transformer(nn.Module):
         log_size(self.output)
 
         # Register freq_cis and mask as buffers so they are moved with the model
-        freqs_cis = precompute_freqs_cis(
+        self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
             self.seq_len,
             params.rope_theta,
         )
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        # self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
         mask = torch.full((self.seq_len, self.seq_len), float("-inf"))
         mask = torch.triu(mask, diagonal=1)
-        mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask])
-        self.register_buffer("mask", mask, persistent=False)
-
-    # """
-    # forward method for pp4-1f1b or pp2-interleaved-1f1b
-    # requires:
-    # - 4 devices
-    # - 4 stages
-    # - n_layers is divisible by 4
-    # """
-    # def forward(self, tokens: torch.Tensor):
-
-    #     with torch.fx.traceback.annotate({"stage": 0}):
-    #         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-    #         start_pos = 0
-    #         for layer in self.layers[:self.n_layers//4]:
-    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     with torch.fx.traceback.annotate({"stage": 1}):
-    #         for layer in self.layers[self.n_layers//4:self.n_layers//2]:
-    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     with torch.fx.traceback.annotate({"stage": 2}):
-    #         for layer in self.layers[self.n_layers//2:3*self.n_layers//4]:
-    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     with torch.fx.traceback.annotate({"stage": 3}):
-    #         for layer in self.layers[3*self.n_layers//4:]:
-    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-    #         h = self.norm(h) if self.norm else h
-    #         output = self.output(h).float() if self.output else h
-
-    #     return output
+        self.mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask])
+        # self.register_buffer("mask", mask, persistent=False)
 
     """
-    forward method for 1f1b schedule
+    forward method for pp4-1f1b or pp2-interleaved-1f1b
     requires:
-    - 2 stages
-    - n_layers is divisible by 2
+    - 4 devices
+    - 4 stages
+    - n_layers is divisible by 4
     """
     def forward(self, tokens: torch.Tensor):
-        assert self.freqs_cis is not None, "freqs_cis is None"
-        assert self.mask is not None, "mask is None"
-        assert self.tok_embeddings is not None, "tok_embeddings is None"
-        assert self.layers is not None, "layers is None"
-        assert self.norm is not None, "norm is None"
-        assert self.output is not None, "output is None"
-        assert tokens is not None, "tokens is None"
-
-        # print(self.layers)
 
         with torch.fx.traceback.annotate({"stage": 0}):
-            h = self.tok_embeddings(tokens)
+            h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
             start_pos = 0
-            for i, layer in enumerate(self.layers[:self.n_layers//2]):
-                # print(f"Stage 0, Layer {i}:")
-                # print(layer)
-                # print(f"freqs_cis shape: {self.freqs_cis.shape}")
-                # print(f"mask shape: {self.mask.shape}")
+            for layer in self.layers[:self.n_layers//4]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
 
-        # print("Made it past stage 0 layers")
         with torch.fx.traceback.annotate({"stage": 1}):
-            # print("Iterating through stage 1")
-            # print(self.layers[self.n_layers//2:])
-            for layer in self.layers[self.n_layers//2:]:
-                # print(layer)
+            for layer in self.layers[self.n_layers//4:self.n_layers//2]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
-            # print(self.norm(h))
-            h = self.norm(h)
-            output = self.output(h).float()
+
+        with torch.fx.traceback.annotate({"stage": 2}):
+            for layer in self.layers[self.n_layers//2:3*self.n_layers//4]:
+                h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+        with torch.fx.traceback.annotate({"stage": 3}):
+            for layer in self.layers[3*self.n_layers//4:]:
+                h = layer(h, start_pos, self.freqs_cis, self.mask)
+            h = self.norm(h) if self.norm else h
+            output = self.output(h).float() if self.output else h
 
         return output
+
+    # """
+    # forward method for 1f1b schedule
+    # requires:
+    # - 2 stages
+    # - n_layers is divisible by 2
+    # """
+    # def forward(self, tokens: torch.Tensor):
+    #     assert self.freqs_cis is not None, "freqs_cis is None"
+    #     assert self.mask is not None, "mask is None"
+    #     assert self.tok_embeddings is not None, "tok_embeddings is None"
+    #     assert self.layers is not None, "layers is None"
+    #     assert self.norm is not None, "norm is None"
+    #     assert self.output is not None, "output is None"
+    #     assert tokens is not None, "tokens is None"
+
+    #     # print(self.layers)
+
+    #     with torch.fx.traceback.annotate({"stage": 0}):
+    #         h = self.tok_embeddings(tokens)
+    #         start_pos = 0
+    #         for i, layer in enumerate(self.layers[:self.n_layers//2]):
+    #             # print(f"Stage 0, Layer {i}:")
+    #             # print(layer)
+    #             # print(f"freqs_cis shape: {self.freqs_cis.shape}")
+    #             # print(f"mask shape: {self.mask.shape}")
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     # print("Made it past stage 0 layers")
+    #     with torch.fx.traceback.annotate({"stage": 1}):
+    #         # print("Iterating through stage 1")
+    #         # print(self.layers[self.n_layers//2:])
+    #         for layer in self.layers[self.n_layers//2:]:
+    #             # print(layer)
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+    #         # print(self.norm(h))
+    #         h = self.norm(h)
+    #         output = self.output(h).float()
+
+    #     return output
 
     # """
     # forward method for no pp

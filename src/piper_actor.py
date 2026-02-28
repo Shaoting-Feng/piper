@@ -401,7 +401,7 @@ class PiperActor:
 
         del gm_data
 
-    def materialize_stage(self, stage_id: int, init="random", seed=0):
+    def materialize_stage(self, stage_id: int):
         if self.stage_materialized[stage_id]:
             return 1
 
@@ -409,7 +409,7 @@ class PiperActor:
         realized = [None] * len(meta_args)
 
         g = torch.Generator(device=self.device)
-        g.manual_seed(seed + 1000 * self.global_rank + stage_id)
+        g.manual_seed(0 + 1000 * self.global_rank + stage_id)
 
         for i, arg in enumerate(meta_args):
             if arg is None:
@@ -419,8 +419,7 @@ class PiperActor:
 
             if arg.requires_grad:
                 t.requires_grad_(True)
-                if init == "random":
-                    torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
+                torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
             else:
                 t.zero_()
 
@@ -443,9 +442,9 @@ class PiperActor:
         return 1
 
 
-    def materialize_all_stages(self, init="random", seed=0):
+    def materialize_all_stages(self):
         for stage_id in list(self.forward_args_meta.keys()):
-            self.materialize_stage(stage_id, init=init, seed=seed)
+            self.materialize_stage(stage_id)
         return 1
 
     def _exec_p2p_op(

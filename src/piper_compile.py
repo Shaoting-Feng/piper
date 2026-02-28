@@ -175,7 +175,7 @@ def piper_setup(
     logger.info(f"DP rank {dp_rank+1} stage graphs loaded onto actors.")
 
     ray.get([
-        actor.materialize_all_stages.remote(init=init, seed=seed)
+        actor.materialize_all_stages.remote()
         for actor in piper_metadata.actors.values()
     ])
     logger.info(f"DP rank {dp_rank+1} stages materialized on actors.")

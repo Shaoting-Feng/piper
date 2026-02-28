@@ -9,8 +9,9 @@ import gc
 from src.piper_exec import piper_exec
 from src.piper_compile import piper_setup, piper_shutdown
 from src.piper_coordinator import PiperProgramCoordinator
+from src.piper_utils import piper_metadata
 
-from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B
+from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B, LLAMA_70B
 from .schedule_helpers import (
     build_1f1b_schedule, 
     build_gpipe_schedule, 
@@ -34,6 +35,8 @@ def main(args):
             llama_config = LLAMA_3B
         case '8b':
             llama_config = LLAMA_8B
+        case '70b':
+            llama_config = LLAMA_70B
     print(args) 
 
     loss_fn = torch.nn.CrossEntropyLoss()
@@ -98,13 +101,13 @@ def main(args):
     )
 
     if args.tracing:
-        ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
+        ray.get([actor.set_tracing.remote(args.tracing) for actor in piper_metadata.actors.values()])
 
         print(f"Running {args.warmup} tracing iterations...")
         for _ in range(args.warmup):
             piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
 
-        trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
+        trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in piper_metadata.actors.values()])
         for rank, trace_data in trace_data_ret:
             for key in trace_data:
                 all_times = trace_data[key]
@@ -122,8 +125,8 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
-    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b'], default='debug',
-                        help='Model configuration: debug, 1b, 3b, or 8b (default: debug)')
+    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b', '70b'], default='debug',
+                        help='Model configuration: debug, 1b, 3b, 8b, or 70b (default: debug)')
     parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'dualpipev', 'no-pp'], default='1f1b',
                         help='Schedule type: gpipe, 1f1b, interleaved-1f1b, dualpipev, or no-pp (default: 1f1b)')
     parser.add_argument('--dp', type=int, default=1,
