@@ -16,34 +16,14 @@ logger = create_logger("piper_backend", LOG_LEVEL)
 @register_backend
 def piper(gm, example_inputs, **kwargs):
 
-    # gm(*example_inputs)
-    # start = torch.cuda.Event(enable_timing=True)
-    # start.record()
-    # for i in range(10):
-    #     gm(*example_inputs)
-    # end = torch.cuda.Event(enable_timing=True)
-    # end.record()
-    # torch.cuda.synchronize()
-    # print(f"Entire model time measured on controller: {start.elapsed_time(end) / 10:.2f} ms")
-    def _dump_get_attrs(tag, gm_):
-        attrs = [n.target for n in gm_.graph.nodes if n.op == "get_attr"]
-        print(f"[{tag}] get_attr targets:", attrs)
-
-    # print("gm code:")
-    # gm.print_readable()
-    # print("nodes:", [(n.op, n.target) for n in gm.graph.nodes])
-
     original_gm = gm
-
-    # _dump_get_attrs("original gm", original_gm)
-
     top_level_gm, submodules = _split_gm_by_stages(gm)
+    
     num_stages = len(piper_metadata.stage_to_device.keys())
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     pp_degree = int(os.environ['PIPER_PP_DEGREE'])
     dp_degree = int(os.environ['PIPER_DP_DEGREE'])
 
-    # top_level_gm.print_readable()
     del top_level_gm
 
     refs = []
@@ -66,9 +46,6 @@ def piper(gm, example_inputs, **kwargs):
         actor = _get_actor(actor_id)
         actor_stages.append((actor, stage_id))
         
-
-        # _dump_get_attrs(f"stage{stage_id}-pre-serialize", stage_gm)
-
         stage_gm_data = _serialize_graphmodule(stage_gm)
         refs.append(actor._load_stage.remote(
             stage_id, 

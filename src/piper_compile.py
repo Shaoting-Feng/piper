@@ -134,10 +134,6 @@ def piper_setup(
         num_devices, optim_fn, num_mbs, num_stages, p2p_schedules, naive_gradient_sync
     )
 
-    # last_stage_rank = stage_to_device[num_stages - 1]
-    # ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
-    # ray.get(piper_metadata.actors[last_stage_rank].load_labels.remote(example_outputs))
-
     ray.get(
         [
             actor._join_process_groups.remote()
@@ -145,7 +141,7 @@ def piper_setup(
         ]
     )
 
-    # Build the model on meta device
+    # Build the model directly on meta device
     with torch.device("meta"):
         model = model_class(*model_args, **model_kwargs)
 
@@ -155,20 +151,7 @@ def piper_setup(
     logger.info(f"DP rank {dp_rank+1} compiling (meta)...")
 
     # Create meta tensors from our example_inputs to pass to the compiled graph
-    # meta_inputs = [torch.empty_like(t, device="meta") for t in example_inputs]
     meta_inputs = [x.to(device="meta") for x in example_inputs]
-
-    # # 1) Verify meta model params are actually meta
-    # for n, p in model.named_parameters():
-    #     assert p.device.type == "meta", (n, p.device)
-
-    # for n, b in model.named_buffers():
-    #     assert b.device.type == "meta", (n, b.device)
-
-    # # 2) Verify meta inputs
-    # for i, x in enumerate(meta_inputs):
-    #     assert isinstance(x, torch.Tensor)
-    #     assert x.device.type == "meta", (i, x.device)
 
     _ = compiled(*meta_inputs)
 

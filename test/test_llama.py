@@ -40,9 +40,6 @@ def main(args):
     print(args) 
 
     loss_fn = torch.nn.CrossEntropyLoss()
-    
-    # model = Transformer(llama_config, args.seq_len)
-    # model.to('cuda')
 
     x = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len)).to('cuda')
     y = torch.randn((args.batch_size, args.seq_len, llama_config.vocab_size)).to('cuda')

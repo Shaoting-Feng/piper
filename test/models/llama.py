@@ -103,14 +103,14 @@ LLAMA_70B = ModelArgs(
     dim=8192,
     n_layers=80,
     n_heads=64,
-    n_kv_heads=8,          # GQA (Grouped Query Attention)
+    n_kv_heads=8,
     vocab_size=128256,
     multiple_of=4096,
     ffn_dim_multiplier=1.3,
     norm_eps=1e-5,
     rope_theta=500000,
     max_batch_size=32,
-    max_seq_len=8192,      # Llama 3 default context length
+    max_seq_len=8192,
 )
 
 
@@ -248,8 +248,6 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # print(f"xq is None: {xq is None}, xk is None: {xk is None}, xv is None: {xv is None}")
-
         # [NOTE] Disable KV cache during training.
 
         # self.cache_k = self.cache_k.to(xq)
@@ -277,9 +275,7 @@ class Attention(nn.Module):
         values = values.transpose(
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        # print("Calculating scores")
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # print("Calculated scores")
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
@@ -356,11 +352,8 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        # print(f"TransformerBlock {self.layer_id} forward:")
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-        # print(f"After attention: {h.shape}")
         out = h + self.feed_forward(self.ffn_norm(h))
-        # print(f"After feed forward: {out.shape}")
         return out
 
 
@@ -414,12 +407,10 @@ class Transformer(nn.Module):
             self.seq_len,
             params.rope_theta,
         )
-        # self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
         mask = torch.full((self.seq_len, self.seq_len), float("-inf"))
         mask = torch.triu(mask, diagonal=1)
         self.mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask])
-        # self.register_buffer("mask", mask, persistent=False)
 
     """
     forward method for pp4-1f1b or pp2-interleaved-1f1b
@@ -459,34 +450,14 @@ class Transformer(nn.Module):
     # - n_layers is divisible by 2
     # """
     # def forward(self, tokens: torch.Tensor):
-    #     assert self.freqs_cis is not None, "freqs_cis is None"
-    #     assert self.mask is not None, "mask is None"
-    #     assert self.tok_embeddings is not None, "tok_embeddings is None"
-    #     assert self.layers is not None, "layers is None"
-    #     assert self.norm is not None, "norm is None"
-    #     assert self.output is not None, "output is None"
-    #     assert tokens is not None, "tokens is None"
-
-    #     # print(self.layers)
-
     #     with torch.fx.traceback.annotate({"stage": 0}):
     #         h = self.tok_embeddings(tokens)
     #         start_pos = 0
     #         for i, layer in enumerate(self.layers[:self.n_layers//2]):
-    #             # print(f"Stage 0, Layer {i}:")
-    #             # print(layer)
-    #             # print(f"freqs_cis shape: {self.freqs_cis.shape}")
-    #             # print(f"mask shape: {self.mask.shape}")
     #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     # print("Made it past stage 0 layers")
     #     with torch.fx.traceback.annotate({"stage": 1}):
-    #         # print("Iterating through stage 1")
-    #         # print(self.layers[self.n_layers//2:])
     #         for layer in self.layers[self.n_layers//2:]:
-    #             # print(layer)
     #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-    #         # print(self.norm(h))
     #         h = self.norm(h)
     #         output = self.output(h).float()
 

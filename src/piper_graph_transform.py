@@ -467,6 +467,8 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
             # Parameter-like placeholders
             is_param_like = ("grapharg" in placeholder.meta) or ("self" in placeholder.name)
 
+            # we may not actually need to call _metathis if we're already placing example inputs on meta, 
+            # but it's guaranteed to be safe with this function call
             graphargs.append(
                 _meta_tensor_like(
                     ex,
