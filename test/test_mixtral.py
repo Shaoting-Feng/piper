@@ -59,26 +59,21 @@ def main(args):
             schedule = DUALPIPEV_NOZB_MB6_SCHEDULE
     print("Schedule:")
     print_schedule(schedule)
-    
-    model = Transformer(config)
-    model.to('cuda')
-    num_params = sum(p.numel() for p in model.parameters())
-    param_size_mb = num_params * 4 / (1024**3)  # float32
-    print(f"Model size: {num_params/(1e6):.0f} M parameters ({param_size_mb:.2f} GB)")
 
-    x = torch.randint(0, config.vocab_size, (batch_size, config.block_size)).to('cuda')
-    input_pos = torch.arange(config.block_size).to('cuda')
-    y = torch.randn(batch_size, config.block_size, config.vocab_size).to('cuda')
+    x = torch.randint(0, config.vocab_size, (batch_size, config.block_size))
+    input_pos = torch.arange(config.block_size)
+    y = torch.randn(batch_size, config.block_size, config.vocab_size)
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
     piper_setup(
-        model,
-        torch.optim.Adam,
-        [x, input_pos],
-        y,
-        schedule,
-        args.naive_grad_sync,
+        Transformer,
+        model_args=(config,),
+        optim_fn=torch.optim.Adam,
+        example_inputs=[x, input_pos],
+        example_outputs=y,
+        schedule=schedule,
+        naive_gradient_sync=args.naive_grad_sync,
         mode=args.mode,
     )
 

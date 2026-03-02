@@ -99,6 +99,20 @@ LLAMA_8B = ModelArgs(
     max_seq_len=2048,
 )
 
+LLAMA_70B = ModelArgs(
+    dim=8192,
+    n_layers=80,
+    n_heads=64,
+    n_kv_heads=8,
+    vocab_size=128256,
+    multiple_of=4096,
+    ffn_dim_multiplier=1.3,
+    norm_eps=1e-5,
+    rope_theta=500000,
+    max_batch_size=32,
+    max_seq_len=8192,
+)
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -387,15 +401,16 @@ class Transformer(nn.Module):
         )
         log_size(self.output)
 
+        # Register freq_cis and mask as buffers so they are moved with the model
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
             self.seq_len,
             params.rope_theta,
-        ).to('cuda')
+        )
 
         mask = torch.full((self.seq_len, self.seq_len), float("-inf"))
         mask = torch.triu(mask, diagonal=1)
-        self.mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask]).to('cuda')
+        self.mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask])
 
     # """
     # 8 STAGES
@@ -469,13 +484,11 @@ class Transformer(nn.Module):
     # 2 STAGES
     # """
     # def forward(self, tokens: torch.Tensor):
-
     #     with torch.fx.traceback.annotate({"stage": 0}):
     #         h = self.tok_embeddings(tokens)
     #         start_pos = 0
     #         for layer in self.layers[:self.n_layers//2+2]:
     #             h = layer(h, start_pos, self.freqs_cis, self.mask)
-
     #     with torch.fx.traceback.annotate({"stage": 1}):
     #         for layer in self.layers[self.n_layers//2+2:]:
     #             h = layer(h, start_pos, self.freqs_cis, self.mask)

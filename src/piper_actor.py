@@ -5,6 +5,7 @@ import os
 import time
 from typing import Any, Dict, List, Set, Tuple
 import gc
+import threading
 from torch._guards import CompileId
 from torch.nn import Parameter
 from torch.autograd.graph import GradientEdge, Node
@@ -391,44 +392,53 @@ class PiperActor:
     ):
         self.logger.debug(f"Loading stage {stage_id} graph on actor {self.global_rank}")
 
-        # compile the graph with the given graphargs
         gm = _deserialize_graphmodule(gm_data)
 
-        # Store GraphModule reference
         self.graph_modules[stage_id] = gm
         self.forward_fns[stage_id] = gm.forward
 
         # initialize A2A states
         self.n_a2a_ops[stage_id] = n_a2a_ops
 
-        # place parameters on the device
-        def move_to_device(idx, arg):
-            if arg.requires_grad:
-                return arg.to(self.device).detach().requires_grad_(True)
-            else:
-                return arg.to(self.device)
-        forward_args = list(map(move_to_device, range(len(forward_args)), forward_args))
-
-        # save parameters
-        self.forward_args[stage_id] = forward_args
         self.stage_id = stage_id
         self.input_idxs[stage_id] = input_idxs
         self.param_idxs[stage_id] = param_idxs
 
+        # Save input meta and punch holes
         for i in self.input_idxs[stage_id]:
             self.forward_input_meta[stage_id][i] = (
                 forward_args[i].shape,
                 forward_args[i].dtype,
                 forward_args[i].requires_grad,
             )
-            self.forward_args[stage_id][i] = None
+            forward_args[i] = None
 
-        # prepare tensors with DP comm ops
+        realized = [None] * len(forward_args)
+        g = torch.Generator(device=self.device)
+        g.manual_seed(1000 * self.global_rank + stage_id)
+
+        for i, arg in enumerate(forward_args):
+            if arg is None:
+                continue
+
+            t = torch.empty(arg.shape, dtype=arg.dtype, device=self.device)
+
+            if arg.requires_grad:
+                t.requires_grad_(True)
+                torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
+            else:
+                t.zero_()
+
+            realized[i] = t
+
+        self.forward_args[stage_id] = realized
+
+        # It's safe to setup hooks + optimizer after tensors are materialized
         if not self.naive_gradient_sync and self.dp_degree > 1:
             self._prepare_dp_comm_ops(stage_id)
 
-        # add the parameters to the optimizer for this stage
-        params = [param for param in forward_args if param is not None and param.requires_grad]
+        params = [t for t in realized if t is not None and t.requires_grad]
+
         if stage_id not in self.optims:
             self.optims[stage_id] = self.optim_class(params)
         else:
@@ -1149,17 +1159,10 @@ class PiperActor:
             self.overlap_a2a_ops = False
         elif self.mode == "overlapped":
             fwd_comp_stream = self.comp_stream
-            bwd_comp_stream = self.overlapped_comp_stream
+            bwd_comp_stream = self.comp_stream
             self.overlap_a2a_ops = True
-            # initialize A2A states
-            self.fwd_a2a_pre_events = [torch.cuda.Event() for _ in range(self.n_a2a_ops[fwd_stage_id])]
-            self.bwd_a2a_pre_events = [torch.cuda.Event() for _ in range(self.n_a2a_ops[bwd_stage_id])]
-            self.fwd_a2a_counter = 0
-            self.bwd_a2a_counter = 0
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
-        fwd_p2p_stream = self.p2p_stream
-        bwd_p2p_stream = self.p2p_stream
 
         self.logger.debug(
             f"Calling forward {fwd_stage_id} mb {fwd_mb_idx} backward {bwd_stage_id} mb {bwd_mb_idx} on actor {self.global_rank}"
@@ -1213,29 +1216,58 @@ class PiperActor:
             assert loss_fn is not None
             labels = self.labels
             assert out_activation.shape == labels.shape
-
-        # RUN FORWARD PASS
+            
         if self.profile:
             forward_ctx_manager = torch.profiler.record_function(f"forward_stage_{fwd_stage_id}_mb_{fwd_mb_idx}")
-            forward_ctx_manager.__enter__()
-
-        with torch.cuda.stream(fwd_comp_stream):
-            output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
-
-        # RUN BACKWARD PASS
-        if self.profile:
-            forward_ctx_manager.__exit__(None, None, None)
             backward_ctx_manager = torch.profiler.record_function(f"backward_stage_{bwd_stage_id}_mb_{bwd_mb_idx}")
-            backward_ctx_manager.__enter__()
-        if self.overlap_a2a_ops and self.dp_degree > 1:
-            bwd_comp_stream.wait_event(self.fwd_a2a_pre_events[0])
-        if bwd_stage_id < self.num_stages - 1:
-            with torch.cuda.stream(bwd_comp_stream):
-                out_activation.backward(gradient=input_grad)
         else:
-            with torch.cuda.stream(bwd_comp_stream):
-                loss = loss_fn(out_activation, labels)
-                loss.backward()
+            forward_ctx_manager = nullcontext()
+            backward_ctx_manager = nullcontext()
+
+        # RUN FORWARD AND BACKWARD PASSES
+        if self.overlap_a2a_ops:
+            output = None
+            loss = None
+            # threading.Events for CPU-side thread coordination
+            n_a2a = self.n_a2a_ops[fwd_stage_id]
+            self.fwd_a2a_submitted = [threading.Event() for _ in range(n_a2a)]
+            self.bwd_a2a_submitted = [threading.Event() for _ in range(n_a2a)]
+            self.fwd_a2a_counter = 0
+            self.bwd_a2a_counter = 0
+
+            def run_fwd():
+                nonlocal output
+                with torch.cuda.stream(fwd_comp_stream), forward_ctx_manager:
+                    output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
+
+            def run_bwd():
+                nonlocal loss
+                self.fwd_a2a_submitted[0].wait()
+                if bwd_stage_id < self.num_stages - 1:
+                    with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                        out_activation.backward(gradient=input_grad)
+                else:
+                    with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                        loss = loss_fn(out_activation, labels)
+                        loss.backward()
+
+            fwd_thread = threading.Thread(target=run_fwd)
+            bwd_thread = threading.Thread(target=run_bwd)
+            fwd_thread.start()
+            bwd_thread.start()
+            fwd_thread.join()
+            bwd_thread.join()
+        else:
+            with torch.cuda.stream(fwd_comp_stream), forward_ctx_manager:
+                output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
+
+            if bwd_stage_id < self.num_stages - 1:
+                with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                    out_activation.backward(gradient=input_grad)
+            else:
+                with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
+                    loss = loss_fn(out_activation, labels)
+                    loss.backward()
 
         # POST PROCESS FORWARD PASS
         out_with_grad = [out for out in output if out.requires_grad]
@@ -1273,9 +1305,10 @@ class PiperActor:
         torch.cuda.synchronize()
 
         # clear A2A states
-        if self.overlap_a2a_ops and self.dp_degree > 1:
-            self.fwd_a2a_pre_events.clear()
-            self.bwd_a2a_pre_events.clear()
+        if self.overlap_a2a_ops:
+            self.overlap_a2a_ops = False
+            self.fwd_a2a_submitted.clear()
+            self.bwd_a2a_submitted.clear()
             self.fwd_a2a_counter = 0
             self.bwd_a2a_counter = 0
 

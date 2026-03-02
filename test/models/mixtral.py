@@ -92,10 +92,10 @@ class Transformer(nn.Module):
 
         self.freqs_cis: Optional[Tensor] = precompute_freqs_cis(
             self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base
-        ).to('cuda')
+        )
         self.causal_mask: Optional[Tensor] = torch.tril(
             torch.ones(self.config.block_size, self.config.block_size, dtype=torch.bool)
-        ).to('cuda')
+        )
         
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
