@@ -1,11 +1,8 @@
-from contextlib import nullcontext
-
 import ray
 import torch
 import logging
 import os
 import time
-import threading
 from typing import Any, Dict, List, Set, Tuple
 import gc
 from torch._guards import CompileId
@@ -51,7 +48,7 @@ def _create_actors(
     for pp_rank in range(num_actors):
         global_rank = _get_rank(pp_rank, dp_rank, pp_degree)
         p2p_schedule = p2p_schedules[pp_rank]
-        actor = PiperActor.options(num_gpus=1).remote(
+        actor = PiperActor.options(num_gpus=0.8).remote(
             pp_rank,
             optim_class,
             world_size,
@@ -132,7 +129,7 @@ class PiperActor:
         self.p2p_stream = torch.cuda.Stream()
         self.overlapped_comp_stream = torch.cuda.Stream()
         self.overlapped_p2p_stream = torch.cuda.Stream()
-        if mode == "naive" or mode == "overlapped":
+        if mode == "naive":
             self.per_mb_streams = [torch.cuda.Stream() for _ in range(2)]
         self.n_a2a_ops = dict()
         self.overlap_a2a_ops = False
@@ -293,6 +290,54 @@ class PiperActor:
 
     def shutdown(self):
         dist.destroy_process_group()
+
+    def _maybe_trigger_grad_allreduce(
+        self, stage_id: int, param: torch.nn.Parameter
+    ) -> None:
+        """
+        Preserve `_prepare_dp_comm_ops` semantics for split backward (BWD_I/BWD_W).
+
+        `_prepare_dp_comm_ops` attaches `register_post_accumulate_grad_hook` to params.
+        Those hooks fire only when autograd's AccumulateGrad runs. In ZeroBubble's
+        split backward, we compute grads via `torch.autograd.grad` and manually
+        accumulate into `param.grad`, so AccumulateGrad (and thus the hooks) never run.
+
+        This helper mirrors the hook behavior: once a parameter has had gradients
+        accumulated for all microbatches (`num_mbs`), launch an async all-reduce on
+        the accumulated `param.grad` and store the handle so `_wait_for_comm_ops()`
+        can wait on it before the optimizer step.
+        """
+        if self.naive_gradient_sync or self.dp_degree <= 1:
+            return
+        if param.grad is None:
+            return
+
+        tid = id(param)
+        self.logger.debug(f"Split bwd: Updating status on actor {self.global_rank}, tensor={tid}")
+        if stage_id not in self.comm_op_tensor_ids:
+            return
+        if tid not in self.comm_op_tensor_ids[stage_id]:
+            return
+
+        self.comm_op_status[stage_id][tid] += 1
+        self.logger.debug(
+            f"Split bwd: Updating status on actor {self.global_rank}, tensor={tid}, "
+            f"status={self.comm_op_status[stage_id][tid]}/{self.num_mbs}"
+        )
+
+        if self.comm_op_status[stage_id][tid] == self.num_mbs:
+            with torch.cuda.stream(self.comm_stream):
+                handle = dist.all_reduce(
+                    param.grad,
+                    op=dist.ReduceOp.AVG,
+                    group=self.dp_group,
+                    async_op=True,
+                )
+            self.logger.debug(
+                f"Split bwd: Allreduce launched on actor {self.global_rank}, tensor={tid}"
+            )
+            self.comm_op_status[stage_id][tid] = 0
+            self.comm_op_handles[stage_id][tid] = handle
 
     def _prepare_dp_comm_ops(self, stage_id):
         def hook_maker(tensor_id):
@@ -670,13 +715,17 @@ class PiperActor:
         self.inp_activation[stage_id][mb_idx] = None
     
     def _forward(self, stage_id: int, mb_idx: int, *deps):
-        if self.mode == "sequential" or self.mode == "overlapped":
+        if self.mode == "sequential":
             comp_stream = self.comp_stream
         elif self.mode == "naive":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
+        elif self.mode == "overlapped":
+            comp_stream = self.comp_stream
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
         
+        self.overlap_a2a_ops = False
+
         self.logger.debug(
             f"Calling forward {stage_id} mb {mb_idx} on actor {self.global_rank}"
         )
@@ -765,12 +814,16 @@ class PiperActor:
         return 1
 
     def _backward(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        if self.mode == "sequential" or self.mode == "overlapped":
+        if self.mode == "sequential":
             comp_stream = self.comp_stream
         elif self.mode == "naive":
             comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
+        elif self.mode == "overlapped":
+            comp_stream = self.comp_stream
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
+
+        self.overlap_a2a_ops = False
 
         self.logger.debug(
             f"Calling backward {stage_id} mb {mb_idx} on actor {self.global_rank}"
@@ -829,7 +882,7 @@ class PiperActor:
 
 
     def _backward_input(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        comp_stream = self.per_mb_streams[(stage_id + mb_idx) % 2]
+        comp_stream = self.comp_stream
 
         self.logger.debug(
             f"Calling backward I {stage_id} mb {mb_idx} on actor {self.global_rank}"
@@ -944,6 +997,7 @@ class PiperActor:
         )
 
         stage_params = [self.forward_args[stage_id][i] for i in self.param_idxs[stage_id]]
+        updated_params: dict[int, torch.nn.Parameter] = {}
 
         # Special case to handle stage 0 since backward_input is a NOOP, 
         # meaning no parameter groups are created
@@ -977,10 +1031,13 @@ class PiperActor:
             )
             
             for p, pg in zip(stage_params, gparams):
+                if pg is None:
+                    continue
                 if p.grad is None:
                     p.grad = pg.clone()
                 else:
                     p.grad.add_(pg)
+                updated_params[id(p)] = p
         else:
             # Create mapping from autograd nodes -> parameters
             grad_acc_to_weight: Dict[Node, Tuple[Parameter, int]] = {}
@@ -1051,7 +1108,7 @@ class PiperActor:
                 )
                 
                 # Finally, update gradients for the params in this param_group
-                for param_node, dw in zip(pg["params"], gparams):
+                for param_node, dw in zip(mapped_param_nodes, gparams):
                     if dw is None:
                         continue
 
@@ -1061,6 +1118,11 @@ class PiperActor:
                         weight.grad = dw
                     else:
                         weight.grad.add_(dw)
+                    updated_params[id(weight)] = weight
+
+        # Mirror post-accumulate hook behavior for split backward.
+        for p in updated_params.values():
+            self._maybe_trigger_grad_allreduce(stage_id, p)
 
         self.bw_grad_cache[stage_id][mb_idx] = None
         self.upstream_grad_cache[stage_id][mb_idx] = None
@@ -1087,10 +1149,17 @@ class PiperActor:
             self.overlap_a2a_ops = False
         elif self.mode == "overlapped":
             fwd_comp_stream = self.comp_stream
-            bwd_comp_stream = self.comp_stream
+            bwd_comp_stream = self.overlapped_comp_stream
             self.overlap_a2a_ops = True
+            # initialize A2A states
+            self.fwd_a2a_pre_events = [torch.cuda.Event() for _ in range(self.n_a2a_ops[fwd_stage_id])]
+            self.bwd_a2a_pre_events = [torch.cuda.Event() for _ in range(self.n_a2a_ops[bwd_stage_id])]
+            self.fwd_a2a_counter = 0
+            self.bwd_a2a_counter = 0
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
+        fwd_p2p_stream = self.p2p_stream
+        bwd_p2p_stream = self.p2p_stream
 
         self.logger.debug(
             f"Calling forward {fwd_stage_id} mb {fwd_mb_idx} backward {bwd_stage_id} mb {bwd_mb_idx} on actor {self.global_rank}"
@@ -1144,58 +1213,29 @@ class PiperActor:
             assert loss_fn is not None
             labels = self.labels
             assert out_activation.shape == labels.shape
-            
+
+        # RUN FORWARD PASS
         if self.profile:
             forward_ctx_manager = torch.profiler.record_function(f"forward_stage_{fwd_stage_id}_mb_{fwd_mb_idx}")
+            forward_ctx_manager.__enter__()
+
+        with torch.cuda.stream(fwd_comp_stream):
+            output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
+
+        # RUN BACKWARD PASS
+        if self.profile:
+            forward_ctx_manager.__exit__(None, None, None)
             backward_ctx_manager = torch.profiler.record_function(f"backward_stage_{bwd_stage_id}_mb_{bwd_mb_idx}")
+            backward_ctx_manager.__enter__()
+        if self.overlap_a2a_ops and self.dp_degree > 1:
+            bwd_comp_stream.wait_event(self.fwd_a2a_pre_events[0])
+        if bwd_stage_id < self.num_stages - 1:
+            with torch.cuda.stream(bwd_comp_stream):
+                out_activation.backward(gradient=input_grad)
         else:
-            forward_ctx_manager = nullcontext()
-            backward_ctx_manager = nullcontext()
-
-        # RUN FORWARD AND BACKWARD PASSES
-        if self.overlap_a2a_ops:
-            output = None
-            loss = None
-            # threading.Events for CPU-side thread coordination
-            n_a2a = self.n_a2a_ops[fwd_stage_id]
-            self.fwd_a2a_submitted = [threading.Event() for _ in range(n_a2a)]
-            self.bwd_a2a_submitted = [threading.Event() for _ in range(n_a2a)]
-            self.fwd_a2a_counter = 0
-            self.bwd_a2a_counter = 0
-
-            def run_fwd():
-                nonlocal output
-                with torch.cuda.stream(fwd_comp_stream), forward_ctx_manager:
-                    output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
-
-            def run_bwd():
-                nonlocal loss
-                self.fwd_a2a_submitted[0].wait()
-                if bwd_stage_id < self.num_stages - 1:
-                    with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
-                        out_activation.backward(gradient=input_grad)
-                else:
-                    with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
-                        loss = loss_fn(out_activation, labels)
-                        loss.backward()
-
-            fwd_thread = threading.Thread(target=run_fwd)
-            bwd_thread = threading.Thread(target=run_bwd)
-            fwd_thread.start()
-            bwd_thread.start()
-            fwd_thread.join()
-            bwd_thread.join()
-        else:
-            with torch.cuda.stream(fwd_comp_stream), forward_ctx_manager:
-                output = self.forward_fns[fwd_stage_id](*self.forward_args[fwd_stage_id])
-
-            if bwd_stage_id < self.num_stages - 1:
-                with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
-                    out_activation.backward(gradient=input_grad)
-            else:
-                with torch.cuda.stream(bwd_comp_stream), backward_ctx_manager:
-                    loss = loss_fn(out_activation, labels)
-                    loss.backward()
+            with torch.cuda.stream(bwd_comp_stream):
+                loss = loss_fn(out_activation, labels)
+                loss.backward()
 
         # POST PROCESS FORWARD PASS
         out_with_grad = [out for out in output if out.requires_grad]
@@ -1233,10 +1273,9 @@ class PiperActor:
         torch.cuda.synchronize()
 
         # clear A2A states
-        if self.overlap_a2a_ops:
-            self.overlap_a2a_ops = False
-            self.fwd_a2a_submitted.clear()
-            self.bwd_a2a_submitted.clear()
+        if self.overlap_a2a_ops and self.dp_degree > 1:
+            self.fwd_a2a_pre_events.clear()
+            self.bwd_a2a_pre_events.clear()
             self.fwd_a2a_counter = 0
             self.bwd_a2a_counter = 0
 

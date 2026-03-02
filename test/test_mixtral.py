@@ -149,6 +149,7 @@ def parse_args():
 if __name__ == "__main__":
     ray.init(include_dashboard=False, log_to_driver=True, namespace="mixtral")
     args = parse_args()
+    print(args)
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
     handles = piper_coordinator.run_program.remote(main, args)
     ray.get(handles)
