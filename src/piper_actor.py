@@ -331,11 +331,110 @@ class PiperActor:
                         self.comm_op_handles[stage_id][tid].wait()
                         done = True
 
+    def _load_stage_kernels(self):
+        # Ensure Triton kernel modules are imported before deserialization
+        # This ensures the kernel registration mechanism is available
+        try:
+            import torchtitan.models.common.moe.kernels
+            import torchtitan.models.common.moe.utils
+            import torch._higher_order_ops.triton_kernel_wrap
+
+            # Trigger module initialization by accessing a function
+            from torchtitan.models.common.moe.kernels import generate_permute_indices
+            from torchtitan.models.common.moe.kernels import fill_indices_wrapper
+            self.logger.info(f"Actor {self.global_rank} imported and initialized Triton kernel modules")
+        except ImportError as e:
+            self.logger.warning(
+                f"Actor {self.global_rank} failed to import Triton kernel modules: {e}. "
+                f"This may cause issues with Triton kernels in the graph."
+            )
+        
+        # HACK: Manually register Triton kernel in the side table
+        # The graph expects kernel_idx=0, so we need to register it at that index
+        self.logger.info(f"Manually registering Triton kernel at index 0 on actor {self.global_rank}...")
+        try:
+            # Import the kernel wrapper
+            from torchtitan.models.common.moe.kernels import fill_indices_wrapper
+            
+            # Create a dummy function that uses the Triton kernel
+            # This needs to be compiled with torch.compile to register the kernel
+            def dummy_kernel_user(tokens, starts, offsets):
+                return fill_indices_wrapper(
+                    tokens, starts, offsets,
+                    experts_per_rank=1, num_ranks=1, max_len=8, block_size=128
+                )
+            
+            # Compile the function to trigger kernel registration
+            device_idx = int(self.device.split(":")[1]) if ":" in self.device else 0
+            with torch.cuda.device(device_idx):
+                # Create dummy inputs
+                dummy_tokens = torch.zeros(8, dtype=torch.int32, device=self.device)
+                dummy_start = torch.zeros(8, dtype=torch.int64, device=self.device)
+                dummy_offsets = torch.zeros(1, dtype=torch.int64, device=self.device)
+                
+                # Compile and run to register the kernel
+                compiled_dummy = torch.compile(dummy_kernel_user, mode="reduce-overhead")
+                _ = compiled_dummy(dummy_tokens, dummy_start, dummy_offsets)
+            
+            # Now try to access the kernel side table and register at index 0
+            from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+            
+            # The kernel should now be registered, but we need to find it and move it to index 0
+            if hasattr(kernel_side_table, 'id_to_kernel') and hasattr(kernel_side_table, 'constant_args'):
+                registered_kernels = list(kernel_side_table.id_to_kernel.items())
+                registered_constants = list(kernel_side_table.constant_args.items())
+                
+                if len(registered_kernels) > 0:
+                    # Get the most recently registered kernel (highest index)
+                    max_idx, kernel = max(registered_kernels, key=lambda x: x[0])
+                    # Manually register it at index 0
+                    kernel_side_table.id_to_kernel[0] = kernel
+                    
+                    # Also register constant args if available
+                    # The graph might expect constant_args_idx=1, so we need to check what was registered
+                    if len(registered_constants) > 0:
+                        # Get the constant args that correspond to our kernel
+                        # Usually they're at the same index, but let's be safe
+                        max_const_idx, const_args = max(registered_constants, key=lambda x: x[0])
+                        for idx in range(10):
+                            kernel_side_table.constant_args[idx] = const_args
+                        self.logger.info(
+                            f"Actor {self.global_rank} manually registered kernel at index 0 "
+                            f"(copied from index {max_idx}, total kernels: {len(registered_kernels)}) "
+                            f"and constant_args at index 1 (copied from index {max_const_idx}, total constants: {len(registered_constants)})"
+                        )
+                    else:
+                        # If no constant args were registered, we might need to create empty ones
+                        # But let's see if the graph actually needs them
+                        self.logger.info(
+                            f"Actor {self.global_rank} manually registered kernel at index 0 "
+                            f"(copied from index {max_idx}, total kernels: {len(registered_kernels)}) "
+                            f"but no constant_args found"
+                        )
+                else:
+                    self.logger.warning(
+                        f"Actor {self.global_rank} no kernels found in side table after compilation"
+                    )
+            else:
+                # Try accessing via different attribute names
+                attrs = [attr for attr in dir(kernel_side_table) if not attr.startswith('_')]
+                self.logger.warning(
+                    f"Actor {self.global_rank} kernel_side_table doesn't have expected attributes. "
+                    f"Available attributes: {attrs}"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"Actor {self.global_rank} failed to manually register kernel: {e}. "
+                f"This may cause Triton kernel errors."
+            )
+            import traceback
+            self.logger.info(f"Traceback: {traceback.format_exc()}")
+
     def _load_stage(
         self, stage_id: int, gm_data, forward_args, input_idxs, param_idxs, 
     ):
-        self.logger.debug(f"Loading stage {stage_id} graph on actor {self.global_rank}")
-
+        self.logger.info(f"Loading stage {stage_id} graph on actor {self.global_rank}")
+        self._load_stage_kernels()
         # compile the graph with the given graphargs
         gm = _deserialize_graphmodule(gm_data)
 

@@ -139,6 +139,12 @@ def _serialize_target(t):
     if isinstance(t, str):
         return {"kind": "string", "value": t}
 
+    target_str = str(t)
+    if target_str.startswith("torch.ops."):
+            # Remove "torch.ops." prefix to get the path
+            path = target_str[len("torch.ops."):]
+            return {"kind": "torch_op", "path": path}
+
     # Handle _VariableFunctionsClass
     if getattr(t, "__module__", "") == "torch._VariableFunctionsClass":
         public_name = t.__name__
@@ -153,6 +159,25 @@ def _serialize_target(t):
 
     # regular python function or built-in
     if inspect.isfunction(t) or inspect.isbuiltin(t):
+        mod = inspect.getmodule(t)
+        # Check if inspect.getmodule returned torch.ops.* namespace
+        # These should be serialized as torch_op, not py_func
+        if mod is not None:
+            mod_name = mod.__name__
+            if mod_name.startswith("torch.ops"):
+                # This is a torch.ops function, serialize as torch_op
+                target_str = str(t)
+                if target_str.startswith("torch.ops."):
+                    path = target_str[len("torch.ops."):]
+                    return {"kind": "torch_op", "path": path}
+                # If str(t) doesn't work, try to construct path from module and name
+                # e.g., module="torch.ops.higher_order", name="triton_kernel_wrapper_mutation"
+                # -> path="higher_order.triton_kernel_wrapper_mutation"
+                module_parts = mod_name.split(".")
+                if len(module_parts) >= 3:
+                    namespace = module_parts[2]  # e.g., "higher_order"
+                    path = f"{namespace}.{t.__name__}"
+                    return {"kind": "torch_op", "path": path}
         # Special handling for torch.autograd.Function.apply methods
         # These are static methods that may have the wrong module in inspect.getmodule
         if t.__name__ == "apply":
@@ -225,12 +250,25 @@ def _resolve_qualname(mod, qualname):
     return obj
 
 def _deserialize_target(payload):
+    # print("DESERIALIZING", payload, flush=True)
     kind = payload["kind"]
 
     if kind == "string":
         return payload["value"]
 
     if kind == "py_func":
+        # Workaround: if module is torch.ops.*, redirect to torch_op deserialization
+        if payload["module"].startswith("torch.ops"):
+            # Reconstruct the path from module and qualname
+            # e.g., module="torch.ops.higher_order", qualname="triton_kernel_wrapper_mutation"
+            # -> path="higher_order.triton_kernel_wrapper_mutation"
+            module_parts = payload["module"].split(".")
+            if len(module_parts) >= 3:
+                namespace = module_parts[2]  # e.g., "higher_order"
+                path = f"{namespace}.{payload['qualname']}"
+                # Recursively call with torch_op payload
+                torch_op_payload = {"kind": "torch_op", "path": path}
+                return _deserialize_target(torch_op_payload)
         mod = importlib.import_module(payload["module"])
         return _resolve_qualname(mod, payload["qualname"])
 
@@ -246,9 +284,34 @@ def _deserialize_target(payload):
 
     if kind == "torch_op":
         obj = torch.ops
-        for part in payload["path"].split("."):
-            obj = getattr(obj, part)
-        return obj
+        path = payload["path"]
+        try:
+            for part in payload["path"].split("."):
+                obj = getattr(obj, part)
+            return obj
+        except AttributeError:
+                # If operator doesn't exist, try importing implementation module to trigger registration
+                if path.startswith("higher_order."):
+                    op_name = path.split(".", 1)[1]
+                    op_to_module = {
+                        "triton_kernel_wrapper_mutation": "torch._higher_order_ops.triton_kernel_wrap",
+                        "triton_kernel_wrapper_functional": "torch._higher_order_ops.triton_kernel_wrap",
+                    }
+                    if op_name in op_to_module:
+                        try:
+                            # Import to trigger registration
+                            importlib.import_module(op_to_module[op_name])
+                            # Try again
+                            obj = torch.ops
+                            for part in path.split("."):
+                                obj = getattr(obj, part)
+                            return obj
+                        except (ImportError, AttributeError):
+                            pass
+                raise AttributeError(
+                    f"Failed to resolve torch.ops path '{path}'. "
+                    f"Available attributes: {[x for x in dir(obj) if not x.startswith('_')][:20]}"
+                )
 
     raise NotImplementedError(f"Unknown target kind: {kind}")
 
