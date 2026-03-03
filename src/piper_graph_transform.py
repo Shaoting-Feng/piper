@@ -45,7 +45,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
     def forward(ctx, output, input_tensor):
         """
         Forward pass: performs all_to_all_single communication.
-        
+
         Args:
             ctx: Context for storing information for backward pass
             output: Output buffer (will be modified in-place)
@@ -59,19 +59,26 @@ class AllToAllSingleFunction(torch.autograd.Function):
         ctx.global_rank = ctx.actor_self.global_rank
         ctx.stream = ctx.actor_self.a2a_stream
 
-        logger.debug(f"Dispatch AllToAllSingleFunction forward rank={ctx.global_rank}, shape={input_tensor.shape}")
-        
+        comp_stream = torch.cuda.current_stream()
+        comm_finished_event = torch.cuda.Event()
+        ctx.stream.wait_stream(comp_stream)
+        logger.info(f"Dispatch AllToAllSingleFunction forward rank={ctx.global_rank}, shape={input_tensor.shape}")  
         ctx.actor_self._start_timing(ctx.stream, "fwd_a2a")
 
-        # Ensure input_tensor is contiguous (all_to_all_single requires contiguous tensors)
-        # TODO: performance cost?
         input_tensor = input_tensor.contiguous()
-        
-        # Perform the communication (modifies output in-place)
         with torch.cuda.stream(ctx.stream):
-            dist.all_to_all_single(output, input_tensor, group=ctx.group)
+            dist.all_to_all_single(output, input_tensor, group=ctx.group, async_op=True).wait()
+            comm_finished_event.record()
 
         ctx.actor_self._stop_timing(ctx.stream, "fwd_a2a")
+
+        # POST-HOOK: wait for bwd to reach its corresponding A2A
+        if ctx.actor_self.overlap_a2a_ops:
+            idx = ctx.actor_self.fwd_a2a_counter
+            ctx.actor_self.fwd_a2a_submitted[idx].set()
+            ctx.actor_self.bwd_a2a_submitted[idx].wait()
+            ctx.actor_self.fwd_a2a_counter += 1
+        comp_stream.wait_event(comm_finished_event)
 
         return output
     
@@ -79,31 +86,39 @@ class AllToAllSingleFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         """
         Backward pass: performs reverse all_to_all_single to propagate gradients.
-        
+
         The backward of all_to_all_single is another all_to_all_single operation
         that reverses the communication pattern.
         """
-        logger.debug(f"Dispatch AllToAllSingleFunction backward rank={ctx.global_rank}, shape={grad_output.shape}")
-
-        ctx.actor_self._start_timing(ctx.stream, "bwd_a2a")
+        logger.info(f"Dispatch AllToAllSingleFunction backward rank={ctx.global_rank}, shape={grad_output.shape}")
 
         if grad_output is None:
             return None, None, None
-        
-        # Ensure grad_output is contiguous (all_to_all_single requires contiguous tensors)
-        # TODO: performance cost?
+
+        comp_stream = torch.cuda.current_stream()
+        comm_finished_event = torch.cuda.Event()
+        ctx.stream.wait_stream(comp_stream)
+
+        ctx.actor_self._start_timing(ctx.stream, "bwd_a2a")
+
         grad_output = grad_output.contiguous()
-        
-        # Create a buffer for the gradient input
         grad_input = torch.empty_like(grad_output)
-        
-        # Reverse the communication: all_to_all_single in backward
-        # This propagates gradients from output back to input
         with torch.cuda.stream(ctx.stream):
-            dist.all_to_all_single(grad_input, grad_output, group=ctx.group)
+            dist.all_to_all_single(grad_input, grad_output, group=ctx.group, async_op=True).wait()
+            comm_finished_event.record()
 
         ctx.actor_self._stop_timing(ctx.stream, "bwd_a2a")
-        
+
+        # POST-HOOK: wait for fwd to reach the next A2A
+        if ctx.actor_self.overlap_a2a_ops:
+            idx = ctx.actor_self.bwd_a2a_counter
+            ctx.actor_self.bwd_a2a_submitted[idx].set()
+            if idx < len(ctx.actor_self.fwd_a2a_submitted) - 1:
+                ctx.actor_self.fwd_a2a_submitted[idx + 1].wait()
+            ctx.actor_self.bwd_a2a_counter += 1
+        comp_stream.wait_event(comm_finished_event)
+
+        logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
         # Return gradients: grad_output flows to grad_input, None for group
         return grad_input, grad_input, None
 
@@ -117,6 +132,13 @@ def _dispatch_a2a_single(output: torch.Tensor, input_tensor: torch.Tensor) -> to
 
 # Allow the dispatch function in the graph
 torch.compiler.allow_in_graph(_dispatch_a2a_single)
+
+def _meta_tensor_like(example: torch.Tensor, *, requires_grad: bool, as_parameter: bool):
+    t = torch.empty(example.shape, dtype=example.dtype, device="meta")
+    t.requires_grad_(requires_grad)
+    if as_parameter:
+        return torch.nn.Parameter(t, requires_grad=requires_grad)
+    return t
 
 def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphModule, list[int], list]]]:
     """
@@ -141,7 +163,10 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
                     nodes_with_metadata.append((node, stage_annotation_id))
     
     if not nodes_with_metadata:
+        logger.info("No stage nodes found in graph")
         return gm, []
+    else:
+        logger.info(f"Found stage nodes in graph")
     
     # Group nodes by stage ID for creating stage modules
     stage_code = defaultdict(list)  # stage_id -> list of all nodes for this stage
@@ -453,19 +478,26 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         prev_stage_id = stage_annotation_id - 1
         if prev_stage_id in stage_modules:
             _, _, _, prev_stage_outputs_list, _, _, _, _, _, _ = stage_modules[prev_stage_id]
+            _, _, _, prev_stage_outputs_list, _, _, _, _, _, _ = stage_modules[prev_stage_id]
             prev_stage_outputs = set(prev_stage_outputs_list)
         
         for i, placeholder in enumerate(placeholders):
-            if "grapharg" in placeholder.meta:
-                example = placeholder.meta["grapharg"]._example()
-            else:
-                example = torch.zeros(
-                    placeholder.meta["example_value"].shape, 
-                    dtype=placeholder.meta["example_value"].dtype, 
-                    requires_grad=placeholder.meta["example_value"].requires_grad, 
-                    device=placeholder.meta["example_value"].device)
-            graphargs.append(example)
-            if isinstance(example, torch.nn.Parameter):
+            ex = placeholder.meta["example_value"]
+
+            # Parameter-like placeholders
+            is_param_like = ("grapharg" in placeholder.meta) or ("self" in placeholder.name)
+
+            # we may not actually need to call _metathis if we're already placing example inputs on meta, 
+            # but it's guaranteed to be safe with this function call
+            graphargs.append(
+                _meta_tensor_like(
+                    ex,
+                    requires_grad=bool(getattr(ex, "requires_grad", False)),
+                    as_parameter=is_param_like,
+                )
+            )
+
+            if isinstance(ex, torch.nn.Parameter):
                 param_idxs.append(i)
             # For the first stage, the input indices are everything that's not an attribute
             if stage_annotation_id == 0:
@@ -637,7 +669,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
 
 
 
-def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
+def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
     """
     Transform a graph module by inserting communication operations on annotated nodes.
     
@@ -681,8 +713,8 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
                     annotated_nodes.append((idx, node, annotation_key, reshape))
     
     if not annotated_nodes:
-        logger.debug("No communication annotations found in graph")
-        return gm
+        logger.info("No communication annotations found in graph")
+        return gm, 0
     
     # Group annotated nodes into contiguous blocks
     # A contiguous block is a sequence of nodes with the same annotation_key
@@ -709,7 +741,8 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
 
     annotation_blocks = list(blocks_by_key.values())
     
-    logger.debug(f"Found {len(annotation_blocks)} comm annotation blocks")
+    n_a2a_ops = len(annotation_blocks)
+    logger.info(f"Found {len(annotation_blocks)} contiguous annotation blocks")
     
     # For each contiguous block, find the output node (the one used outside the annotation)
     # This is the node that should have communication applied to it
@@ -736,13 +769,13 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
             if output_candidates:
                 # Use the first output candidate (should be the output of the annotated block)
                 annotated_output_nodes.append(output_candidates[0])
-                logger.debug(f"Block {block_idx}: Using output node {output_candidates[0][0].name}")
             else:
                 # No external users found, use the last node in topological order within the block
                 # This happens if the annotated block's output isn't used yet
                 last_node = max(nodes_in_block, key=lambda x: node_list.index(x[0]))
                 annotated_output_nodes.append(last_node)
-                logger.debug(f"Block {block_idx}: No external users found, using last node: {last_node[0].name}")
+    
+    logger.info(f"Found {len(annotated_output_nodes)} annotation blocks requiring communication operations")
     
     # Create a new graph to build the transformed version
     new_graph = fx.Graph()
@@ -836,13 +869,10 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
                         torch.reshape,
                         (buf_node, reshape_shape)
                     )
-                    logger.debug(f"Applied output reshape {reshape_shape} for node {node.name}")
             
             # 3. Replace all uses of the original node with the buffer
             # The buffer now contains the result after communication (and optional reshape)
             node_mapping[node] = buf_node
-            
-            logger.debug(f"Inserted all_to_all_single communication for node {node.name}")
         else:
             # Regular node, just copy it
             new_node = new_graph.node_copy(
@@ -882,7 +912,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> fx.GraphModule:
     
     new_gm.recompile()
     
-    return new_gm
+    return new_gm, n_a2a_ops
 
 def _insert_p2p_ops(
     gm: fx.GraphModule,

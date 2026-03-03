@@ -9,8 +9,9 @@ import gc
 from src.piper_exec import piper_exec
 from src.piper_compile import piper_setup, piper_shutdown
 from src.piper_coordinator import PiperProgramCoordinator
+from src.piper_utils import piper_metadata
 
-from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B
+from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B, LLAMA_70B
 from .schedule_helpers import (
     build_1f1b_schedule, 
     build_gpipe_schedule, 
@@ -38,12 +39,11 @@ def main(args):
             llama_config = LLAMA_3B
         case '8b':
             llama_config = LLAMA_8B
+        case '70b':
+            llama_config = LLAMA_70B
     print(args) 
 
     loss_fn = torch.nn.CrossEntropyLoss()
-    
-    model = Transformer(llama_config, args.seq_len)
-    model.to('cuda')
 
     x = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len)).to('cuda')
     y = torch.randn((args.batch_size, args.seq_len, llama_config.vocab_size)).to('cuda')
@@ -84,20 +84,14 @@ def main(args):
     print_schedule(schedule)
 
     piper_setup(
-        model,
-        torch.optim.Adam, 
-        [x],
-        y,
-        schedule,
-        args.naive_gradient_sync,
+        Transformer,
+        model_args=(llama_config, args.seq_len),
+        optim_fn=torch.optim.Adam,
+        example_inputs=[x],
+        example_outputs=y,
+        schedule=schedule,
+        naive_gradient_sync=args.naive_gradient_sync,
     )
-
-    del model
-    del x
-    del y 
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     # Warmup
     print(f"Running {args.warmup} warmup iterations...")
