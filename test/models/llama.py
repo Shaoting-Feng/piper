@@ -461,19 +461,19 @@ class Transformer(nn.Module):
         with torch.fx.traceback.annotate({"stage": 0}):
             h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
             start_pos = 0
-            for layer in self.layers[:self.n_layers//4+1]:
+            for layer in self.layers[:self.n_layers//4]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
 
         with torch.fx.traceback.annotate({"stage": 1}):
-            for layer in self.layers[self.n_layers//4+1:self.n_layers//2+2]:
+            for layer in self.layers[self.n_layers//4:self.n_layers//2]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
 
         with torch.fx.traceback.annotate({"stage": 2}):
-            for layer in self.layers[self.n_layers//2+2:3*self.n_layers//4+3]:
+            for layer in self.layers[self.n_layers//2:3*self.n_layers//4]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
 
         with torch.fx.traceback.annotate({"stage": 3}):
-            for layer in self.layers[3*self.n_layers//4+3:]:
+            for layer in self.layers[3*self.n_layers//4:]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
             h = self.norm(h) if self.norm else h
             output = self.output(h).float() if self.output else h

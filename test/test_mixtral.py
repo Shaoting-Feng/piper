@@ -3,6 +3,7 @@ import ray
 import torch
 import torch.nn as nn
 import argparse
+import json
 import time
 import os
 import numpy as np
@@ -109,9 +110,19 @@ def main(args):
                 all_times = trace_data[key]
                 print(f"rank {rank} {key} time= {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
 
+    # Collect task_id -> label mappings from all actors
+    all_task_labels = {}
+    for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
+        all_task_labels.update(labels)
+
+    os.makedirs("out", exist_ok=True)
     timeline_filename = f"out/mixtral-pp{args.pp}-dp{args.dp}-{args.schedule}-{args.mode}"
     ray.timeline(timeline_filename)
+    labels_filename = timeline_filename + "-labels.json"
+    with open(labels_filename, "w") as f:
+        json.dump(all_task_labels, f)
     print(f"Ray timeline saved to: {timeline_filename}")
+    print(f"Task labels saved to: {labels_filename}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')

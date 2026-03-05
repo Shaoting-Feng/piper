@@ -2,6 +2,7 @@ import ray
 import torch
 import time
 import argparse
+import json
 import os
 import numpy as np
 import gc
@@ -102,11 +103,12 @@ def main(args):
     # Time training steps
     print(f"Running {args.iters} timed iterations...")
     iter_times = []
-    for _ in range(args.iters):
+    for i in range(args.iters):
         start = time.perf_counter()
         piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
         end = time.perf_counter()
         iter_times.append(end - start)
+        print(f"Iter {i} completed")
     
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     print(
@@ -115,7 +117,6 @@ def main(args):
     )
 
     if args.tracing:
-        from src.piper_utils import piper_metadata
         actors = piper_metadata.actors
         ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
         ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
@@ -139,9 +140,20 @@ def main(args):
         suffix = "-naive-sync"
     else:
         suffix = ""
+    # Collect task_id -> label mappings from all actors
+    all_task_labels = {}
+    actors = piper_metadata.actors
+    for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
+        all_task_labels.update(labels)
+
+    os.makedirs("out", exist_ok=True)
     timeline_filename = f"out/{args.model}-pp{args.pp}-dp{args.dp}-{args.schedule}{suffix}.json"
     ray.timeline(timeline_filename)
+    labels_filename = timeline_filename.replace(".json", "-labels.json")
+    with open(labels_filename, "w") as f:
+        json.dump(all_task_labels, f)
     print(f"Ray timeline saved to: {timeline_filename}")
+    print(f"Task labels saved to: {labels_filename}")
 
     piper_shutdown()
 

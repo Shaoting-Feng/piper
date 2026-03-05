@@ -115,51 +115,51 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
-    # def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-    #     """
-    #     2 Stages
-    #     """
-    #     self.first_arg = idx.shape
-    #     with torch.fx.traceback.annotate({"stage": 0}):
-    #         mask = self.causal_mask[None, None, input_pos]
-    #         freqs_cis = self.freqs_cis[input_pos]
-    #         x = self.tok_embeddings(idx)
-    #         for layer in self.layers[:len(self.layers)//2]:
-    #             x = layer(x, input_pos, freqs_cis, mask)
-        
-    #     with torch.fx.traceback.annotate({"stage": 1}):
-    #         for layer in self.layers[len(self.layers)//2:]:
-    #             x = layer(x, input_pos, freqs_cis, mask)
-    #         x = self.norm(x)
-    #         logits = self.output(x)
-    #     return logits
-
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         """
-        4 Stages
+        2 Stages
         """
         self.first_arg = idx.shape
         with torch.fx.traceback.annotate({"stage": 0}):
             mask = self.causal_mask[None, None, input_pos]
             freqs_cis = self.freqs_cis[input_pos]
             x = self.tok_embeddings(idx)
-            for layer in self.layers[:len(self.layers)//4]:
+            for layer in self.layers[:len(self.layers)//2]:
                 x = layer(x, input_pos, freqs_cis, mask)
         
         with torch.fx.traceback.annotate({"stage": 1}):
-            for layer in self.layers[len(self.layers)//4:len(self.layers)//2]:
-                x = layer(x, input_pos, freqs_cis, mask)
-
-        with torch.fx.traceback.annotate({"stage": 2}):
-            for layer in self.layers[len(self.layers)//2:3*len(self.layers)//4]:
-                x = layer(x, input_pos, freqs_cis, mask)
-
-        with torch.fx.traceback.annotate({"stage": 3}):
-            for layer in self.layers[3*len(self.layers)//4:]:
+            for layer in self.layers[len(self.layers)//2:]:
                 x = layer(x, input_pos, freqs_cis, mask)
             x = self.norm(x)
             logits = self.output(x)
         return logits
+
+    # def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    #     """
+    #     4 Stages
+    #     """
+    #     self.first_arg = idx.shape
+    #     with torch.fx.traceback.annotate({"stage": 0}):
+    #         mask = self.causal_mask[None, None, input_pos]
+    #         freqs_cis = self.freqs_cis[input_pos]
+    #         x = self.tok_embeddings(idx)
+    #         for layer in self.layers[:len(self.layers)//4]:
+    #             x = layer(x, input_pos, freqs_cis, mask)
+        
+    #     with torch.fx.traceback.annotate({"stage": 1}):
+    #         for layer in self.layers[len(self.layers)//4:len(self.layers)//2]:
+    #             x = layer(x, input_pos, freqs_cis, mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 2}):
+    #         for layer in self.layers[len(self.layers)//2:3*len(self.layers)//4]:
+    #             x = layer(x, input_pos, freqs_cis, mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 3}):
+    #         for layer in self.layers[3*len(self.layers)//4:]:
+    #             x = layer(x, input_pos, freqs_cis, mask)
+    #         x = self.norm(x)
+    #         logits = self.output(x)
+    #     return logits
 
     @classmethod
     def from_name(cls, name: str):

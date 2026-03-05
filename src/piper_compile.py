@@ -109,6 +109,7 @@ def order_p2p_comms(schedule: Schedule2D, num_devices: int, num_stages: int, sta
     for src_stage, dst_stage, mb_idx in p2p_comms:
         src_rank = stage_to_device[src_stage]
         dst_rank = stage_to_device[dst_stage]
+        logger.info(f"P2P comm: {src_stage}:{src_rank}->{dst_stage}:{dst_rank} MB {mb_idx}")
         p2p_schedules[src_rank].append((src_stage, dst_stage, mb_idx, True))
         p2p_schedules[dst_rank].append((src_stage, dst_stage, mb_idx, False))
     
@@ -128,7 +129,7 @@ def piper_setup(
     example_outputs=None,
     schedule: Schedule2D=None,
     naive_gradient_sync=False,
-    mode="overlapped",
+    mode="sequential",
 ):
     """
     Compile a model with the piper backend.
