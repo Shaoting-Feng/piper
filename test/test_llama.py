@@ -161,7 +161,7 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
-    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b'], default='debug',
+    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b', '70b'], default='debug',
                         help='Model configuration: debug, 1b, 3b, or 8b (default: debug)')
     parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'interleaved-gpipe', 'dualpipev-nozb', 'dualpipev', 'zerobubble', 'no-pp'], default='1f1b',
                         help='Schedule type: gpipe, 1f1b, interleaved-1f1b, dualpipev, zerobubble, or no-pp (default: 1f1b)')
