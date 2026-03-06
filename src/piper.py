@@ -5,7 +5,7 @@ import gc
 from torch._dynamo.backends.registry import register_backend
 
 from .piper_utils import _serialize_graphmodule, piper_metadata, create_logger, LOG_LEVEL
-from .piper_graph_transform import _get_dp_comm_ops, _split_gm_by_stages, _insert_a2a_ops, _insert_p2p_ops
+from .piper_graph_transform import _get_dp_comm_ops, _split_gm_by_stages, _profile_and_split_gm, _insert_a2a_ops, _insert_p2p_ops
 from .piper_actor import _get_actor
 
 logger = create_logger("piper_backend", LOG_LEVEL)
@@ -13,30 +13,34 @@ logger = create_logger("piper_backend", LOG_LEVEL)
 
 @register_backend
 def piper(gm, example_inputs, **kwargs):
+    
+    # gm.print_readable()
 
     original_gm = gm
-    top_level_gm, submodules = _split_gm_by_stages(gm)
-    
     num_stages = len(piper_metadata.stage_to_device.keys())
+
+    # Check if the graph has stage annotations
+    has_annotations = any(
+        isinstance(node.meta.get('custom'), dict) and node.meta['custom'].get('stage') is not None
+        for node in gm.graph.nodes
+    )
+
+    if has_annotations:
+        top_level_gm, submodules = _split_gm_by_stages(gm)
+    else:
+        logger.info(f"No stage annotations found, profiling graph to split into {num_stages} stages")
+        top_level_gm, submodules = _profile_and_split_gm(gm, num_stages)
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     pp_degree = int(os.environ['PIPER_PP_DEGREE'])
     dp_degree = int(os.environ['PIPER_DP_DEGREE'])
+
+    # top_level_gm.print_readable()
 
     del top_level_gm
 
     refs = []
     actor_stages = []
     for (stage_id, stage_gm, input_idxs, param_idxs, graphargs, placeholders) in submodules:
-        stage_gm(*graphargs)
-        start = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for i in range(5):
-            stage_gm(*graphargs)
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        torch.cuda.synchronize()
-        print(f"Stage {stage_id} time measured on controller: {start.elapsed_time(end) / 5:.2f} ms")
-
         n_a2a_ops = 0
         if dp_degree > 1:
             stage_gm, n_a2a_ops = _insert_a2a_ops(stage_gm)

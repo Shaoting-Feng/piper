@@ -11,7 +11,6 @@ from src.piper_exec import piper_exec
 from src.piper_compile import piper_setup, piper_shutdown
 from src.piper_coordinator import PiperProgramCoordinator
 from src.piper_utils import piper_metadata
-
 from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B, LLAMA_70B
 from .schedule_helpers import (
     build_1f1b_schedule, 
@@ -109,6 +108,7 @@ def main(args):
         end = time.perf_counter()
         iter_times.append(end - start)
         print(f"Iter {i} completed")
+        time.sleep(1) 
     
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     print(
@@ -119,22 +119,24 @@ def main(args):
     if args.tracing:
         actors = piper_metadata.actors
         ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
-        ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
-        ray.get([actor.start_mem_tracing.remote() for actor in actors.values()])
+        # ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
+        # ray.get([actor.start_mem_tracing.remote() for actor in actors.values()])
 
         print(f"Running {args.warmup} tracing iterations...")
         for _ in range(args.warmup):
             piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
 
-        mem_data_ret = ray.get([actor.get_peak_memory.remote() for actor in actors.values()])
-        for rank, peak_mem in mem_data_ret:
-            print(f"rank {rank} peak memory= {peak_mem:.3f} GB")
+        # mem_data_ret = ray.get([actor.get_peak_memory.remote() for actor in actors.values()])
+        # for rank, peak_mem in mem_data_ret:
+        #     print(f"rank {rank} peak memory= {peak_mem:.3f} GB")
 
         trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
         for rank, trace_data in trace_data_ret:
             for key in trace_data:
                 all_times = trace_data[key]
                 print(f"rank {rank} {key} time= {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
+                if key == "fwd_recv_wait" or key == "bwd_recv_wait":
+                    print(f"rank {rank} {key} all times: {all_times}")
 
     if args.naive_gradient_sync:
         suffix = "-naive-sync"
@@ -185,7 +187,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    ray.init(include_dashboard=False, log_to_driver=True, namespace="llama")
+    ray.init(log_to_driver=True, namespace="llama", include_dashboard=False, _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp")
     args = parse_args()
     piper_coordinator = PiperProgramCoordinator.remote(dp_degree=args.dp, pp_degree=args.pp)
     ray.get(piper_coordinator.run_program.remote(main, args))

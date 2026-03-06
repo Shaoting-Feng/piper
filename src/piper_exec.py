@@ -236,6 +236,62 @@ def _validate_schedule(schedule: list[list[Task | None]], dag_edges: list[DAGEdg
                 )
 
 
+def _build_p2p_schedule(schedule, num_stages, num_devices, num_steps, stage_to_device):
+    """
+    Build a global p2p schedule by iterating the compute schedule in execution order.
+
+    Returns:
+        rank_p2p: dict mapping pp_rank -> list of (op_type, stage_from, stage_to, mb_idx, is_fwd)
+        p2p_idx_map: dict mapping (pp_rank, stage_from, stage_to, mb_idx, is_fwd, op_type) -> rank_local_idx
+    """
+    # Global p2p ops in schedule iteration order. Each entry: (stage_from, stage_to, mb_idx, is_fwd).
+    # Only cross-rank ops are included. Each communication is added exactly once,
+    # from the SENDER's compute task, to avoid duplicates.
+    p2p_ops = []
+
+    for i in range(num_steps):
+        for j in range(num_devices - 1, -1, -1):
+            if i >= len(schedule[j]):
+                continue
+            task = schedule[j][i]
+            if task is None:
+                continue
+            pp_rank, batches, task_type = task
+
+            # Forward send (added after forward compute produces output)
+            if task_type in (CompType.FWD, CompType.FWD_BWD):
+                stage_id, mb_idx = batches[0]
+                if stage_id < num_stages - 1 and stage_to_device[stage_id] != stage_to_device[stage_id + 1]:
+                    p2p_ops.append((stage_id, stage_id + 1, mb_idx, True))
+
+            # Backward send (added after backward compute produces gradients)
+            if task_type in (CompType.BWD, CompType.BWD_I, CompType.FWD_BWD):
+                if task_type == CompType.FWD_BWD:
+                    stage_id, mb_idx = batches[1]
+                else:
+                    stage_id, mb_idx = batches[0]
+                if stage_id > 0 and stage_to_device[stage_id] != stage_to_device[stage_id - 1]:
+                    p2p_ops.append((stage_id, stage_id - 1, mb_idx, False))
+
+    # Build per-rank schedules and index map
+    rank_p2p = defaultdict(list)
+    p2p_idx_map = {}
+
+    for stage_from, stage_to, mb_idx, is_fwd in p2p_ops:
+        sender_pp = stage_to_device[stage_from]
+        receiver_pp = stage_to_device[stage_to]
+
+        send_idx = len(rank_p2p[sender_pp])
+        rank_p2p[sender_pp].append(("send", stage_from, stage_to, mb_idx, is_fwd))
+        p2p_idx_map[(sender_pp, stage_from, stage_to, mb_idx, is_fwd, "send")] = send_idx
+
+        recv_idx = len(rank_p2p[receiver_pp])
+        rank_p2p[receiver_pp].append(("recv", stage_from, stage_to, mb_idx, is_fwd))
+        p2p_idx_map[(receiver_pp, stage_from, stage_to, mb_idx, is_fwd, "recv")] = recv_idx
+
+    return rank_p2p, p2p_idx_map
+
+
 def piper_exec(
     schedule: Schedule2D,
     loss_fn,
@@ -266,10 +322,41 @@ def piper_exec(
     _validate_schedule(schedule, dag_edges, num_mbs)
 
     actors = piper_metadata.actors
+    stage_to_device = piper_metadata.stage_to_device
+
+    # Build p2p schedule and send to actors
+    rank_p2p, p2p_idx_map = _build_p2p_schedule(
+        schedule, num_stages, num_devices, num_steps, stage_to_device
+    )
+
+    def _p2p_recv(actor, pp_rank, stage_from, stage_to, mb_idx, is_fwd, dep):
+        """Dispatch a recv: _exec_p2p_op for cross-rank, old method for local."""
+        key = (pp_rank, stage_from, stage_to, mb_idx, is_fwd, "recv")
+        if key in p2p_idx_map:
+            return actor._exec_p2p_op.remote(p2p_idx_map[key], dep)
+        if is_fwd:
+            return actor._exec_fwd_recv.remote(stage_to, mb_idx, dep)
+        return actor._exec_bwd_recv.remote(stage_to, mb_idx, dep)
+
+    def _p2p_send(actor, pp_rank, stage_from, stage_to, mb_idx, is_fwd, dep):
+        """Dispatch a send: _exec_p2p_op for cross-rank, old method for local."""
+        key = (pp_rank, stage_from, stage_to, mb_idx, is_fwd, "send")
+        if key in p2p_idx_map:
+            return actor._exec_p2p_op.remote(p2p_idx_map[key], dep)
+        if is_fwd:
+            return actor._exec_fwd_send.remote(stage_from, mb_idx, dep)
+        return actor._exec_bwd_send.remote(stage_from, mb_idx, dep)
 
     ret = []
     # map pp_rank -> latest dependency
     deps = {}
+
+    # Send p2p schedules to actors before dispatch
+    for pp_rank in range(num_devices):
+        deps[pp_rank] = actors[pp_rank].set_p2p_schedule.remote(
+            rank_p2p.get(pp_rank, [])
+        )
+
     for i in range(num_steps):
         for j in range(num_devices-1, -1, -1):
             if not i < len(schedule[j]):
@@ -277,63 +364,55 @@ def piper_exec(
             task = schedule[j][i]
             if task:
                 pp_rank, batches, task_type = task
-                actor_id = j
-                actor = actors[actor_id]
+                actor = actors[j]
                 match task_type:
                     case CompType.UPD:
                         loss = actor._update.remote(deps[pp_rank])
                         ret.append(loss)
                     case CompType.FWD:
                         stage_id, mb_idx = batches[0]
-                        # logger.info(f"Executing forward {stage_id} mb {mb_idx} on actor {actor_id}")
-                        dep = deps[pp_rank] if pp_rank in deps else None
-                        if stage_id == 0:
-                            dep = actor._forward.remote(stage_id, mb_idx, dep)
-                        else:
-                            dep = actor._exec_p2p_op.remote(stage_id - 1, stage_id, mb_idx, False, dep)
-                            dep = actor._forward.remote(stage_id, mb_idx, dep)
+                        dep = deps[pp_rank]
+                        if stage_id > 0:
+                            dep = _p2p_recv(actor, pp_rank, stage_id - 1, stage_id, mb_idx, True, dep)
+                        dep = actor._forward.remote(stage_id, mb_idx, dep)
                         if stage_id < num_stages - 1:
-                            dep = actor._exec_p2p_op.remote(stage_id, stage_id + 1, mb_idx, True, dep)
+                            dep = _p2p_send(actor, pp_rank, stage_id, stage_id + 1, mb_idx, True, dep)
                         deps[pp_rank] = dep
                     case CompType.BWD:
                         stage_id, mb_idx = batches[0]
-                        # logger.info(f"Executing backward {stage_id} mb {mb_idx} on actor {actor_id}")
                         dep = deps[pp_rank]
                         if stage_id < num_stages - 1:
-                            dep = actor._exec_p2p_op.remote(stage_id + 1, stage_id, mb_idx, False, dep)
+                            dep = _p2p_recv(actor, pp_rank, stage_id + 1, stage_id, mb_idx, False, dep)
                         dep = actor._backward.remote(stage_id, mb_idx, dep, loss_fn=loss_fn)
                         if stage_id > 0:
-                            dep = actor._exec_p2p_op.remote(stage_id, stage_id - 1, mb_idx, True, dep)
+                            dep = _p2p_send(actor, pp_rank, stage_id, stage_id - 1, mb_idx, False, dep)
                         deps[pp_rank] = dep
                     case CompType.BWD_I:
                         stage_id, mb_idx = batches[0]
-                        # logger.info(f"Executing backward I {stage_id} mb {mb_idx} on actor {actor_id}")
                         dep = deps[pp_rank]
                         if stage_id < num_stages - 1:
-                            dep = actor._exec_p2p_op.remote(stage_id + 1, stage_id, mb_idx, False, dep)
+                            dep = _p2p_recv(actor, pp_rank, stage_id + 1, stage_id, mb_idx, False, dep)
                         dep = actor._backward_input.remote(stage_id, mb_idx, dep, loss_fn=loss_fn)
                         if stage_id > 0:
-                            dep = actor._exec_p2p_op.remote(stage_id, stage_id - 1, mb_idx, True, dep)
+                            dep = _p2p_send(actor, pp_rank, stage_id, stage_id - 1, mb_idx, False, dep)
                         deps[pp_rank] = dep
                     case CompType.BWD_W:
                         stage_id, mb_idx = batches[0]
-                        # logger.info(f"Executing backward W {stage_id} mb {mb_idx} on actor {actor_id}")
                         dep = deps[pp_rank]
                         dep = actor._backward_weight.remote(stage_id, mb_idx, dep)
                         deps[pp_rank] = dep
                     case CompType.FWD_BWD:
                         fwd_stage_id, fwd_mb_idx = batches[0]
                         bwd_stage_id, bwd_mb_idx = batches[1]
-                        # logger.info(f"Executing forward-backward {fwd_stage_id} mb {fwd_mb_idx} -> {bwd_stage_id} mb {bwd_mb_idx} on actor {actor_id}")
                         dep = deps[pp_rank]
                         if fwd_stage_id > 0:
-                            dep = actor._exec_p2p_op.remote(fwd_stage_id - 1, fwd_stage_id, fwd_mb_idx, False, dep)
+                            dep = _p2p_recv(actor, pp_rank, fwd_stage_id - 1, fwd_stage_id, fwd_mb_idx, True, dep)
                         if bwd_stage_id < num_stages - 1:
-                            dep = actor._exec_p2p_op.remote(bwd_stage_id + 1, bwd_stage_id, bwd_mb_idx, False, dep)
+                            dep = _p2p_recv(actor, pp_rank, bwd_stage_id + 1, bwd_stage_id, bwd_mb_idx, False, dep)
                         dep = actor._forward_backward.remote(fwd_stage_id, fwd_mb_idx, bwd_stage_id, bwd_mb_idx, dep, loss_fn=loss_fn)
                         if fwd_stage_id < num_stages - 1:
-                            dep = actor._exec_p2p_op.remote(fwd_stage_id, fwd_stage_id + 1, fwd_mb_idx, True, dep)
+                            dep = _p2p_send(actor, pp_rank, fwd_stage_id, fwd_stage_id + 1, fwd_mb_idx, True, dep)
                         if bwd_stage_id > 0:
-                            dep = actor._exec_p2p_op.remote(bwd_stage_id, bwd_stage_id - 1, bwd_mb_idx, True, dep)
+                            dep = _p2p_send(actor, pp_rank, bwd_stage_id, bwd_stage_id - 1, bwd_mb_idx, False, dep)
                         deps[pp_rank] = dep
     return ray.get(ret)
