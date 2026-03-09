@@ -26,7 +26,9 @@ def piper_setup(
     example_outputs=None,
     schedule: Schedule2D=None,
     naive_gradient_sync=False,
+    activation_checkpointing=False,
     mode="sequential",
+    pg=None,
 ):
     """
     Compile a model with the piper backend.
@@ -36,6 +38,7 @@ def piper_setup(
     stage_to_device = schedule.stage_to_device()
     assert len(stage_to_device) > 0
     piper_metadata.stage_to_device = stage_to_device
+    piper_metadata.use_activation_checkpointing = activation_checkpointing
 
     num_mbs = schedule.num_mbs()
     num_stages = schedule.num_stages()
@@ -43,7 +46,7 @@ def piper_setup(
 
     _create_actors(
         num_devices, optim_fn, num_mbs, num_stages, naive_gradient_sync,
-        profile=True, mode=mode, stage_to_device=stage_to_device,
+        profile=True, mode=mode, stage_to_device=stage_to_device, pg=pg,
     )
 
     ray.get(

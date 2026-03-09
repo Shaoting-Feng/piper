@@ -11,6 +11,8 @@ from torch.autograd.graph import GradientEdge, Node
 import torch.distributed as dist
 from collections import defaultdict
 
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
 from .piper_utils import (
     _deserialize_graphmodule,
     create_logger,
@@ -37,6 +39,7 @@ def _create_actors(
     profile=False,
     mode="sequential",
     stage_to_device=None,
+    pg=None,
 ):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     world_size = int(os.environ["PIPER_WORLD_SIZE"])
@@ -52,7 +55,14 @@ def _create_actors(
             "cuda-event-trace": "false",
             "stop-on-exit": "true",
         }} if profile else {}
-        actor = PiperActor.options(num_gpus=0.8, runtime_env=nsight_env).remote(
+        actor = PiperActor.options(
+            num_gpus=0.8, 
+            runtime_env=nsight_env,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=dp_rank
+            ),
+        ).remote(
             pp_rank,
             optim_class,
             world_size,
@@ -248,7 +258,7 @@ class PiperActor:
         torch.cuda.reset_peak_memory_stats()
 
     def get_peak_memory(self):
-        return torch.cuda.max_memory_allocated() / (1024**3)
+        return self.global_rank, torch.cuda.max_memory_allocated() / (1024**3)
 
     def load_input(self, inputs):
         self.inputs = [inp.to(self.device) for inp in inputs]
@@ -443,14 +453,21 @@ class PiperActor:
                         done = True
 
     def _load_stage(
-        self, stage_id: int, gm_data, forward_args, input_idxs, param_idxs, n_a2a_ops
+        self, stage_id: int, gm_data, forward_args, input_idxs, param_idxs, n_a2a_ops,
+        use_activation_checkpointing: bool = False,
     ):
         self.logger.debug(f"Loading stage {stage_id} graph on actor {self.global_rank}")
 
         gm = _deserialize_graphmodule(gm_data)
 
         self.graph_modules[stage_id] = gm
-        self.forward_fns[stage_id] = gm.forward
+
+        if use_activation_checkpointing:
+            forward_fn = gm.forward
+            self.forward_fns[stage_id] = lambda *args, _fn=forward_fn: torch.utils.checkpoint.checkpoint(_fn, *args, use_reentrant=False)
+            self.logger.debug(f"Applied activation checkpointing to stage {stage_id}")
+        else:
+            self.forward_fns[stage_id] = gm.forward
 
         # initialize A2A states
         self.n_a2a_ops[stage_id] = n_a2a_ops
@@ -663,7 +680,10 @@ class PiperActor:
         self.inp_activation[stage_id][mb_idx] = None
     
     def _forward(self, stage_id: int, mb_idx: int, *deps):
-        return self._forward_impl(stage_id, mb_idx, *deps)
+        torch.cuda.nvtx.range_push(f"forward_stage_{stage_id}_mb_{mb_idx}")
+        ret = self._forward_impl(stage_id, mb_idx, *deps)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
     def _forward_impl(self, stage_id: int, mb_idx: int, *deps):
         self._label_task(f"{stage_id}:{mb_idx}")
@@ -763,7 +783,10 @@ class PiperActor:
         return 0
 
     def _backward(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        return self._backward_impl(stage_id, mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_push(f"backward_stage_{stage_id}_mb_{mb_idx}")
+        ret = self._backward_impl(stage_id, mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
     def _backward_impl(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
         self._label_task(f"{stage_id}:{mb_idx}")
@@ -828,7 +851,10 @@ class PiperActor:
 
 
     def _backward_input(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        return self._backward_input_impl(stage_id, mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_push(f"backward_input_stage_{stage_id}_mb_{mb_idx}")
+        ret = self._backward_input_impl(stage_id, mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
     def _backward_input_impl(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
         self._label_task(f"{stage_id}:{mb_idx}")
@@ -947,7 +973,10 @@ class PiperActor:
         return 0
 
     def _backward_weight(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
-        return self._backward_weight_impl(stage_id, mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_push(f"backward_weight_stage_{stage_id}_mb_{mb_idx}")
+        ret = self._backward_weight_impl(stage_id, mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
     def _backward_weight_impl(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
         self._label_task(f"{stage_id}:{mb_idx}")
@@ -1106,7 +1135,10 @@ class PiperActor:
         return 0
 
     def _forward_backward(self, fwd_stage_id: int, fwd_mb_idx: int, bwd_stage_id: int, bwd_mb_idx: int, *deps, loss_fn=None):
-        return self._forward_backward_impl(fwd_stage_id, fwd_mb_idx, bwd_stage_id, bwd_mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_push(f"forward_stage_{fwd_stage_id}_mb_{fwd_mb_idx}_backward_stage_{bwd_stage_id}_mb_{bwd_mb_idx}")
+        ret = self._forward_backward_impl(fwd_stage_id, fwd_mb_idx, bwd_stage_id, bwd_mb_idx, *deps, loss_fn=loss_fn)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
     def _forward_backward_impl(self, fwd_stage_id: int, fwd_mb_idx: int, bwd_stage_id: int, bwd_mb_idx: int, *deps, loss_fn=None):
         self._label_task(f"{fwd_stage_id}:{fwd_mb_idx}|{bwd_stage_id}:{bwd_mb_idx}")
@@ -1285,7 +1317,10 @@ class PiperActor:
                         )
 
     def _update(self, *deps):
-        return self._update_impl(*deps)
+        torch.cuda.nvtx.range_push(f"update")
+        ret = self._update_impl(*deps)
+        torch.cuda.nvtx.range_pop()
+        return ret
 
     def _update_impl(self, *deps):
         self._label_task("update")

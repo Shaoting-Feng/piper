@@ -3,7 +3,6 @@ import torch
 import os
 import gc
 from torch._dynamo.backends.registry import register_backend
-
 from .piper_utils import _serialize_graphmodule, piper_metadata, create_logger, LOG_LEVEL
 from .piper_graph_transform import _get_dp_comm_ops, _split_gm_by_stages, _profile_and_split_gm, _insert_a2a_ops, _insert_p2p_ops
 from .piper_actor import _get_actor
@@ -30,11 +29,10 @@ def piper(gm, example_inputs, **kwargs):
     else:
         logger.info(f"No stage annotations found, profiling graph to split into {num_stages} stages")
         top_level_gm, submodules = _profile_and_split_gm(gm, num_stages)
+
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     pp_degree = int(os.environ['PIPER_PP_DEGREE'])
     dp_degree = int(os.environ['PIPER_DP_DEGREE'])
-
-    # top_level_gm.print_readable()
 
     del top_level_gm
 
@@ -45,18 +43,20 @@ def piper(gm, example_inputs, **kwargs):
         if dp_degree > 1:
             stage_gm, n_a2a_ops = _insert_a2a_ops(stage_gm)
 
+        stage_gm_data = _serialize_graphmodule(stage_gm)
+
         actor_id = piper_metadata.stage_to_device[stage_id]
         actor = _get_actor(actor_id)
         actor_stages.append((actor, stage_id))
-        
-        stage_gm_data = _serialize_graphmodule(stage_gm)
+
         refs.append(actor._load_stage.remote(
-            stage_id, 
+            stage_id,
             stage_gm_data,
             graphargs,
             input_idxs,
             param_idxs,
             n_a2a_ops,
+            use_activation_checkpointing=piper_metadata.use_activation_checkpointing,
         ))
 
         del stage_gm
