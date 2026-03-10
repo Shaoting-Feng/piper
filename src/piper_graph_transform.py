@@ -118,7 +118,12 @@ class AllToAllSingleFunction(torch.autograd.Function):
             ctx.actor_self.bwd_a2a_counter += 1
         comp_stream.wait_event(comm_finished_event)
 
-        logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
+        # logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
+        if ctx.actor_self.trace_data.get('bwd_a2a') and len(ctx.actor_self.trace_data['bwd_a2a']) > 0:
+            logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
+        else:
+            logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank}")
+        
         # Return gradients: grad_output flows to grad_input, None for group
         return grad_input, grad_input, None
 
@@ -713,7 +718,6 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                     annotated_nodes.append((idx, node, annotation_key, reshape))
     
     if not annotated_nodes:
-        logger.info("No communication annotations found in graph")
         return gm, 0
     
     # Group annotated nodes into contiguous blocks
@@ -830,6 +834,10 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
             if reshape_info is not None:
                 reshape_type, reshape_shape = reshape_info
                 if reshape_type == "input":
+                    # DEBUG: Log reshape information
+                    logger.info(f"Applying input reshape {reshape_shape} to node {node.name}")
+                    if isinstance(reshape_shape, (list, tuple)) and -1 in reshape_shape:
+                        logger.warning(f"Input reshape shape contains -1: {reshape_shape}, this may cause shape inference issues")
                     # Reshape before communication
                     new_node = new_graph.call_function(
                         torch.reshape,
@@ -865,6 +873,11 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                 reshape_type, reshape_shape = reshape_info
                 if reshape_type == "output":
                     # Reshape after communication
+                    # DEBUG: Log reshape information
+                    logger.info(f"Applying output reshape {reshape_shape} to node {node.name}, buf_node shape inference needed")
+                    # Log the reshape shape for debugging
+                    if isinstance(reshape_shape, (list, tuple)) and -1 in reshape_shape:
+                        logger.warning(f"Reshape shape contains -1: {reshape_shape}, this may cause shape inference issues")
                     buf_node = new_graph.call_function(
                         torch.reshape,
                         (buf_node, reshape_shape)

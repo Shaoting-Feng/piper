@@ -160,6 +160,9 @@ def _serialize_target(t):
     # regular python function or built-in
     if inspect.isfunction(t) or inspect.isbuiltin(t):
         mod = inspect.getmodule(t)
+
+        # TODO: This may not be working as expected, since we use another 
+        # workaround during deserialization. 
         # Check if inspect.getmodule returned torch.ops.* namespace
         # These should be serialized as torch_op, not py_func
         if mod is not None:
@@ -257,7 +260,9 @@ def _deserialize_target(payload):
         return payload["value"]
 
     if kind == "py_func":
-        # Workaround: if module is torch.ops.*, redirect to torch_op deserialization
+        #TODO: this is a workaround to deserialize torch.ops.* functions
+        # if module is torch.ops.*, redirect to torch_op deserialization
+        # this needs to be dealt with during the serialization. 
         if payload["module"].startswith("torch.ops"):
             # Reconstruct the path from module and qualname
             # e.g., module="torch.ops.higher_order", qualname="triton_kernel_wrapper_mutation"
@@ -290,7 +295,7 @@ def _deserialize_target(payload):
                 obj = getattr(obj, part)
             return obj
         except AttributeError:
-                # If operator doesn't exist, try importing implementation module to trigger registration
+                # if operator doesn't exist, try importing implementation module to trigger registration
                 if path.startswith("higher_order."):
                     op_name = path.split(".", 1)[1]
                     op_to_module = {

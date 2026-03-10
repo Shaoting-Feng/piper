@@ -4,11 +4,14 @@ import torch
 import dataclasses
 from torch import nn
 
-# from torchtitan.models.qwen3 import Qwen3Model
 from torchtitan.models.qwen3 import Qwen3Model, Qwen3TransformerBlock
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.moe.moe import MoE
 
+from torchtitan.config import ActivationCheckpointConfig
+from torchtitan.distributed.activation_checkpoint import apply_ac
+
+from torch.utils.checkpoint import checkpoint
 
 class AnnotatedMoE(MoE):
     
@@ -40,30 +43,30 @@ class AnnotatedMoE(MoE):
                 * top_scores_experts_sorted.reshape(-1, 1)
             ).to(x.dtype)
         
-        # PIPER ANNOTATION 1: Dispatch tokens to experts via all_to_all
+        routed_input = routed_input.reshape(
+            2, self.experts.num_experts, -1 , dim)
+
+        # dispatch tokens to experts via all_to_all
         with torch.fx.traceback.annotate({
             "collective": "all_to_all_single",
             "group": "ep",
-            "reshape": ("output", (self.experts.num_experts, -1, dim))
         }):
-            # The routed_input will be dispatched to experts on different ranks
-            dispatched_input = routed_input
+            dispatched_input = routed_input.contiguous()
         
+        dispatched_input = dispatched_input.reshape(-1, dim)
         routed_output = self.experts(dispatched_input, num_tokens_per_expert)
-        
-        # PIPER ANNOTATION 2: Gather expert outputs back via all_to_all
+        routed_output = routed_output.reshape(self.experts.num_experts, -1, dim)
+
+        # gather expert outputs back via all_to_all
         with torch.fx.traceback.annotate({
             "collective": "all_to_all_single",
             "group": "ep",
-            "reshape": ("input", (self.experts.num_experts, -1, dim))
         }):
-            # The routed_output will be gathered back from expert ranks
-            gathered_output = routed_output
+            gathered_output = routed_output.contiguous()
         
-        # Rest of the forward pass (same as parent)
+        gathered_output = gathered_output.reshape(-1, dim)
         out = self.shared_experts(x) if self.shared_experts is not None else None
         
-        # Unsort routed outputs
         routed_output_unsorted = torch.zeros(
             (bs * slen * self.router.top_k, dim),
             dtype=gathered_output.dtype,
@@ -93,23 +96,10 @@ class AnnotatedMoE(MoE):
 
 class AnnotatedQwen3TransformerBlock(Qwen3TransformerBlock):
     def __init__(self, config, *, layer_id: int, dim: int, n_layers: int):
-        # Call parent init
         super().__init__(config, layer_id=layer_id, dim=dim, n_layers=n_layers)
         
-        # Replace MoE with annotated version if MoE is enabled
-        if self.moe_enabled and hasattr(self, 'moe'):
-            # Create AnnotatedMoE using the config (simpler and correct)
-            annotated_moe = AnnotatedMoE(config.moe, dim=dim)
-            
-            # Copy weights from original MoE if already initialized
-            if hasattr(self.moe, 'experts'):
-                annotated_moe.experts.load_state_dict(self.moe.experts.state_dict())
-                annotated_moe.router.load_state_dict(self.moe.router.state_dict())
-                if self.moe.shared_experts is not None:
-                    annotated_moe.shared_experts.load_state_dict(
-                        self.moe.shared_experts.state_dict()
-                    )
-            self.moe = annotated_moe
+        if self.moe_enabled:
+            self.moe = AnnotatedMoE(config.moe, dim=dim)
 
 
 class PiperQwen3Model(Qwen3Model):
@@ -120,27 +110,24 @@ class PiperQwen3Model(Qwen3Model):
     in the forward pass for pipeline parallelism.
     """
     
-    def __init__(self, config, num_stages: int = 2):
-        # Temporarily replace layer config to use AnnotatedQwen3TransformerBlock
+    def __init__(self, config, num_stages: int = 2, use_checkpointing: bool = False):
         original_layer_config = config.layer
         
-        # Create a new config that uses AnnotatedQwen3TransformerBlock
-        # We'll override the build method to use our annotated block
         class AnnotatedLayerConfig(original_layer_config.__class__):
             def build(self, *, layer_id: int, dim: int, n_layers: int):
                 return AnnotatedQwen3TransformerBlock(
                     self, layer_id=layer_id, dim=dim, n_layers=n_layers
                 )
         
-        # Extract fields from the original config (works with slots=True)
         field_dict = {field.name: getattr(original_layer_config, field.name) 
                      for field in dataclasses.fields(original_layer_config)}
         annotated_layer_config = AnnotatedLayerConfig(**field_dict)
         config.layer = annotated_layer_config
         
-        # Call parent init
         super().__init__(config)
         self.num_stages = num_stages
+        self.use_checkpointing = use_checkpointing
+
     
     def forward(
         self,
@@ -157,23 +144,21 @@ class PiperQwen3Model(Qwen3Model):
         num_layers = len(self.layers)
         layers_per_stage = num_layers // self.num_stages
         
-        # Stage 0: Embedding + first N layers
+        # stage 0: embedding + first N layers
         with torch.fx.traceback.annotate({"stage": 0}):
             h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
             
-            # Process first set of layers
             for i in range(layers_per_stage * (self.num_stages - 1)):
                 layer = self.layers[str(i)]
                 h = layer(h, self.freqs_cis, attention_masks, positions)
         
-        # Stage 1 (or last stage): Remaining layers + norm + output
+        # stage 1: remaining layers + norm + output
         with torch.fx.traceback.annotate({"stage": self.num_stages - 1}):
-            # Process remaining layers
             for i in range(layers_per_stage * (self.num_stages - 1), num_layers):
                 layer = self.layers[str(i)]
                 h = layer(h, self.freqs_cis, attention_masks, positions)
             
-            # Final norm and output
+            # final norm and output
             h = self.norm(h) if self.norm is not None else h
             output = self.output(h) if self.output is not None else h
         

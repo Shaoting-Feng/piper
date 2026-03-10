@@ -15,6 +15,7 @@ from .models.qwen3 import PiperQwen3Model
 from torchtitan.models.qwen3 import Qwen3Model, Qwen3TransformerBlock
 from torchtitan.models.common import GQAttention, RoPE, FeedForward
 from torchtitan.models.common.moe import MoE
+
 from .schedule_helpers import (
     build_1f1b_schedule, 
     build_gpipe_schedule, 
@@ -91,7 +92,7 @@ def create_qwen3_config(name: str) -> Qwen3Model.Config:
                     norm_eps=1e-6,
                     moe=MoE.Config(
                         hidden_dim=3584,
-                        num_experts=2,
+                        num_experts=4,
                         top_k=2,
                         use_grouped_mm=True,
                         num_expert_groups=None,
@@ -210,6 +211,42 @@ def create_qwen3_config(name: str) -> Qwen3Model.Config:
                     backend="cos_sin",
                 ),
             )
+        case '30B-A3B':
+            return Qwen3Model.Config(
+                vocab_size=151936,
+                dim=2048,
+                n_layers=48,
+                layer=Qwen3TransformerBlock.Config(
+                    norm_eps=1e-6,
+                    moe_enabled=True,
+                    moe=MoE.Config(
+                        hidden_dim=768,
+                        num_experts=64,
+                        num_shared_experts=0,
+                        top_k=8,
+                        score_func="softmax",
+                        route_norm=True,
+                        route_scale=1.0,
+                        score_before_experts=False,
+                    ),
+                    feed_forward=FeedForward.Config(hidden_dim=6144),
+                    attention=GQAttention.Config(
+                        n_heads=32,
+                        n_kv_heads=4,
+                        head_dim=128,
+                        qk_norm=True,
+                        norm_eps=1e-6,
+                        attn_backend="sdpa",
+                        rope_backend="cos_sin",
+                    ),
+                ),
+                rope=RoPE.Config(
+                    dim=128,
+                    max_seq_len=262144,
+                    theta=1000000.0,
+                    backend="cos_sin",
+                ),
+            )
         case _:
             raise ValueError(f"Unknown model config: {name}")
 
@@ -242,9 +279,10 @@ def main(args):
     model = PiperQwen3Model(config, num_stages=args.pp)
     model.to('cuda')
     
-    # Initialize weights using TorchTitan's method
-    with torch.no_grad():
-        model.init_weights(buffer_device=torch.device("cuda:0"))
+
+    # # Initialize weights using TorchTitan's method
+    # with torch.no_grad():
+    #     model.init_weights(buffer_device=torch.device("cuda:0"))
     
     # Create input tensors
     # Qwen3 forward signature: forward(tokens, attention_masks=None, positions=None)
@@ -257,12 +295,13 @@ def main(args):
 
     # Setup Piper
     piper_setup(
-        model, 
-        torch.optim.Adam, 
-        [x],  # Only tokens, not [x, input_pos] like Mixtral
-        y,
-        schedule,
-        args.naive_gradient_sync,
+        PiperQwen3Model,  # model_class (not model instance)
+        model_args=(config, args.pp),  # arguments to pass to model class
+        optim_fn=torch.optim.Adam,
+        example_inputs=[x],
+        example_outputs=y,
+        schedule=schedule,
+        naive_gradient_sync=args.naive_gradient_sync,
     )
 
     # Send data to actors ahead of time
@@ -279,11 +318,67 @@ def main(args):
     
     print(f"Running {args.iters} timed iterations...")
     iter_times = []
-    for _ in range(args.iters):
+    profile_iter = args.profile_iter
+    
+
+    if profile_iter is not None:
+        os.makedirs("piper_profiling/memory_snapshots", exist_ok=True)
+        os.makedirs("piper_profiling/overlapped", exist_ok=True)
+        os.makedirs("./piper_profiling/tensorboard", exist_ok=True)
+        os.makedirs("./piper_profiling/chrome_traces", exist_ok=True)
+    
+    for iter_idx in range(args.iters):
+        # Enable profiling for the specified iteration
+        if profile_iter is not None and iter_idx == profile_iter:
+            print(f"\n=== Enabling profiling for iteration {iter_idx} ===")
+            ray.get([actor.enable_profiling.remote(True) for actor in actors.values()])
+            ray.get([actor.set_tracing.remote(True) for actor in actors.values()])
+            ray.get([actor.enable_memory_tracing.remote(True) for actor in actors.values()])
+            ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
+            ray.get([actor.clear_trace_data.remote() for actor in actors.values()])
+        
         start = time.perf_counter()
-        piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
+        if profile_iter is not None and iter_idx == profile_iter:
+            with torch.profiler.record_function("piper_exec_iteration"):
+                piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
+        else:
+            piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
+
         end = time.perf_counter()
         iter_times.append(end - start)
+
+        # Collect profiling data and disable profiling after the specified iteration
+        if profile_iter is not None and iter_idx == profile_iter:
+            print(f"\n=== Collecting profiling data for iteration {iter_idx} ===")
+            
+            # Memory profiling
+            snapshot_paths = ray.get([actor.dump_memory_snapshot.remote() for actor in actors.values()])
+            print("\nMemory snapshots:")
+            for rank, path in enumerate(snapshot_paths):
+                if path:
+                    print(f"Rank {rank}: {path}")
+            
+            # Peak memory
+            mem_data_ret = ray.get([actor.get_peak_memory.remote() for actor in actors.values()])
+            print("\nPeak memory usage:")
+            for rank, peak_mem in mem_data_ret:
+                print(f"  Rank {rank}: {peak_mem:.3f} GB")
+            
+            # Timing data
+            trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
+            print("\nTiming data:")
+            for rank, trace_data in trace_data_ret:
+                print(f"\n  Rank {rank}:")
+                for key in trace_data:
+                    all_times = trace_data[key]
+                    if all_times:
+                        print(f"    {key}: {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
+            
+            # Disable profiling
+            print("\n=== Disabling profiling ===")
+            ray.get([actor.enable_profiling.remote(False) for actor in actors.values()])
+            ray.get([actor.set_tracing.remote(False) for actor in actors.values()])
+            ray.get([actor.enable_memory_tracing.remote(False) for actor in actors.values()])
     
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     print(
@@ -304,15 +399,15 @@ def main(args):
                 all_times = trace_data[key]
                 print(f"rank {rank} {key} time= {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
 
-    timeline_filename = f"out/qwen3-pp{args.pp}-dp{args.dp}"
+    timeline_filename = f"timeline/qwen3-pp{args.pp}-dp{args.dp}"
     ray.timeline(timeline_filename)
     print(f"Ray timeline saved to: {timeline_filename}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run Qwen3 model with pipeline parallelism')
-    parser.add_argument('--model', choices=['tiny', 'small', 'medium', 'large'], default='small',
-                        help='Model configuration: tiny, small, medium, or large (default: tiny)')
+    parser.add_argument('--model', choices=['tiny', 'small', 'medium', 'large', '30B-A3B'], default='small',
+                        help='Model configuration: tiny, small, medium, large, or 30B-A3B (default: tiny)')
     parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'no-pp'], default='1f1b',
                         help='Schedule type: gpipe, 1f1b, or interleaved-1f1b (default: 1f1b)')
     parser.add_argument('--dp', type=int, default=1,
@@ -321,7 +416,7 @@ def parse_args():
                         help='Number of pipeline parallel degrees (default: 2)')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size (default: 16)')
-    parser.add_argument('--seq_len', type=int, default=2048,
+    parser.add_argument('--seq_len', type=int, default=1024,
                         help='Sequence length (default: 2048)')
     parser.add_argument('--mbs', type=int, default=4,
                         help='Number of microbatches (default: 4)')
@@ -333,11 +428,17 @@ def parse_args():
                         help='Enable tracing')
     parser.add_argument('--naive_gradient_sync', action='store_true', default=False,
                         help='Enable naive gradient sync')
+    parser.add_argument('--profile_iter', type=int, default=None,
+                        help='Iteration number to profile (0-indexed). If None, no profiling (default: None)')
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    ray.init(include_dashboard=False, log_to_driver=True, namespace="qwen3", _temp_dir="/m-coriander/coriander/mfris/tmp/ray")
+    ray.init(
+        include_dashboard=False, 
+        log_to_driver=True, 
+        namespace="qwen3", 
+        _temp_dir="/dev/shm/ray")
     args = parse_args()
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
     handles = piper_coordinator.run_program.remote(main, args)
