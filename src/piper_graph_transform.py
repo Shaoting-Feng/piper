@@ -1,8 +1,11 @@
+import hashlib
+import json
 import ray
 import torch
 import torch.fx as fx
 import torch.distributed as dist
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 import operator
 import os
@@ -137,6 +140,362 @@ def _dispatch_a2a_single(output: torch.Tensor, input_tensor: torch.Tensor) -> to
 
 # Allow the dispatch function in the graph
 torch.compiler.allow_in_graph(_dispatch_a2a_single)
+
+def _profile_and_split_gm(gm, num_stages) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphModule, list[int], list]]]:
+    """
+    Profile each node in the graph module, then split into num_stages stages
+    of roughly equal execution time. This replaces annotation-based splitting
+    when users don't provide stage annotations.
+
+    Returns the same format as _split_gm_by_stages:
+        (top_level_gm, [(stage_id, stage_gm, input_idxs, param_idxs, graphargs, placeholders), ...])
+    """
+    # Step 1: Collect compute nodes (everything that isn't placeholder, get_attr, or output)
+    compute_nodes = []
+    for node in gm.graph.nodes:
+        if node.op in ("placeholder", "get_attr", "output"):
+            continue
+        compute_nodes.append(node)
+
+    if not compute_nodes:
+        return gm, []
+
+    # Check for cached split from a previous profiling run
+    cache_dir = Path.home() / ".cache" / "piper" / "splits"
+    graph_signature = hashlib.sha256(
+        json.dumps([(n.name, n.op, str(n.target)) for n in compute_nodes] + [num_stages]).encode()
+    ).hexdigest()[:16]
+    cache_file = cache_dir / f"{graph_signature}.json"
+
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+            split_node_names = cached["split_node_names"]
+            # Rebuild split_indices from cached node names
+            node_name_to_idx = {n.name: i for i, n in enumerate(compute_nodes)}
+            split_indices = [node_name_to_idx[name] for name in split_node_names]
+            logger.info(f"Loaded cached split from {cache_file} (splits: {split_node_names})")
+
+            # Assign stages and inject annotations
+            stage_assignments = {}
+            current_stage = 0
+            split_iter = iter(split_indices)
+            next_split = next(split_iter, len(compute_nodes))
+            for idx, node in enumerate(compute_nodes):
+                if idx == next_split:
+                    current_stage += 1
+                    next_split = next(split_iter, len(compute_nodes))
+                stage_assignments[node] = current_stage
+
+            for node, stage_id in stage_assignments.items():
+                if 'custom' not in node.meta:
+                    node.meta['custom'] = {}
+                node.meta['custom']['stage'] = stage_id
+
+            return _split_gm_by_stages(gm)
+        except Exception as e:
+            logger.warning(f"Failed to load cached split from {cache_file}: {e}, re-profiling")
+
+    # Step 2: Build environment mapping for executing individual nodes
+    # We need real tensors on device to profile. To handle models too large for a single
+    # GPU, we eagerly free intermediate tensors once all their consumers have been profiled.
+    env = {}
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Build reference counts: for each node, count how many compute nodes (+ the output node)
+    # consume it. When refcount hits 0 after profiling a consumer, we free the tensor.
+    compute_node_set = set(compute_nodes)
+    ref_counts = {}  # node.name -> int
+    for node in compute_nodes:
+        for inp in node.all_input_nodes:
+            ref_counts[inp.name] = ref_counts.get(inp.name, 0) + 1
+
+    def _materialize_tensor(ex, device):
+        """Create a real tensor on device from an example (possibly meta) tensor."""
+        if isinstance(ex, torch.Tensor):
+            shape = tuple(ex.shape)
+            if ex.device.type != "meta" and ex.device.type == device:
+                return ex
+            if ex.is_floating_point():
+                t = torch.randn(shape, dtype=ex.dtype, device=device)
+            else:
+                t = torch.ones(shape, dtype=ex.dtype, device=device)
+            if isinstance(ex, torch.nn.Parameter):
+                t = torch.nn.Parameter(t, requires_grad=ex.requires_grad)
+            return t
+        return ex
+
+    def _ensure_in_env(node):
+        """Lazily materialize a placeholder or get_attr node into env on first access."""
+        if node.name in env:
+            return
+        if node.op == "placeholder":
+            ex = node.meta.get("example_value")
+            if ex is not None:
+                env[node.name] = _materialize_tensor(ex, device)
+            else:
+                env[node.name] = None
+        elif node.op == "get_attr":
+            target_atoms = node.target.split(".")
+            attr = gm
+            for atom in target_atoms:
+                attr = getattr(attr, atom)
+            if isinstance(attr, torch.Tensor):
+                env[node.name] = _materialize_tensor(attr, device)
+            else:
+                env[node.name] = attr
+
+    def _fetch_arg(arg):
+        if isinstance(arg, fx.Node):
+            _ensure_in_env(arg)
+            return env.get(arg.name)
+        elif isinstance(arg, (list, tuple)):
+            vals = [_fetch_arg(a) for a in arg]
+            return type(arg)(vals)
+        elif isinstance(arg, dict):
+            return {k: _fetch_arg(v) for k, v in arg.items()}
+        return arg
+
+    def _dec_ref(node):
+        """Decrement refcount for a node and free its env entry when it reaches 0."""
+        name = node.name
+        if name not in ref_counts:
+            return
+        ref_counts[name] -= 1
+        if ref_counts[name] <= 0 and name in env and isinstance(env[name], torch.Tensor):
+            del env[name]
+
+    def _exec_node(node, args, kwargs, fn):
+        """Execute a single graph node and return the result."""
+        if node.op == "call_method":
+            return getattr(args[0], node.target)(*args[1:], **kwargs)
+        elif node.op == "call_module":
+            return fn(*args, **kwargs)
+        else:
+            return fn(*args, **kwargs)
+
+    def _log_env_memory():
+        """Log all active tensors in env and their total memory usage."""
+        active = []
+        total_bytes = 0
+        for name, val in env.items():
+            if isinstance(val, torch.Tensor) and val.device.type != "meta":
+                nbytes = val.nelement() * val.element_size()
+                total_bytes += nbytes
+                active.append((name, tuple(val.shape), val.dtype, nbytes))
+        total_mb = total_bytes / (1024 * 1024)
+        cuda_allocated_mb = torch.cuda.memory_allocated() / (1024 * 1024) if device == "cuda" else 0
+        logger.debug(
+            f"Active env tensors: {len(active)}, env total: {total_mb:.1f} MB, "
+            f"CUDA allocated: {cuda_allocated_mb:.1f} MB"
+        )
+        # Log the top 10 largest tensors
+        active.sort(key=lambda x: x[3], reverse=True)
+        for name, shape, dtype, nbytes in active[:10]:
+            logger.debug(f"  {name}: {shape} {dtype} ({nbytes / (1024*1024):.1f} MB)")
+
+    # Step 3: Profile each compute node with eager memory freeing
+    # Use no_grad to prevent autograd graph accumulation — we only need forward timing.
+    node_times = {}  # node -> time in ms
+
+    num_warmup = 3
+    num_profile = 5
+    log_interval = max(1, len(compute_nodes) // 20)  # Log ~20 times during profiling
+    for node_idx, node in enumerate(compute_nodes):
+        if node_idx % log_interval == 0:
+            _log_env_memory()
+
+        args = _fetch_arg(node.args)
+        kwargs = _fetch_arg(node.kwargs)
+
+        # Check for None inputs from failed predecessor nodes
+        has_none_input = False
+        for inp in node.all_input_nodes:
+            if inp.op not in ("placeholder", "get_attr") and env.get(inp.name) is None:
+                has_none_input = True
+                break
+
+        if has_none_input:
+            logger.debug(f"Skipping node {node.name}: predecessor produced None")
+            node_times[node.name] = 0.0
+            env[node.name] = None
+            for inp in node.all_input_nodes:
+                _dec_ref(inp)
+            continue
+
+        # Resolve the callable
+        if node.op == "call_function":
+            fn = node.target
+        elif node.op == "call_method":
+            fn = getattr(type(args[0]), node.target) if args else None
+        elif node.op == "call_module":
+            fn = gm.get_submodule(node.target)
+            fn.to(device)
+        else:
+            node_times[node.name] = 0.0
+            env[node.name] = None
+            for inp in node.all_input_nodes:
+                _dec_ref(inp)
+            continue
+
+        # Execute and profile under no_grad to prevent autograd graph accumulation
+        try:
+            with torch.no_grad():
+                for _ in range(num_warmup):
+                    result = _exec_node(node, args, kwargs, fn)
+
+                if device == "cuda":
+                    torch.cuda.synchronize()
+
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                for _ in range(num_profile):
+                    result = _exec_node(node, args, kwargs, fn)
+                end_event.record()
+                torch.cuda.synchronize()
+                elapsed = start_event.elapsed_time(end_event) / num_profile
+            node_times[node.name] = elapsed
+            env[node.name] = result
+        except Exception as e:
+            logger.warning(f"Failed to profile node {node.name} ({node.op}): {e}")
+            node_times[node.name] = 0.0
+            try:
+                with torch.no_grad():
+                    env[node.name] = _exec_node(node, args, kwargs, fn)
+            except Exception:
+                env[node.name] = None
+
+        # Move call_module submodules back to meta to free GPU memory
+        if node.op == "call_module":
+            fn.to("meta")
+
+        # Decrement refcounts for all inputs of this node
+        for inp in node.all_input_nodes:
+            _dec_ref(inp)
+
+    # Step 4: Partition compute nodes into num_stages groups of roughly equal time
+    total_time = sum(node_times.get(n.name, 0.0) for n in compute_nodes)
+    target_time = total_time / num_stages
+
+    # Precompute prefix sums for fast time range queries
+    prefix_times = [0.0]
+    for n in compute_nodes:
+        prefix_times.append(prefix_times[-1] + node_times.get(n.name, 0.0))
+
+    def _count_cross_boundary_deps(split_idx):
+        """Count how many compute nodes before split_idx are used by nodes at or after split_idx."""
+        before_set = set(compute_nodes[:split_idx])
+        cross = set()
+        for node in compute_nodes[split_idx:]:
+            for arg in node.all_input_nodes:
+                if arg in before_set and arg.op not in ("placeholder", "get_attr"):
+                    cross.add(arg)
+        return len(cross)
+
+    def _find_best_split(ideal_idx, stage_start_idx):
+        """Search all valid split points and return the one closest to ideal_idx in time."""
+        ideal_time = prefix_times[ideal_idx]
+        best_split = None
+        best_time_dist = float('inf')
+        for candidate in range(stage_start_idx + 1, len(compute_nodes)):
+            n_deps = _count_cross_boundary_deps(candidate)
+            if n_deps <= 1:
+                time_dist = abs(prefix_times[candidate] - ideal_time)
+                if time_dist < best_time_dist:
+                    best_time_dist = time_dist
+                    best_split = candidate
+        return best_split
+
+    # Find split points: we need (num_stages - 1) splits
+    split_indices = []
+    stage_start_idx = 0
+    for s in range(num_stages - 1):
+        # Target cumulative time for end of this stage
+        remaining_time = prefix_times[-1] - prefix_times[stage_start_idx]
+        remaining_stages = num_stages - s
+        stage_target = remaining_time / remaining_stages
+
+        target_cum_time = prefix_times[stage_start_idx] + stage_target
+        # Find the ideal split index (first node where cumulative time exceeds target)
+        ideal_idx = stage_start_idx + 1
+        for i in range(stage_start_idx + 1, len(compute_nodes)):
+            if prefix_times[i] >= target_cum_time:
+                ideal_idx = i
+                break
+        else:
+            ideal_idx = len(compute_nodes) - 1
+
+        best_split = _find_best_split(ideal_idx, stage_start_idx)
+        if best_split is not None:
+            split_indices.append(best_split)
+            time_offset = prefix_times[best_split] - prefix_times[ideal_idx]
+            logger.info(
+                f"Stage {s}/{s+1} boundary: split before node {compute_nodes[best_split].name} "
+                f"(index {best_split}, time offset from ideal: {time_offset:+.3f} ms)"
+            )
+            stage_start_idx = best_split
+        else:
+            logger.warning(f"Could not find valid split point near node {ideal_idx}, skipping")
+
+    # Save split to cache
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        split_node_names = [compute_nodes[i].name for i in split_indices]
+        cache_file.write_text(json.dumps({"split_node_names": split_node_names}, indent=2))
+        logger.info(f"Saved split cache to {cache_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save split cache: {e}")
+
+    # Assign stages based on split indices
+    stage_assignments = {}
+    current_stage = 0
+    split_iter = iter(split_indices)
+    next_split = next(split_iter, len(compute_nodes))
+    for idx, node in enumerate(compute_nodes):
+        if idx == next_split:
+            current_stage += 1
+            next_split = next(split_iter, len(compute_nodes))
+        stage_assignments[node] = current_stage
+
+    # Ensure example_value metadata matches the profiled result's requires_grad.
+    # This prevents assertions in _forward_impl from failing when non-grad tensors
+    # (e.g., masks, positional encodings) are passed between stages as outputs.
+    for node in compute_nodes:
+        result = env.get(node.name)
+        if result is not None and isinstance(result, torch.Tensor) and not result.requires_grad:
+            ex = node.meta.get("example_value")
+            if ex is not None and isinstance(ex, torch.Tensor) and ex.requires_grad:
+                node.meta["example_value"] = ex.detach()
+
+    # Inject stage annotations into node metadata so _split_gm_by_stages can handle it
+    for node, stage_id in stage_assignments.items():
+        if 'custom' not in node.meta:
+            node.meta['custom'] = {}
+        node.meta['custom']['stage'] = stage_id
+
+    # Log stage times
+    stage_times = defaultdict(float)
+    stage_node_counts = defaultdict(int)
+    for node, stage_id in stage_assignments.items():
+        stage_times[stage_id] += node_times.get(node.name, 0.0)
+        stage_node_counts[stage_id] += 1
+    for stage_id in sorted(stage_times.keys()):
+        logger.info(
+            f"Stage {stage_id}: {stage_times[stage_id]:.3f} ms "
+            f"({stage_node_counts[stage_id]} nodes)"
+        )
+
+    # Free all profiling tensors before training starts
+    import gc
+    env.clear()
+    del env
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Delegate to _split_gm_by_stages which handles all the submodule creation
+    return _split_gm_by_stages(gm)
+
 
 def _meta_tensor_like(example: torch.Tensor, *, requires_grad: bool, as_parameter: bool):
     t = torch.empty(example.shape, dtype=example.dtype, device="meta")
@@ -395,8 +754,13 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         
         # Find outputs: nodes computed in this stage that are used by other stages
         # Check if users have stage annotations from other stages, or if they're in already-processed stages
+        # Only consider non-placeholder nodes as outputs — placeholders (e.g. model attributes
+        # like freqs_cis, mask) are copied into each stage via get_attr or re-created as
+        # placeholders, so they don't need to be passed between stages.
         stage_outputs = []
         for node in stage_computed_nodes:
+            if node.op == "placeholder":
+                continue
             for user in node.users:
                 # Check if user has a stage annotation from a different stage
                 user_in_other_stage = False

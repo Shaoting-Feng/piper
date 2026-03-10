@@ -2,15 +2,21 @@ import ray
 import torch
 import time
 import argparse
+import json
 import os
 import numpy as np
 import gc
+
+from ray.util.placement_group import (
+    placement_group,
+    placement_group_table,
+    remove_placement_group,
+)
 
 from src.piper_exec import piper_exec
 from src.piper_compile import piper_setup, piper_shutdown
 from src.piper_coordinator import PiperProgramCoordinator
 from src.piper_utils import piper_metadata
-
 from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B, LLAMA_70B
 from .schedule_helpers import (
     build_1f1b_schedule, 
@@ -27,7 +33,7 @@ from .schedule_helpers import (
 )
 
 
-def main(args):
+def main(args, pg):
     
     # Set model configuration based on argument
     match args.model:
@@ -91,6 +97,8 @@ def main(args):
         example_outputs=y,
         schedule=schedule,
         naive_gradient_sync=args.naive_gradient_sync,
+        activation_checkpointing=args.activation_checkpointing,
+        pg=pg,
     )
 
     # Warmup
@@ -102,11 +110,13 @@ def main(args):
     # Time training steps
     print(f"Running {args.iters} timed iterations...")
     iter_times = []
-    for _ in range(args.iters):
+    for i in range(args.iters):
         start = time.perf_counter()
         piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
         end = time.perf_counter()
         iter_times.append(end - start)
+        print(f"Iter {i} completed")
+        time.sleep(1) 
     
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     print(
@@ -115,7 +125,6 @@ def main(args):
     )
 
     if args.tracing:
-        from src.piper_utils import piper_metadata
         actors = piper_metadata.actors
         ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
         ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
@@ -139,15 +148,26 @@ def main(args):
         suffix = "-naive-sync"
     else:
         suffix = ""
+    # Collect task_id -> label mappings from all actors
+    all_task_labels = {}
+    actors = piper_metadata.actors
+    for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
+        all_task_labels.update(labels)
+
+    os.makedirs("out", exist_ok=True)
     timeline_filename = f"out/{args.model}-pp{args.pp}-dp{args.dp}-{args.schedule}{suffix}.json"
     ray.timeline(timeline_filename)
+    labels_filename = timeline_filename.replace(".json", "-labels.json")
+    with open(labels_filename, "w") as f:
+        json.dump(all_task_labels, f)
     print(f"Ray timeline saved to: {timeline_filename}")
+    print(f"Task labels saved to: {labels_filename}")
 
     piper_shutdown()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
-    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b'], default='debug',
+    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b', '70b'], default='debug',
                         help='Model configuration: debug, 1b, 3b, or 8b (default: debug)')
     parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'interleaved-gpipe', 'dualpipev-nozb', 'dualpipev', 'zerobubble', 'no-pp'], default='1f1b',
                         help='Schedule type: gpipe, 1f1b, interleaved-1f1b, dualpipev, zerobubble, or no-pp (default: 1f1b)')
@@ -169,13 +189,18 @@ def parse_args():
                         help='Enable tracing')
     parser.add_argument('--naive_gradient_sync', action='store_true', default=False,
                         help='Enable naive gradient sync')
+    parser.add_argument('--activation_checkpointing', action='store_true', default=False,
+                        help='Enable activation checkpointing')
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    ray.init(include_dashboard=False, log_to_driver=True, namespace="llama")
     args = parse_args()
+    ray.init(log_to_driver=True, namespace="llama", include_dashboard=False, _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp")
+    pg = placement_group([{"CPU": 32*args.pp, "GPU": args.pp}] * args.dp)
+    ray.get(pg.ready(), timeout=10)  # Wait for the placement group to be ready before proceeding
+    print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(dp_degree=args.dp, pp_degree=args.pp)
-    ray.get(piper_coordinator.run_program.remote(main, args))
+    ray.get(piper_coordinator.run_program.remote(main, args, pg))
     time.sleep(3)
     ray.shutdown()

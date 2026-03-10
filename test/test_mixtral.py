@@ -3,12 +3,19 @@ import ray
 import torch
 import torch.nn as nn
 import argparse
+import json
 import time
 import os
 import numpy as np
 import itertools
 
 logger = logging.getLogger(__name__)
+
+from ray.util.placement_group import (
+    placement_group,
+    placement_group_table,
+    remove_placement_group,
+)
 
 from src.piper_coordinator import PiperProgramCoordinator
 from src.piper_compile import piper_setup
@@ -27,7 +34,7 @@ from .schedule_helpers import (
     DUALPIPEV_MB6_SCHEDULE,
 )
 
-def main(args):
+def main(args, pg):
 
     world_size = args.dp * args.pp
     mbs = args.mbs
@@ -74,7 +81,9 @@ def main(args):
         example_outputs=y,
         schedule=schedule,
         naive_gradient_sync=args.naive_grad_sync,
+        activation_checkpointing=args.activation_checkpointing,
         mode=args.mode,
+        pg=pg,
     )
 
     print(f"Running {args.warmup} warmup iterations...")
@@ -95,8 +104,9 @@ def main(args):
         f"rank {dp_rank} throughput= {(args.batch_size * args.mbs * config.block_size)/np.mean(iter_times):.3f} tokens/s ({len(iter_times)} samples)"
     )
 
+    actors = piper_metadata.actors
+
     if args.tracing:
-        actors = piper_metadata.actors
         ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
 
         print(f"Running {args.trace_iters} tracing iterations...")
@@ -109,9 +119,19 @@ def main(args):
                 all_times = trace_data[key]
                 print(f"rank {rank} {key} time= {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
 
+    # Collect task_id -> label mappings from all actors
+    all_task_labels = {}
+    for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
+        all_task_labels.update(labels)
+
+    os.makedirs("out", exist_ok=True)
     timeline_filename = f"out/mixtral-pp{args.pp}-dp{args.dp}-{args.schedule}-{args.mode}"
     ray.timeline(timeline_filename)
+    labels_filename = timeline_filename + "-labels.json"
+    with open(labels_filename, "w") as f:
+        json.dump(all_task_labels, f)
     print(f"Ray timeline saved to: {timeline_filename}")
+    print(f"Task labels saved to: {labels_filename}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
@@ -137,15 +157,25 @@ def parse_args():
                         help='Enable tracing')
     parser.add_argument('--naive-grad-sync', action='store_true', default=False,
                         help='Enable naive gradient sync')
+    parser.add_argument('--activation-checkpointing', action='store_true', default=False,
+                        help='Enable activation checkpointing')
     parser.add_argument('--mode', choices=['sequential', 'naive', 'overlapped'], default='overlapped',
                         help='Mode: sequential, naive, or overlapped (default: overlapped)')
     return parser.parse_args()
 
 if __name__ == "__main__":
-    ray.init(include_dashboard=False, log_to_driver=True, namespace="mixtral")
     args = parse_args()
     print(args)
+    ray.init(
+        log_to_driver=True,
+        namespace="mixtral",
+        include_dashboard=False,
+        _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
+    )
+    pg = placement_group([{"CPU": 32*args.pp, "GPU": args.pp}] * args.dp)
+    ray.get(pg.ready(), timeout=10)  # Wait for the placement group to be ready before proceeding
+    print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
-    handles = piper_coordinator.run_program.remote(main, args)
+    handles = piper_coordinator.run_program.remote(main, args, pg)
     ray.get(handles)
     ray.shutdown()

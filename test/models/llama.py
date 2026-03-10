@@ -494,32 +494,73 @@ class Transformer(nn.Module):
 
     #     return output
 
-    """
-    4 STAGES
-    """
-    def forward(self, tokens: torch.Tensor):
+    # """
+    # 8 STAGES
+    # """
+    # def forward(self, tokens: torch.Tensor):
 
-        with torch.fx.traceback.annotate({"stage": 0}):
-            h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-            start_pos = 0
-            for layer in self.layers[:self.n_layers//4+1]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
+    #     with torch.fx.traceback.annotate({"stage": 0}):
+    #         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+    #         start_pos = 0
+    #         for layer in self.layers[:self.n_layers//7]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
 
-        with torch.fx.traceback.annotate({"stage": 1}):
-            for layer in self.layers[self.n_layers//4+1:self.n_layers//2+2]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
+    #     with torch.fx.traceback.annotate({"stage": 1}):
+    #         for layer in self.layers[self.n_layers//7:2*self.n_layers//7]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
 
-        with torch.fx.traceback.annotate({"stage": 2}):
-            for layer in self.layers[self.n_layers//2+2:3*self.n_layers//4+3]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
+    #     with torch.fx.traceback.annotate({"stage": 2}):
+    #         for layer in self.layers[2*self.n_layers//7:3*self.n_layers//7]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
 
-        with torch.fx.traceback.annotate({"stage": 3}):
-            for layer in self.layers[3*self.n_layers//4+3:]:
-                h = layer(h, start_pos, self.freqs_cis, self.mask)
-            h = self.norm(h) if self.norm else h
-            output = self.output(h).float() if self.output else h
+    #     with torch.fx.traceback.annotate({"stage": 3}):
+    #         for layer in self.layers[3*self.n_layers//7:4*self.n_layers//7]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
 
-        return output
+    #     with torch.fx.traceback.annotate({"stage": 4}):
+    #         for layer in self.layers[4*self.n_layers//7:5*self.n_layers//7]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 5}):
+    #         for layer in self.layers[5*self.n_layers//7:6*self.n_layers//7]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 6}):
+    #         for layer in self.layers[6*self.n_layers//7:]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 7}):
+    #         h = self.norm(h) if self.norm else h
+    #         output = self.output(h).float() if self.output else h
+
+    #     return output
+
+    # """
+    # 4 STAGES
+    # """
+    # def forward(self, tokens: torch.Tensor):
+
+    #     with torch.fx.traceback.annotate({"stage": 0}):
+    #         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+    #         start_pos = 0
+    #         for layer in self.layers[:self.n_layers//4]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 1}):
+    #         for layer in self.layers[self.n_layers//4:self.n_layers//2]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 2}):
+    #         for layer in self.layers[self.n_layers//2:3*self.n_layers//4]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+
+    #     with torch.fx.traceback.annotate({"stage": 3}):
+    #         for layer in self.layers[3*self.n_layers//4:]:
+    #             h = layer(h, start_pos, self.freqs_cis, self.mask)
+    #         h = self.norm(h) if self.norm else h
+    #         output = self.output(h).float() if self.output else h
+
+    #     return output
 
     # """
     # 2 STAGES
@@ -538,20 +579,14 @@ class Transformer(nn.Module):
 
     #     return output
 
-    # """
-    # 1 STAGE
-    # """
-    # def forward(self, tokens: torch.Tensor):
-
-    #     distributed_stage(0, actor_id=0)
-
-    #     h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-    #     start_pos = 0
-        
-    #     for layer in self.layers:
-    #         h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     h = self.norm(h) if self.norm else h
-    #     output = self.output(h).float() if self.output else h
-
-    #     return output
+    """
+    No annotations: auto infer stages
+    """
+    def forward(self, tokens: torch.Tensor):
+        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        start_pos = 0
+        for layer in self.layers:
+            h = layer(h, start_pos, self.freqs_cis, self.mask)
+        h = self.norm(h) if self.norm else h
+        output = self.output(h).float() if self.output else h
+        return output

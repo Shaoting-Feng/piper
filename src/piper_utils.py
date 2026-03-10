@@ -75,6 +75,7 @@ class PiperMetadata:
     dag = set()
     stage_to_device = dict()
     naive_gradient_sync = False
+    use_activation_checkpointing = False
 
 piper_metadata = PiperMetadata()
 
