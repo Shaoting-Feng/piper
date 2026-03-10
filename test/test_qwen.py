@@ -5,11 +5,17 @@ import argparse
 import time
 import os
 import numpy as np
+import json
 
 from src.piper_coordinator import PiperProgramCoordinator
-from src.piper_compile import piper_setup
+from src.piper_compile import piper_setup, piper_shutdown
 from src.piper_exec import piper_exec
 from src.piper_utils import piper_metadata
+from ray.util.placement_group import (
+    placement_group,
+    placement_group_table,
+    remove_placement_group,
+)
 
 from .models.qwen3 import PiperQwen3Model
 from torchtitan.models.qwen3 import Qwen3Model, Qwen3TransformerBlock
@@ -251,7 +257,7 @@ def create_qwen3_config(name: str) -> Qwen3Model.Config:
             raise ValueError(f"Unknown model config: {name}")
 
 
-def main(args):
+def main(args, pg):
     world_size = args.dp * args.pp
     mbs = args.mbs
     batch_size = args.batch_size
@@ -295,13 +301,15 @@ def main(args):
 
     # Setup Piper
     piper_setup(
-        PiperQwen3Model,  # model_class (not model instance)
-        model_args=(config, args.pp),  # arguments to pass to model class
+        PiperQwen3Model,
+        model_args=(config, args.pp),
         optim_fn=torch.optim.Adam,
         example_inputs=[x],
         example_outputs=y,
         schedule=schedule,
         naive_gradient_sync=args.naive_gradient_sync,
+        activation_checkpointing=args.activation_checkpointing,
+        pg=pg,
     )
 
     # Send data to actors ahead of time
@@ -399,9 +407,30 @@ def main(args):
                 all_times = trace_data[key]
                 print(f"rank {rank} {key} time= {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
 
-    timeline_filename = f"timeline/qwen3-pp{args.pp}-dp{args.dp}"
+
+
+    if args.naive_gradient_sync:
+        suffix = "-naive-sync"
+    else:
+        suffix = ""
+    # Collect task_id -> label mappings from all actors
+    all_task_labels = {}
+    actors = piper_metadata.actors
+    for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
+        all_task_labels.update(labels)
+
+
+    os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/timeline", exist_ok=True)
+    timeline_filename = f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/timeline/qwen3-pp{args.pp}-dp{args.dp}-{args.schedule}{suffix}.json"
     ray.timeline(timeline_filename)
+    labels_filename = timeline_filename.replace(".json", "-labels.json")
+    with open(labels_filename, "w") as f:
+        import json
+        json.dump(all_task_labels, f)
     print(f"Ray timeline saved to: {timeline_filename}")
+    print(f"Task labels saved to: {labels_filename}")
+
+    piper_shutdown()
 
 
 def parse_args():
@@ -428,19 +457,26 @@ def parse_args():
                         help='Enable tracing')
     parser.add_argument('--naive_gradient_sync', action='store_true', default=False,
                         help='Enable naive gradient sync')
-    parser.add_argument('--profile_iter', type=int, default=None,
+    parser.add_argument('--profile_iter', type=int, default=5,
                         help='Iteration number to profile (0-indexed). If None, no profiling (default: None)')
+    parser.add_argument('--activation_checkpointing', action='store_true', default=True,
+                        help='Enable activation checkpointing')
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    ray.init(
-        include_dashboard=False, 
-        log_to_driver=True, 
-        namespace="qwen3", 
-        _temp_dir="/dev/shm/ray")
     args = parse_args()
+    ray.init(
+        include_dashboard=False,
+        log_to_driver=True,
+        namespace="qwen3",
+        _temp_dir="/dev/shm/ray"
+    )
+    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp)
+    ray.get(pg.ready(), timeout=10)
+    print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
-    handles = piper_coordinator.run_program.remote(main, args)
+    handles = piper_coordinator.run_program.remote(main, args, pg)
     ray.get(handles)
+    time.sleep(3)
     ray.shutdown()

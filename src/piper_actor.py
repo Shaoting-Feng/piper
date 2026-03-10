@@ -1103,6 +1103,16 @@ class PiperActor:
         return ret
 
     def _forward_impl(self, stage_id: int, mb_idx: int, *deps):
+
+        if self.profile:
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                with_stack=True,
+            )
+            profiler.__enter__()
+            forward_ctx_manager = torch.profiler.record_function(f"forward_stage_{stage_id}_mb_{mb_idx}")
+            forward_ctx_manager.__enter__()
+
         self._label_task(f"{stage_id}:{mb_idx}")
         if self.mode == "sequential":
             comp_stream = self.comp_stream
@@ -1212,6 +1222,16 @@ class PiperActor:
         return ret
 
     def _backward_impl(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
+
+        if self.profile:
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                with_stack=True,
+            )
+            profiler.__enter__()
+            backward_ctx_manager = torch.profiler.record_function(f"backward_stage_{stage_id}_mb_{mb_idx}")
+            backward_ctx_manager.__enter__()
+
         self._label_task(f"{stage_id}:{mb_idx}")
         if self.mode == "sequential":
             comp_stream = self.comp_stream
@@ -1265,7 +1285,7 @@ class PiperActor:
                 loss.backward()
             self._stop_timing(comp_stream, "backward_comp")
 
-            # self.loss.append(loss.item())
+        # self.loss.append(loss.item())
         # torch.cuda.nvtx.range_pop()
 
         # Clear output activation after backward pass
@@ -1277,7 +1297,7 @@ class PiperActor:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        torch.cuda.synchronize()
+        comp_stream.synchronize()
 
         if self.profile:
             backward_ctx_manager.__exit__(None, None, None)
@@ -1704,6 +1724,16 @@ class PiperActor:
         return ret
 
     def _backward_weight_impl(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
+        
+        if self.profile:
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                with_stack=True,
+            )
+            profiler.__enter__()
+            backward_ctx_manager = torch.profiler.record_function(f"backward_weight_stage_{stage_id}_mb_{mb_idx}")
+            backward_ctx_manager.__enter__()
+
         self._label_task(f"{stage_id}:{mb_idx}")
         comp_stream = self.comp_stream
 
@@ -2112,6 +2142,16 @@ class PiperActor:
         return ret
 
     def _forward_backward_impl(self, fwd_stage_id: int, fwd_mb_idx: int, bwd_stage_id: int, bwd_mb_idx: int, *deps, loss_fn=None):
+        
+        if self.profile:
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                with_stack=True,
+            )
+            profiler.__enter__()
+            forward_backward_ctx_manager = torch.profiler.record_function(f"forward_backward_stage_{fwd_stage_id}_mb_{fwd_mb_idx}_backward_stage_{bwd_stage_id}_mb_{bwd_mb_idx}")
+            forward_backward_ctx_manager.__enter__()
+
         self._label_task(f"{fwd_stage_id}:{fwd_mb_idx}|{bwd_stage_id}:{bwd_mb_idx}")
         if self.mode == "sequential":
             fwd_comp_stream = self.comp_stream
@@ -2283,7 +2323,7 @@ class PiperActor:
             self.bwd_a2a_counter = 0
 
         if self.profile:
-            backward_ctx_manager.__exit__(None, None, None)
+            forward_backward_ctx_manager.__exit__(None, None, None)
             profiler.__exit__(None, None, None)
             profiler.export_chrome_trace(
                 f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces/{self.mode}/actor{self.global_rank}_"
