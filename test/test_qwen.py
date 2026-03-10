@@ -322,10 +322,10 @@ def main(args):
     
 
     if profile_iter is not None:
-        os.makedirs("piper_profiling/memory_snapshots", exist_ok=True)
-        os.makedirs("piper_profiling/overlapped", exist_ok=True)
-        os.makedirs("./piper_profiling/tensorboard", exist_ok=True)
-        os.makedirs("./piper_profiling/chrome_traces", exist_ok=True)
+        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/memory_snapshots", exist_ok=True)
+        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/overlapped", exist_ok=True)
+        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/tensorboard", exist_ok=True)
+        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces", exist_ok=True)
     
     for iter_idx in range(args.iters):
         # Enable profiling for the specified iteration

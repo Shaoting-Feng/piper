@@ -307,7 +307,7 @@ class PiperActor:
 
     def stop_mem_tracing(self) -> None:
         torch.cuda.memory._dump_snapshot(
-            f"actor{self.global_rank}_memory_snapshot_mb4_gpipe.pickle"
+            f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/actor{self.global_rank}_memory_snapshot_mb4_gpipe.pickle"
         )
         self.logger.info(
             f"Saved memory snapshot to actor{self.global_rank}_memory_snapshot_mb4_gpipe.pickle"
@@ -1238,7 +1238,7 @@ class PiperActor:
         if self.profile:
             forward_ctx_manager.__exit__(None, None, None)
             profiler.__exit__(None, None, None)
-            profiler.export_chrome_trace(f"actor{self.global_rank}_fwd{stage_id}mb{mb_idx}_trace.json")
+            profiler.export_chrome_trace(f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces/{self.mode}/actor{self.global_rank}_fwd{stage_id}mb{mb_idx}_trace.json")
 
         return 1
 
@@ -1314,7 +1314,7 @@ class PiperActor:
         if self.profile:
             backward_ctx_manager.__exit__(None, None, None)
             profiler.__exit__(None, None, None)
-            profiler.export_chrome_trace(f"actor{self.global_rank}_bwd{stage_id}mb{mb_idx}_trace.json")
+            profiler.export_chrome_trace(f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces/{self.mode}/actor{self.global_rank}_bwd{stage_id}mb{mb_idx}_trace.json")
 
         return 1
 
@@ -1428,6 +1428,16 @@ class PiperActor:
         return 1
 
     def _backward_weight(self, stage_id: int, mb_idx: int, *deps, loss_fn=None):
+        
+        if self.profile:
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                with_stack=True,
+            )
+            profiler.__enter__()
+            backward_ctx_manager = torch.profiler.record_function(f"backward_weight_stage_{stage_id}_mb_{mb_idx}")
+            backward_ctx_manager.__enter__()
+        
         comp_stream = self.comp_stream
 
         self.logger.debug(
@@ -1577,7 +1587,7 @@ class PiperActor:
         if self.profile:
             backward_ctx_manager.__exit__(None, None, None)
             profiler.__exit__(None, None, None)
-            profiler.export_chrome_trace(f"actor{self.global_rank}_bwd{stage_id}mb{mb_idx}_trace.json")
+            profiler.export_chrome_trace(f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces/{self.mode}/actor{self.global_rank}_bwd{stage_id}mb{mb_idx}_trace.json")
 
         return 1
 
@@ -2257,7 +2267,7 @@ class PiperActor:
             backward_ctx_manager.__exit__(None, None, None)
             profiler.__exit__(None, None, None)
             profiler.export_chrome_trace(
-                f"actor{self.global_rank}_"
+                f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces/{self.mode}/actor{self.global_rank}_"
                 f"fwd{fwd_stage_id}mb{fwd_mb_idx}_"
                 f"bwd{bwd_stage_id}mb{bwd_mb_idx}_trace.json")
 
