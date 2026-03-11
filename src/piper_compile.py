@@ -29,6 +29,7 @@ def piper_setup(
     activation_checkpointing=False,
     mode="sequential",
     pg=None,
+    model_dtype=None,
 ):
     """
     Compile a model with the piper backend.
@@ -59,6 +60,8 @@ def piper_setup(
     # Build the model directly on meta device
     with torch.device("meta"):
         model = model_class(*model_args, **model_kwargs)
+    if model_dtype is not None:
+        model = model.to(model_dtype)
 
     num_params = sum(p.numel() for p in model.parameters())
     param_size_mb = num_params * 4 / (1024**3)  # float32
