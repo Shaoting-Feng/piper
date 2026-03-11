@@ -253,6 +253,36 @@ def create_qwen3_config(name: str) -> Qwen3Model.Config:
                     backend="cos_sin",
                 ),
             )
+
+        case '72B':
+            return Qwen3Model.Config(
+                vocab_size=152064,
+                dim=8192,
+                n_layers=80,
+                norm_eps=1e-5,
+                enable_weight_tying=False,
+                layer=Qwen3TransformerBlock.Config(
+                    depth_init=True,
+                    moe_enabled=False,
+                    norm_eps=1e-5,
+                    feed_forward=FeedForward.Config(hidden_dim=29568),
+                    attention=GQAttention.Config(
+                        n_heads=64,
+                        n_kv_heads=8,
+                        head_dim=128,
+                        qk_norm=True,
+                        norm_eps=1e-5,
+                        attn_backend="sdpa",
+                        rope_backend="cos_sin",
+                    ),
+                ),
+                rope=RoPE.Config(
+                    dim=128,
+                    max_seq_len=131072,
+                    theta=1000000.0,
+                    backend="cos_sin",
+                ),
+            )
         case _:
             raise ValueError(f"Unknown model config: {name}")
 
@@ -329,21 +359,21 @@ def main(args, pg):
     profile_iter = args.profile_iter
     
 
-    if profile_iter is not None:
-        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/memory_snapshots", exist_ok=True)
-        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/overlapped", exist_ok=True)
-        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/tensorboard", exist_ok=True)
-        os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces", exist_ok=True)
+    # if profile_iter is not None:
+    #     os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/memory_snapshots", exist_ok=True)
+    #     os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/overlapped", exist_ok=True)
+    #     os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/tensorboard", exist_ok=True)
+    #     os.makedirs("/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/chrome_traces", exist_ok=True)
     
     for iter_idx in range(args.iters):
         # Enable profiling for the specified iteration
         if profile_iter is not None and iter_idx == profile_iter:
             print(f"\n=== Enabling profiling for iteration {iter_idx} ===")
-            ray.get([actor.enable_profiling.remote(True) for actor in actors.values()])
-            ray.get([actor.set_tracing.remote(True) for actor in actors.values()])
-            ray.get([actor.enable_memory_tracing.remote(True) for actor in actors.values()])
-            ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
-            ray.get([actor.clear_trace_data.remote() for actor in actors.values()])
+            # ray.get([actor.enable_profiling.remote(True) for actor in actors.values()])
+            # ray.get([actor.set_tracing.remote(True) for actor in actors.values()])
+            # ray.get([actor.enable_memory_tracing.remote(True) for actor in actors.values()])
+            # ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
+            # ray.get([actor.clear_trace_data.remote() for actor in actors.values()])
         
         start = time.perf_counter()
         if profile_iter is not None and iter_idx == profile_iter:
@@ -356,37 +386,37 @@ def main(args, pg):
         iter_times.append(end - start)
 
         # Collect profiling data and disable profiling after the specified iteration
-        if profile_iter is not None and iter_idx == profile_iter:
-            print(f"\n=== Collecting profiling data for iteration {iter_idx} ===")
+        # if profile_iter is not None and iter_idx == profile_iter:
+        #     print(f"\n=== Collecting profiling data for iteration {iter_idx} ===")
             
-            # Memory profiling
-            snapshot_paths = ray.get([actor.dump_memory_snapshot.remote() for actor in actors.values()])
-            print("\nMemory snapshots:")
-            for rank, path in enumerate(snapshot_paths):
-                if path:
-                    print(f"Rank {rank}: {path}")
+            # # Memory profiling
+            # snapshot_paths = ray.get([actor.dump_memory_snapshot.remote() for actor in actors.values()])
+            # print("\nMemory snapshots:")
+            # for rank, path in enumerate(snapshot_paths):
+            #     if path:
+            #         print(f"Rank {rank}: {path}")
             
-            # Peak memory
-            mem_data_ret = ray.get([actor.get_peak_memory.remote() for actor in actors.values()])
-            print("\nPeak memory usage:")
-            for rank, peak_mem in mem_data_ret:
-                print(f"  Rank {rank}: {peak_mem:.3f} GB")
+            # # Peak memory
+            # mem_data_ret = ray.get([actor.get_peak_memory.remote() for actor in actors.values()])
+            # print("\nPeak memory usage:")
+            # for rank, peak_mem in mem_data_ret:
+            #     print(f"  Rank {rank}: {peak_mem:.3f} GB")
             
-            # Timing data
-            trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
-            print("\nTiming data:")
-            for rank, trace_data in trace_data_ret:
-                print(f"\n  Rank {rank}:")
-                for key in trace_data:
-                    all_times = trace_data[key]
-                    if all_times:
-                        print(f"    {key}: {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
+            # # Timing data
+            # trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
+            # print("\nTiming data:")
+            # for rank, trace_data in trace_data_ret:
+            #     print(f"\n  Rank {rank}:")
+            #     for key in trace_data:
+            #         all_times = trace_data[key]
+            #         if all_times:
+            #             print(f"    {key}: {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
             
-            # Disable profiling
-            print("\n=== Disabling profiling ===")
-            ray.get([actor.enable_profiling.remote(False) for actor in actors.values()])
-            ray.get([actor.set_tracing.remote(False) for actor in actors.values()])
-            ray.get([actor.enable_memory_tracing.remote(False) for actor in actors.values()])
+            # # Disable profiling
+            # print("\n=== Disabling profiling ===")
+            # ray.get([actor.enable_profiling.remote(False) for actor in actors.values()])
+            # ray.get([actor.set_tracing.remote(False) for actor in actors.values()])
+            # ray.get([actor.enable_memory_tracing.remote(False) for actor in actors.values()])
     
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     print(
@@ -435,8 +465,8 @@ def main(args, pg):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run Qwen3 model with pipeline parallelism')
-    parser.add_argument('--model', choices=['tiny', 'small', 'medium', 'large', '30B-A3B'], default='small',
-                        help='Model configuration: tiny, small, medium, large, or 30B-A3B (default: tiny)')
+    parser.add_argument('--model', choices=['tiny', 'small', 'medium', 'large', '30B-A3B', '72B'], default='small',
+                        help='Model configuration: tiny, small, medium, large, 30B-A3B, or 72B (default: tiny)')
     parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'no-pp'], default='1f1b',
                         help='Schedule type: gpipe, 1f1b, or interleaved-1f1b (default: 1f1b)')
     parser.add_argument('--dp', type=int, default=1,
@@ -459,7 +489,7 @@ def parse_args():
                         help='Enable naive gradient sync')
     parser.add_argument('--profile_iter', type=int, default=5,
                         help='Iteration number to profile (0-indexed). If None, no profiling (default: None)')
-    parser.add_argument('--activation_checkpointing', action='store_true', default=True,
+    parser.add_argument('--activation_checkpointing', action='store_true', default=False,
                         help='Enable activation checkpointing')
     return parser.parse_args()
 

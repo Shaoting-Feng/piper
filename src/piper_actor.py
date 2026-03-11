@@ -25,6 +25,7 @@ CLEANUP_MEMORY = True
 
 logger = create_logger("piper_actor", LOG_LEVEL)
 
+torch.autograd.set_detect_anomaly(True, check_nan=False)
 
 def _get_rank(pp_rank, dp_rank, pp_degree):
     return pp_rank + dp_rank * pp_degree
@@ -194,6 +195,7 @@ class PiperActor:
 
         piper_metadata.actor_self = self
 
+        self.profile = False
 
         # In PiperActor.__init__, add:
         self.pytorch_profiler = None
@@ -1284,6 +1286,13 @@ class PiperActor:
                 loss = loss_fn(out_activation, labels)
                 loss.backward()
             self._stop_timing(comp_stream, "backward_comp")
+
+
+        # gm = self.graph_modules.get(stage_id)
+        # if gm is not None:
+        #     for m in gm.modules():
+        #         if hasattr(m, 'flush_tokens_per_expert'):
+        #             m.flush_tokens_per_expert()
 
         # self.loss.append(loss.item())
         # torch.cuda.nvtx.range_pop()

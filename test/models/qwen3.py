@@ -14,7 +14,12 @@ from torchtitan.distributed.activation_checkpoint import apply_ac
 from torch.utils.checkpoint import checkpoint
 
 class AnnotatedMoE(MoE):
-    
+    def flush_tokens_per_expert(self) -> None:
+        if hasattr(self, '_tokens_per_expert_acc'):
+            with torch.no_grad():
+                self.tokens_per_expert.add_(self._tokens_per_expert_acc)
+                self._tokens_per_expert_acc.zero_()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
@@ -25,9 +30,20 @@ class AnnotatedMoE(MoE):
             num_tokens_per_expert,
         ) = self.router(x, self.expert_bias)
         
-        with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+        # with torch.no_grad():
+        #     # self.tokens_per_expert.add_(num_tokens_per_expert)
+        #     self.tokens_per_expert.add_(num_tokens_per_expert.detach().to(self.tokens_per_expert.device))
         
+        # with torch.no_grad():
+        #     # Don't write to buffer in forward (breaks use_reentrant=False checkpoint).
+        #     # Accumulate; Piper must call flush_tokens_per_expert() after backward.
+        #     acc = num_tokens_per_expert.detach().to(
+        #         dtype=self.tokens_per_expert.dtype, device=self.tokens_per_expert.device
+        #     )
+        #     if not hasattr(self, '_tokens_per_expert_acc'):
+        #         self._tokens_per_expert_acc = torch.zeros_like(self.tokens_per_expert)
+        #     self._tokens_per_expert_acc = self._tokens_per_expert_acc + acc
+
         (
             top_scores_experts_sorted,
             token_indices_experts_sorted,
