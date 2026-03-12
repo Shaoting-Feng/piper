@@ -56,13 +56,15 @@ class ModelArgs:
 
 transformer_configs = {
     "tiny": dict(block_size=128, n_layer=4, n_head=2, n_local_heads=1, dim=256, intermediate_size=512, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
-    "small": dict(block_size=512, n_layer=8, n_head=8, n_local_heads=2, dim=1024, intermediate_size=2048, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
-    "medium": dict(block_size=512, n_layer=24, n_head=32, n_local_heads=8, dim=1024, intermediate_size=2048, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
-    "Mixtral-8x7B-v0.1": dict(block_size=32768, n_layer=32, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
+    "small": dict(block_size=512, n_layer=2, n_head=32, n_local_heads=8, dim=1024, intermediate_size=2048, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
+    "medium": dict(block_size=512, n_layer=4, n_head=8, n_local_heads=2, dim=4096, intermediate_size=14336, rope_base=1000000.0, num_experts=4, num_activated_experts=2),
+    "Mixtral-8x7B-v0.1": dict(block_size=1024, n_layer=2, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
+    # "Mixtral-8x22B-v0.1": dict(block_size=2048, n_layer=4, n_head=48, n_local_heads=8, dim=6144, intermediate_size=16384, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
+    "Mixtral-8x22B-v0.1": dict(block_size=1024, n_layer=4, n_head=32, n_local_heads=8, dim=2048, intermediate_size=16384, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
 }
 
 class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
@@ -92,10 +94,10 @@ class Transformer(nn.Module):
 
         self.freqs_cis: Optional[Tensor] = precompute_freqs_cis(
             self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base
-        ).to('cuda')
+        )
         self.causal_mask: Optional[Tensor] = torch.tril(
             torch.ones(self.config.block_size, self.config.block_size, dtype=torch.bool)
-        ).to('cuda')
+        )
         
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
@@ -112,7 +114,7 @@ class Transformer(nn.Module):
         for b in self.layers:
             b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base).to(torch.bfloat16)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -238,9 +240,9 @@ class ConditionalFeedForward(nn.Module):
         super().__init__()
         self.config = config
 
-        self.w1 = nn.Parameter(torch.randn(config.num_experts, config.intermediate_size, config.dim))
-        self.w2 = nn.Parameter(torch.randn(config.num_experts, config.dim, config.intermediate_size))
-        self.w3 = nn.Parameter(torch.randn(config.num_experts, config.intermediate_size, config.dim))
+        self.w1 = nn.Parameter(torch.empty(config.num_experts, config.intermediate_size, config.dim))
+        self.w2 = nn.Parameter(torch.empty(config.num_experts, config.dim, config.intermediate_size))
+        self.w3 = nn.Parameter(torch.empty(config.num_experts, config.intermediate_size, config.dim))
 
     def forward(self, x: Tensor, dispatch_mask: Tensor, combine_weights: Tensor, capacity: int) -> Tensor:
         """
@@ -291,7 +293,7 @@ class MOEFeedForward(nn.Module):
         mask = F.one_hot(expert_indices, num_classes=num_experts).sum(dim=1).bool()  # [T, E]
         capacity = x.shape[0] # // num_experts * 2
         locations = torch.cumsum(mask, dim=0) - 1 # [T, E]
-        locations_sc = F.one_hot(locations * mask, capacity).float() # [T, E, C]
+        locations_sc = F.one_hot(locations * mask, capacity).to(dtype=x.dtype) # [T, E, C]
         combine_weights = torch.einsum("se,sec->sec", gates * mask, locations_sc)
         dispatch_mask = combine_weights.bool()
 
@@ -322,7 +324,7 @@ def precompute_freqs_cis(
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
-    return cache.to(dtype=torch.bfloat16)
+    return cache
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
