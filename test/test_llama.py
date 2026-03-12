@@ -1,5 +1,6 @@
 import ray
 import torch
+import bitsandbytes as bnb
 import time
 import argparse
 import json
@@ -92,13 +93,14 @@ def main(args, pg):
     piper_setup(
         Transformer,
         model_args=(llama_config, args.seq_len),
-        optim_fn=torch.optim.Adam,
+        optim_fn=bnb.optim.Adam8bit,
         example_inputs=[x],
         example_outputs=y,
         schedule=schedule,
         naive_gradient_sync=args.naive_gradient_sync,
         activation_checkpointing=args.activation_checkpointing,
         pg=pg,
+        model_dtype=torch.bfloat16,
     )
 
     # Warmup
@@ -175,11 +177,11 @@ def parse_args():
                         help='Number of data parallel degrees (default: 1)')
     parser.add_argument('--pp', type=int, default=2,
                         help='Number of pipeline parallel degrees (default: 2)')
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size (default: 16)')
     parser.add_argument('--mbs', type=int, default=4,
                         help='Number of microbatches (default: 4)')
-    parser.add_argument('--seq_len', type=int, default=256,
+    parser.add_argument('--seq-len', type=int, default=256,
                         help='Sequence length (default: 256)')
     parser.add_argument('--warmup', type=int, default=5,
                         help='Number of warmup iterations (default: 5)')
@@ -187,9 +189,9 @@ def parse_args():
                         help='Number of timing iterations (default: 10)')
     parser.add_argument('--tracing', action='store_true', default=False,
                         help='Enable tracing')
-    parser.add_argument('--naive_gradient_sync', action='store_true', default=False,
+    parser.add_argument('--naive-gradient-sync', action='store_true', default=False,
                         help='Enable naive gradient sync')
-    parser.add_argument('--activation_checkpointing', action='store_true', default=False,
+    parser.add_argument('--activation-checkpointing', action='store_true', default=False,
                         help='Enable activation checkpointing')
     return parser.parse_args()
 

@@ -47,8 +47,10 @@ def main(args, pg):
             config = ModelArgs.from_name("small")
         case 'medium':
             config = ModelArgs.from_name("medium")
-        case 'large':
+        case '7b':
             config = ModelArgs.from_name("Mixtral-8x7B-v0.1")
+        case '22b':
+            config = ModelArgs.from_name("Mixtral-8x22B-v0.1")
 
     schedule = None
     match args.schedule:
@@ -83,12 +85,24 @@ def main(args, pg):
         naive_gradient_sync=args.naive_grad_sync,
         activation_checkpointing=args.activation_checkpointing,
         mode=args.mode,
+        model_dtype=torch.bfloat16,
         pg=pg,
     )
+
+    if args.no_nccl_conflict_handling:
+        ray.get([actor.disable_nccl_monitor.remote() for actor in piper_metadata.actors.values()])
 
     print(f"Running {args.warmup} warmup iterations...")
     for _ in range(args.warmup):
         piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync)
+        time.sleep(1)
+
+    actors = piper_metadata.actors
+
+    ray.get([actor.enable_nccl_monitoring.remote() for actor in actors.values()])
+    piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync) 
+    ray.get([actor.print_nccl_overlaps.remote() for actor in actors.values()])
+    time.sleep(1)
 
     print(f"Running {args.iters} timed iterations...")
     iter_times = []
@@ -97,6 +111,7 @@ def main(args, pg):
         piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync)
         end = time.perf_counter()
         iter_times.append(end - start)
+        time.sleep(1)
     
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     print(
@@ -104,14 +119,13 @@ def main(args, pg):
         f"rank {dp_rank} throughput= {(args.batch_size * args.mbs * config.block_size)/np.mean(iter_times):.3f} tokens/s ({len(iter_times)} samples)"
     )
 
-    actors = piper_metadata.actors
-
     if args.tracing:
         ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
 
         print(f"Running {args.trace_iters} tracing iterations...")
         for _ in range(args.trace_iters):
             piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync)
+            time.sleep(1)
 
         trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
         for rank, trace_data in trace_data_ret:
@@ -135,15 +149,15 @@ def main(args, pg):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
-    parser.add_argument('--model', choices=['tiny', 'small', 'medium', 'large'], default='tiny',
-                        help='Model configuration: tiny, small, medium, or large (default: tiny)')
+    parser.add_argument('--model', choices=['tiny', 'small', 'medium', '7b', '22b'], default='tiny',
+                        help='Model configuration: tiny, small, medium, 7b, or 22b (default: tiny)')
     parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'dualpipev', 'dualpipev-nozb', 'no-pp'], default='1f1b',
                         help='Schedule type: gpipe, 1f1b, interleaved-1f1b, dualpipev, dualpipev-nozb, or no-pp (default: 1f1b)')
     parser.add_argument('--dp', type=int, default=2,
                         help='Number of data parallel degrees (default: 2)')
     parser.add_argument('--pp', type=int, default=2,
                         help='Number of pipeline parallel degrees (default: 2)')
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size (default: 16)')
     parser.add_argument('--mbs', type=int, default=4,
                         help='Number of microbatches (default: 4)')
@@ -161,6 +175,8 @@ def parse_args():
                         help='Enable activation checkpointing')
     parser.add_argument('--mode', choices=['sequential', 'naive', 'overlapped'], default='overlapped',
                         help='Mode: sequential, naive, or overlapped (default: overlapped)')
+    parser.add_argument('--no-nccl-conflict-handling', action='store_true', default=False,
+                        help='Disable NCCL conflict detection and dependency enforcement')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -172,7 +188,7 @@ if __name__ == "__main__":
         include_dashboard=False,
         _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
     )
-    pg = placement_group([{"CPU": 32*args.pp, "GPU": args.pp}] * args.dp)
+    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp)
     ray.get(pg.ready(), timeout=10)  # Wait for the placement group to be ready before proceeding
     print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)

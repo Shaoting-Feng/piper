@@ -1,12 +1,12 @@
+import queue
 import ray
 import torch
-import uuid
 import inspect
 import logging
 import json, importlib, operator
 import torch.fx as fx
-import threading
 from collections import defaultdict
+from dataclasses import dataclass
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from typing import Any, Optional
 
@@ -64,6 +64,266 @@ def create_logger(name: str, log_level: str):
         logger.propagate = False
     
     return logger
+
+
+_CRITICAL_OPS     = frozenset({"fwd_p2p_recv", "fwd_p2p_send", "bwd_p2p_recv", "bwd_p2p_send", "fwd_a2a", "bwd_a2a"})
+_NON_CRITICAL_OPS = frozenset({"grad_allreduce", "grad_allreduce_naive"})
+
+_nccl_log = logging.getLogger("piper_nccl")
+
+
+class _DepGate:
+    """One-shot handoff of a CUDA end-event from a critical op to a non-critical op.
+
+    signal() is called by the critical op's after_kernel.
+    wait()   is called by the non-critical op's before_kernel.
+
+    wait() is intentionally non-blocking: if the critical op hasn't fired yet
+    (e.g. both are dispatched from the same CPU thread and the critical op comes
+    later in the schedule), enforcement is skipped rather than deadlocking.
+    Unmatched signals are drained by NcclOverlapDetector.reset_iteration().
+    """
+    __slots__ = ("_q",)
+
+    def __init__(self):
+        self._q: queue.Queue = queue.Queue()
+
+    def signal(self, end_event: "torch.cuda.Event") -> None:
+        self._q.put(end_event)
+
+    def wait(self, stream: "torch.cuda.Stream") -> None:
+        try:
+            event = self._q.get_nowait()
+            stream.wait_event(event)    # GPU-side dependency
+        except queue.Empty:
+            pass  # critical op not yet dispatched; skip enforcement for this call
+
+    def drain(self) -> None:
+        """Discard any unmatched signals left over from the previous iteration."""
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+
+
+@dataclass
+class _NcclKernelRecord:
+    kernel_name: str
+    stream_label: str
+    start_event: "torch.cuda.Event"
+    end_event: Optional["torch.cuda.Event"] = None
+    # GPU-side timestamps (ms from reference event); populated by find_overlaps()
+    t_start_ms: Optional[float] = None
+    t_end_ms: Optional[float] = None
+    # Position of this kernel in dispatch order on its stream; set by build_enforcement
+    stream_instance_idx: Optional[int] = None
+
+
+class NcclOverlapDetector:
+    """
+    Passively records GPU-side start/end events for every NCCL kernel while
+    monitoring is enabled, then performs a single retrospective overlap analysis
+    after the iteration completes.
+
+    No callbacks, no host functions, no GPU stalls.
+
+    Typical usage in a training loop:
+
+        # After warmup, enable monitoring for one iteration:
+        actor.enable_nccl_monitoring.remote()
+        losses = piper.step(batch)
+        actor.print_nccl_overlaps.remote()   # syncs GPU, analyses, prints, then disables
+
+    At each NCCL launch site (AFTER any stream.wait_stream / wait_event):
+        token = detector.before_kernel(cuda_stream, kernel_name, stream_label)
+        # ... launch the NCCL kernel ...
+        detector.after_kernel(cuda_stream, token)
+
+    reset_iteration() is called automatically at the end of every training iteration.
+    It clears records only when monitoring is disabled, so a monitored iteration's
+    records survive until print_nccl_overlaps() consumes them.
+    """
+
+    def __init__(self):
+        self._records: list[_NcclKernelRecord] = []
+        self._ref_event: Optional["torch.cuda.Event"] = None
+        self.enabled: bool = False
+        # Enforcement — keyed by (stream_label, stream_instance_idx)
+        self._signal_gates: dict[tuple[str, int], list[_DepGate]] = {}
+        self._wait_gates:   dict[tuple[str, int], list[_DepGate]] = {}
+        self._per_stream_counter: dict[str, int] = {}  # reset each iteration
+        self._enforcement_active: bool = False
+
+    def enable(self) -> None:
+        """Enable monitoring and reset any previous records."""
+        self._records.clear()
+        self._ref_event = torch.cuda.Event(enable_timing=True)
+        self._ref_event.record()
+        self.enabled = True
+
+    def disable(self) -> None:
+        self.enabled = False
+
+    def before_kernel(
+        self,
+        cuda_stream: "torch.cuda.Stream",
+        kernel_name: str,
+        stream_label: str,
+    ) -> str:
+        """Record start_event on cuda_stream and return an opaque token.
+
+        Must be called AFTER any stream.wait_stream() / stream.wait_event() so the
+        event is enqueued only once GPU-side dependencies have resolved, giving an
+        accurate kernel-start timestamp.
+        """
+        # Enforcement: compute per-stream instance index and wait on any gates for this slot
+        instance_idx = -1
+        if self._enforcement_active:
+            instance_idx = self._per_stream_counter.get(stream_label, 0)
+            for gate in self._wait_gates.get((stream_label, instance_idx), []):
+                gate.wait(cuda_stream)
+            self._per_stream_counter[stream_label] = instance_idx + 1
+
+        if not self.enabled:
+            # Enforcement-only: encode (stream_label, instance_idx) for after_kernel
+            return f"E:{stream_label}:{instance_idx}" if self._enforcement_active else ""
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(cuda_stream)
+        token = str(len(self._records))
+        self._records.append(_NcclKernelRecord(
+            kernel_name=kernel_name,
+            stream_label=stream_label,
+            start_event=start_event,
+            stream_instance_idx=instance_idx if self._enforcement_active else None,
+        ))
+        return token
+
+    def after_kernel(self, cuda_stream: "torch.cuda.Stream", token: str) -> None:
+        """Record end_event on cuda_stream. Call after the NCCL kernel."""
+        if not token:
+            return
+
+        if token.startswith("E:"):
+            # Enforcement-only mode: parse "E:{stream_label}:{instance_idx}"
+            _, stream_label, idx_str = token.split(":")
+            instance_idx = int(idx_str)
+            end_event = torch.cuda.Event(enable_timing=False)
+            end_event.record(cuda_stream)
+            for gate in self._signal_gates.get((stream_label, instance_idx), []):
+                gate.signal(end_event)
+            return
+
+        # Monitoring mode (with or without enforcement): token is a record index
+        record_idx = int(token)
+        record = self._records[record_idx]
+
+        end_event = None
+        if self.enabled:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(cuda_stream)
+            record.end_event = end_event
+
+        if self._enforcement_active and record.stream_instance_idx is not None:
+            if end_event is None:
+                end_event = torch.cuda.Event(enable_timing=False)
+                end_event.record(cuda_stream)
+            for gate in self._signal_gates.get(
+                (record.stream_label, record.stream_instance_idx), []
+            ):
+                gate.signal(end_event)
+
+    def build_enforcement(self, overlaps: list, logger) -> None:
+        """Build per-instance gate map from detected overlaps. Call after find_overlaps().
+
+        Assigns a stable stream_instance_idx to every record (= position in dispatch
+        order on that stream), then creates one _DepGate per detected overlap instance.
+        Gates are permanent — they are not rebuilt each iteration; only
+        _per_stream_counter is reset so the same indices are reproduced.
+        """
+        # Assign stream_instance_idx to every record in monitoring order
+        stream_counts: dict[str, int] = {}
+        for r in self._records:
+            r.stream_instance_idx = stream_counts.get(r.stream_label, 0)
+            stream_counts[r.stream_label] = r.stream_instance_idx + 1
+
+        # Build one gate per detected overlap instance
+        signal: dict[tuple[str, int], list[_DepGate]] = {}
+        wait:   dict[tuple[str, int], list[_DepGate]] = {}
+        n_pairs = 0
+        for a, b, _ in overlaps:
+            if a.kernel_name in _CRITICAL_OPS and b.kernel_name in _NON_CRITICAL_OPS:
+                crit, noncrit = a, b
+            elif b.kernel_name in _CRITICAL_OPS and a.kernel_name in _NON_CRITICAL_OPS:
+                crit, noncrit = b, a
+            else:
+                continue
+            logger.debug(f"Enforcing dependency between {crit} -> {noncrit} NCCL kernels")
+            gate = _DepGate()
+            signal.setdefault((crit.stream_label,    crit.stream_instance_idx),    []).append(gate)
+            wait.setdefault(  (noncrit.stream_label, noncrit.stream_instance_idx), []).append(gate)
+            n_pairs += 1
+
+        self._signal_gates = signal
+        self._wait_gates   = wait
+        self._enforcement_active = bool(n_pairs)
+        if self._enforcement_active:
+            _nccl_log.info(
+                "NcclOverlapDetector: enforcement active — %d instance-level gate(s)", n_pairs
+            )
+
+    def find_overlaps(self, logger) -> list[tuple["_NcclKernelRecord", "_NcclKernelRecord", float]]:
+        """Compute GPU-time intervals and return all overlapping cross-stream pairs.
+
+        Must be called after torch.cuda.synchronize() so all events are complete.
+        Returns a list of (record_a, record_b, overlap_ms) tuples.
+        """
+        if not self._records or self._ref_event is None:
+            return []
+
+        ref = self._ref_event
+        for r in self._records:
+            if r.end_event is None or r.t_start_ms is not None:
+                continue
+            try:
+                r.t_start_ms = ref.elapsed_time(r.start_event)
+                r.t_end_ms   = ref.elapsed_time(r.end_event)
+            except Exception:
+                pass
+
+        valid = [r for r in self._records if r.t_start_ms is not None and r.t_end_ms is not None]
+        overlaps = []
+        for i, a in enumerate(valid):
+            # logger.info(f"NCCL kernel '{a.kernel_name}' on stream '{a.stream_label}': {a.t_start_ms:.3f}-{a.t_end_ms:.3f} ms")
+            for b in valid[i + 1:]:
+                if a.stream_label == b.stream_label:
+                    continue
+                if a.t_start_ms < b.t_end_ms and b.t_start_ms < a.t_end_ms:
+                    overlap_ms = (min(a.t_end_ms, b.t_end_ms)
+                                  - max(a.t_start_ms, b.t_start_ms))
+                    overlaps.append((a, b, overlap_ms))
+        return overlaps
+
+    def reset_iteration(self) -> None:
+        """Called at the end of every training iteration (after streams are synced).
+
+        Clears records only when monitoring is disabled.  When monitoring is enabled,
+        records are preserved so that print_nccl_overlaps() can analyse them after
+        the iteration returns.  Gates are permanent and not rebuilt; only
+        _per_stream_counter is reset so each iteration reproduces the same
+        (stream_label, index) assignments as during monitoring.
+        """
+        if not self.enabled:
+            self._records.clear()
+            self._ref_event = None
+        if self._enforcement_active:
+            # Drain any unmatched signals (cases where the critical op fired after
+            # the non-critical op's non-blocking wait already returned empty).
+            for gates in self._signal_gates.values():
+                for gate in gates:
+                    gate.drain()
+            self._per_stream_counter.clear()
 
 
 """

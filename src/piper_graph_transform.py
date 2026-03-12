@@ -58,20 +58,23 @@ class AllToAllSingleFunction(torch.autograd.Function):
         # Store group for backward pass
         from .piper_utils import piper_metadata
         ctx.actor_self = piper_metadata.actor_self
-        ctx.group = ctx.actor_self.dp_group
+        ctx.group = ctx.actor_self.ep_group
         ctx.global_rank = ctx.actor_self.global_rank
         ctx.stream = ctx.actor_self.a2a_stream
 
         comp_stream = torch.cuda.current_stream()
         comm_finished_event = torch.cuda.Event()
-        ctx.stream.wait_stream(comp_stream)
 
         ctx.actor_self._start_timing(ctx.stream, "fwd_a2a")
 
+        ctx.stream.wait_stream(comp_stream)
+        _ov_token = ctx.actor_self.overlap_detector.before_kernel(ctx.stream, "fwd_a2a", "a2a_stream")
+
         input_tensor = input_tensor.contiguous()
         with torch.cuda.stream(ctx.stream):
-            dist.all_to_all_single(output, input_tensor, group=ctx.group, async_op=True).wait()
+            dist.all_to_all_single(output, input_tensor, group=ctx.group)
             comm_finished_event.record()
+        ctx.actor_self.overlap_detector.after_kernel(ctx.stream, _ov_token)
 
         ctx.actor_self._stop_timing(ctx.stream, "fwd_a2a")
 
@@ -100,15 +103,18 @@ class AllToAllSingleFunction(torch.autograd.Function):
 
         comp_stream = torch.cuda.current_stream()
         comm_finished_event = torch.cuda.Event()
-        ctx.stream.wait_stream(comp_stream)
 
         ctx.actor_self._start_timing(ctx.stream, "bwd_a2a")
+
+        ctx.stream.wait_stream(comp_stream)
+        _ov_token = ctx.actor_self.overlap_detector.before_kernel(ctx.stream, "bwd_a2a", "a2a_stream")
 
         grad_output = grad_output.contiguous()
         grad_input = torch.empty_like(grad_output)
         with torch.cuda.stream(ctx.stream):
-            dist.all_to_all_single(grad_input, grad_output, group=ctx.group, async_op=True).wait()
+            dist.all_to_all_single(grad_input, grad_output, group=ctx.group)
             comm_finished_event.record()
+        ctx.actor_self.overlap_detector.after_kernel(ctx.stream, _ov_token)
 
         ctx.actor_self._stop_timing(ctx.stream, "bwd_a2a")
 

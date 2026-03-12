@@ -18,6 +18,7 @@ from .piper_utils import (
     create_logger,
     LOG_LEVEL,
     piper_metadata,
+    NcclOverlapDetector,
 )
 from .backward_utils import get_param_groups, construct_reverse_graph, _get_grad_fn_or_grad_acc
 
@@ -56,7 +57,7 @@ def _create_actors(
             "stop-on-exit": "true",
         }} if profile else {}
         actor = PiperActor.options(
-            num_gpus=0.8, 
+            num_gpus=1, 
             runtime_env=nsight_env,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=pg,
@@ -118,6 +119,7 @@ class PiperActor:
         self.num_stages = num_stages
         self.stage_to_device = stage_to_device or {}
         self.dp_group = None
+        self.ep_group = None  # separate NCCL communicator for expert-parallel (all2all) ops
         # Per-direction communicators: (src_global_rank, dst_global_rank) -> ProcessGroup
         self.pp_groups = {}
         self.device = "cuda"
@@ -139,6 +141,7 @@ class PiperActor:
         self.p2p_recv_stream = torch.cuda.Stream()
         self.overlapped_comp_stream = torch.cuda.Stream()
         self.overlapped_p2p_stream = torch.cuda.Stream()
+        self.overlap_detector = NcclOverlapDetector()
         if mode == "naive":
             self.per_mb_streams = [torch.cuda.Stream() for _ in range(2)]
         self.n_a2a_ops = dict()
@@ -230,6 +233,47 @@ class PiperActor:
                     self._exec_bwd_send(stage_from, mb_idx)
             self.p2p_cursor += 1
 
+    def enable_nccl_monitoring(self) -> None:
+        """Enable NCCL overlap monitoring for the next training iteration.
+
+        Call this before the iteration you want to profile.  After the iteration
+        completes, call print_nccl_overlaps() to analyse and display results.
+        Monitoring is automatically disabled after print_nccl_overlaps() returns.
+        """
+        self.overlap_detector.enable()
+        self.logger.info("Actor %d: NCCL monitoring enabled", self.global_rank)
+
+    def print_nccl_overlaps(self) -> None:
+        """Synchronise the GPU, analyse recorded NCCL events, and log all overlapping
+        kernel pairs.  Disables monitoring afterwards so subsequent iterations are
+        not affected.
+
+        Call this after the monitored training iteration has completed.
+        """
+        torch.cuda.synchronize()
+        overlaps = self.overlap_detector.find_overlaps(self.logger)
+        n_kernels = len(self.overlap_detector._records)
+        if not overlaps:
+            self.logger.info(
+                "Actor %d: NCCL overlap monitor — no overlaps detected "
+                "(%d kernels recorded)", self.global_rank, n_kernels,
+            )
+        else:
+            self.logger.warning(
+                "Actor %d: NCCL overlap monitor — %d overlapping pair(s) "
+                "across %d kernels:", self.global_rank, len(overlaps), n_kernels,
+            )
+            for a, b, overlap_ms in overlaps:
+                self.logger.warning(
+                    "  '%s' on '%s' [%.3f–%.3f ms]  <->  '%s' on '%s' [%.3f–%.3f ms]"
+                    "  (overlap %.3f ms)",
+                    a.kernel_name, a.stream_label, a.t_start_ms, a.t_end_ms,
+                    b.kernel_name, b.stream_label, b.t_start_ms, b.t_end_ms,
+                    overlap_ms,
+                )
+        self.overlap_detector.build_enforcement(overlaps, self.logger)
+        self.overlap_detector.disable()
+
     def get_trace_data(self) -> dict:
         return self.global_rank, self.trace_data
 
@@ -315,9 +359,14 @@ class PiperActor:
             group_ranks = [
                 (dp_group_id + num_dp_groups * i) for i in range(self.dp_degree)
             ]
+            # Two separate NCCL communicators over the same ranks: one for allreduce,
+            # one for all2all.  Sharing a communicator causes both op types to run on
+            # the same internal NCCL proxy stream, which prevents true overlap.
             process_group = dist.new_group(ranks=group_ranks, backend="nccl")
+            ep_process_group = dist.new_group(ranks=group_ranks, backend="nccl")
             if self.global_rank % num_dp_groups == dp_group_id:
                 self.dp_group = process_group
+                self.ep_group = ep_process_group
                 self.logger.debug(
                     f"Global rank {self.global_rank} joined its dp group {dp_group_id} along with ranks {group_ranks}"
                 )
@@ -352,7 +401,7 @@ class PiperActor:
             self.logger.debug(f"Global rank {self.global_rank} warming up pp communicator {key}")
             dist.all_reduce(dummy, group=pg)
         torch.cuda.synchronize()
-        self.logger.debug(f"Global rank {self.global_rank} warmed up {len(self.pp_groups)} pp communicators")
+        self.logger.info(f"Global rank {self.global_rank} warmed up {len(self.pp_groups)} pp communicators")
 
     def shutdown(self):
         dist.destroy_process_group()
@@ -392,13 +441,21 @@ class PiperActor:
         )
 
         if self.comm_op_status[stage_id][tid] == self.num_mbs:
+            # Same ordering fix as in _prepare_dp_comm_ops: the backward_weight call
+            # accumulates into param.grad on comp_stream.  Establish a GPU-side
+            # dependency so comm_stream doesn't start the all-reduce until the
+            # gradient write has completed.  This does not block the CPU.
+            dep_event = torch.cuda.Event()
+            dep_event.record(self.comp_stream)
+            self.comm_stream.wait_event(dep_event)
+            _ov_token = self.overlap_detector.before_kernel(self.comm_stream, "grad_allreduce", "comm_stream")
             with torch.cuda.stream(self.comm_stream):
                 handle = dist.all_reduce(
                     param.grad,
                     op=dist.ReduceOp.AVG,
                     group=self.dp_group,
-                    async_op=True,
                 )
+            self.overlap_detector.after_kernel(self.comm_stream, _ov_token)
             self.logger.debug(
                 f"Split bwd: Allreduce launched on actor {self.global_rank}, tensor={tid}"
             )
@@ -413,13 +470,24 @@ class PiperActor:
                     f"Updating status on actor: {self.global_rank}, tensor={tensor_id}, status={self.comm_op_status[stage_id][tensor_id]}/{self.num_mbs}"
                 )
                 if self.comm_op_status[stage_id][tensor_id] == self.num_mbs:
+                    # The AccumulateGrad CUDA kernel that writes the final gradient into
+                    # param.grad is in-flight on comp_stream.  The hook fires on the CPU
+                    # as soon as the kernel is *submitted*, not when it *completes*.
+                    # Record an event on comp_stream now so that comm_stream can wait for
+                    # the gradient to be fully written before starting the all-reduce.
+                    # comm_stream.wait_event() is a GPU-side barrier — it does not block
+                    # the CPU, so backward compute on comp_stream continues to overlap.
+                    dep_event = torch.cuda.Event()
+                    dep_event.record(self.comp_stream)
+                    self.comm_stream.wait_event(dep_event)
+                    _ov_token = self.overlap_detector.before_kernel(self.comm_stream, "grad_allreduce", "comm_stream")
                     with torch.cuda.stream(self.comm_stream):
                         handle = dist.all_reduce(
                             grad,
                             op=dist.ReduceOp.AVG,
                             group=self.dp_group,
-                            async_op=True,
                         )
+                    self.overlap_detector.after_kernel(self.comm_stream, _ov_token)
                     self.logger.debug(
                         f"Allreduce on actor: {self.global_rank}, tensor={tensor_id}"
                     )
@@ -449,7 +517,7 @@ class PiperActor:
                         self.logger.debug(
                             f"Waiting for comm op to be finished dp_rank: {self.dp_rank}, tensor={tid}"
                         )
-                        self.comm_op_handles[stage_id][tid].wait()
+                        # self.comm_op_handles[stage_id][tid].wait()
                         done = True
 
     def _load_stage(
@@ -551,6 +619,7 @@ class PiperActor:
                 f"Dispatch fwd p2p recv on communicator ({global_src_rank}, {self.global_rank}) to {self.global_rank} from {global_src_rank}, op: ({stage_id-1} -> {stage_id}, mb {mb_idx})"
             )
             self._start_timing(p2p_stream, "fwd_p2p_recv")
+            _ov_token = self.overlap_detector.before_kernel(p2p_stream, "fwd_p2p_recv", "p2p_recv_stream")
             with torch.cuda.stream(p2p_stream):
                 for i in self.input_idxs[stage_id]:
                     dist.recv(
@@ -560,6 +629,7 @@ class PiperActor:
                     )
             recv_event = torch.cuda.Event()
             recv_event.record(p2p_stream)
+            self.overlap_detector.after_kernel(p2p_stream, _ov_token)
             self.p2p_events[p2p_op] = recv_event
             self._stop_timing(p2p_stream, "fwd_p2p_recv")
             self.logger.debug(
@@ -592,6 +662,7 @@ class PiperActor:
             )
             self._start_timing(p2p_stream, "fwd_p2p_send")
             p2p_stream.wait_stream(comp_stream)
+            _ov_token = self.overlap_detector.before_kernel(p2p_stream, "fwd_p2p_send", "p2p_send_stream")
             with torch.cuda.stream(p2p_stream):
                 for i in range(len(output)):
                     dist.send(
@@ -599,6 +670,7 @@ class PiperActor:
                         dst=global_dst_rank,
                         group=self.pp_groups[(self.global_rank, global_dst_rank)],
                     )
+            self.overlap_detector.after_kernel(p2p_stream, _ov_token)
             self._stop_timing(p2p_stream, "fwd_p2p_send")
             self.logger.debug(
                 f"Completed fwd p2p send on {self.global_rank} to {global_dst_rank}, op: ({stage_id} -> {stage_id+1}, mb {mb_idx})"
@@ -628,12 +700,14 @@ class PiperActor:
                 f"Dispatch bwd p2p recv on communicator ({global_src_rank}, {self.global_rank}) to {self.global_rank} from {global_src_rank}, op: ({stage_id+1} -> {stage_id}, mb {mb_idx})"
             )
             self._start_timing(p2p_stream, "bwd_p2p_recv")
+            _ov_token = self.overlap_detector.before_kernel(p2p_stream, "bwd_p2p_recv", "p2p_recv_stream")
             with torch.cuda.stream(p2p_stream):
                 dist.recv(
                     input_grad, src=global_src_rank, group=self.pp_groups[(global_src_rank, self.global_rank)]
                 )
             recv_event = torch.cuda.Event()
             recv_event.record(p2p_stream)
+            self.overlap_detector.after_kernel(p2p_stream, _ov_token)
             self.p2p_events[p2p_op] = recv_event
             self._stop_timing(p2p_stream, "bwd_p2p_recv")
             self.logger.debug(
@@ -668,10 +742,12 @@ class PiperActor:
             )
             self._start_timing(p2p_stream, "bwd_p2p_send")
             p2p_stream.wait_stream(comp_stream)
+            _ov_token = self.overlap_detector.before_kernel(p2p_stream, "bwd_p2p_send", "p2p_send_stream")
             with torch.cuda.stream(p2p_stream):
                 dist.send(
                     output_grad, dst=global_src_rank, group=self.pp_groups[(self.global_rank, global_src_rank)]
                 )
+            self.overlap_detector.after_kernel(p2p_stream, _ov_token)
             self._stop_timing(p2p_stream, "bwd_p2p_send")
             self.logger.debug(
                 f"Completed bwd p2p send on {self.global_rank} to {global_src_rank}, op: ({stage_id} -> {stage_id-1}, mb {mb_idx})"
@@ -713,6 +789,7 @@ class PiperActor:
             recv_event = self.p2p_events.pop(recv_key, None)
             if recv_event is not None:
                 comp_stream.wait_event(recv_event)
+                # self.nccl_monitor.notify_ordered_after(comp_stream, recv_event)
             inputs_from_prev_stage = self.p2p_cache.pop(recv_key)
             self._stop_timing(comp_stream, "fwd_recv_wait")
 
@@ -815,6 +892,7 @@ class PiperActor:
             recv_event = self.p2p_events.pop(recv_key, None)
             if recv_event is not None:
                 comp_stream.wait_event(recv_event)
+                # self.nccl_monitor.notify_ordered_after(comp_stream, recv_event)
             input_grad = self.p2p_cache.pop(recv_key)
             self._stop_timing(comp_stream, "bwd_recv_wait")
 
@@ -874,6 +952,7 @@ class PiperActor:
             recv_event = self.p2p_events.pop(recv_key, None)
             if recv_event is not None:
                 comp_stream.wait_event(recv_event)
+                # self.nccl_monitor.notify_ordered_after(comp_stream, recv_event)
             upstream_grad = self.p2p_cache.pop(recv_key)
             activation_or_loss = out_activation
         else:
@@ -1173,6 +1252,7 @@ class PiperActor:
             fwd_recv_event = self.p2p_events.pop(fwd_recv_key, None)
             if fwd_recv_event is not None:
                 fwd_comp_stream.wait_event(fwd_recv_event)
+                # self.nccl_monitor.notify_ordered_after(fwd_comp_stream, fwd_recv_event)
             inputs_from_prev_stage = self.p2p_cache.pop(fwd_recv_key)
 
             # Detach to avoid double-backprop if the previous stage is co-located
@@ -1207,6 +1287,7 @@ class PiperActor:
             bwd_recv_event = self.p2p_events.pop(bwd_recv_key, None)
             if bwd_recv_event is not None:
                 bwd_comp_stream.wait_event(bwd_recv_event)
+                # self.nccl_monitor.notify_ordered_after(bwd_comp_stream, bwd_recv_event)
             input_grad = self.p2p_cache.pop(bwd_recv_key)
         else:
             assert loss_fn is not None
@@ -1311,10 +1392,12 @@ class PiperActor:
         for stage_id, parameters in self.forward_args.items():
             for param in parameters:
                 if param is not None and param.grad is not None:
+                    _ov_token = self.overlap_detector.before_kernel(self.comm_stream, "grad_allreduce_naive", "comm_stream")
                     with torch.cuda.stream(self.comm_stream):
                         dist.all_reduce(
                             param.grad, op=dist.ReduceOp.AVG, group=self.dp_group
                         )
+                    self.overlap_detector.after_kernel(self.comm_stream, _ov_token)
 
     def _update(self, *deps):
         torch.cuda.nvtx.range_push(f"update")
@@ -1350,5 +1433,6 @@ class PiperActor:
         self.comm_stream.synchronize()
 
         self.reset_p2p_states()
+        self.overlap_detector.reset_iteration()
 
         return losses
