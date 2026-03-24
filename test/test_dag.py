@@ -174,11 +174,7 @@ def parse_args():
     parser.add_argument("--trace-iters", type=int, default=3)
     parser.add_argument("--tracing", action="store_true", default=False)
     parser.add_argument("--naive-grad-sync", action="store_true", default=False)
-    parser.add_argument(
-        "--mode",
-        choices=["sequential", "naive", "overlapped"],
-        default="sequential",
-    )
+    parser.add_argument("--mode", choices=["sequential", "naive", "overlapped"], default="sequential")
     parser.add_argument("--bucketing", action="store_true", default=False,
                         help="Split stages into per-param-bucket sub-modules for overlapped all-reduce")
     parser.add_argument("--nsight", action="store_true", default=False,
@@ -195,7 +191,7 @@ if __name__ == "__main__":
         include_dashboard=False,
         # _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
     )
-    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="STRICT_SPREAD")
+    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="SPREAD")
     ray.get(pg.ready(), timeout=600)
     print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
