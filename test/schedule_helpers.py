@@ -2,9 +2,13 @@
 from src.piper_exec import (
     Task,
     BatchMeta,
-    CompType,
+    TaskType,
+    CompType,  # backwards-compatible alias for TaskType
     Schedule2D,
+    TaskNode,
+    TaskDAG,
 )
+from src.piper_graph_transform import schedule_to_dag, visualize_schedule, visualize_dag, insert_p2p_ops
 
 
 def _task_label(task: Task) -> str:
@@ -75,7 +79,7 @@ def build_gpipe_schedule(n_mbs: int, n_stages: int) -> Schedule2D:
 
 def build_1f1b_schedule(n_mbs: int, n_stages: int) -> Schedule2D:
     steps = n_mbs + n_stages - 1
-    schedule = [[None] * (steps * 2 + 1) for _ in range(n_stages)]
+    schedule = [[None] * (steps * 2) for _ in range(n_stages)]
     stage_mb = [[0, 0] for _ in range(n_stages)]
     for step in range(n_stages):
         for stage_id in range(n_stages):
@@ -103,12 +107,6 @@ def build_1f1b_schedule(n_mbs: int, n_stages: int) -> Schedule2D:
                         type=task_type,
                     )
                     stage_mb[stage_id][fwd_or_bwd] += 1
-    for i, stage in enumerate(range(n_stages)):
-        schedule[stage][-i-1] = Task(
-            pp_rank=stage,
-            batches=[BatchMeta(stage_id=stage, mb_idx=n_mbs - 1)],
-            type=CompType.UPD,
-        )
     return Schedule2D(grid=schedule)
 
 
@@ -128,7 +126,6 @@ ZEROBUBBLE_MB4_SCHEDULE = Schedule2D(
             Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=2)], type=CompType.BWD_W),        # t10: W2
             Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=3)], type=CompType.BWD_I),        # t11: I3
             Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=3)], type=CompType.BWD_W),        # t12: W3
-            Task(pp_rank=0, batches=[], type=CompType.UPD),                                         # t13: U0
         ],
         [
             None,                                                                                   # t0:  -
@@ -144,7 +141,6 @@ ZEROBUBBLE_MB4_SCHEDULE = Schedule2D(
             Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=3)], type=CompType.BWD_I),        # t10: I3
             Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=2)], type=CompType.BWD_W),        # t11: W2
             Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=3)], type=CompType.BWD_W),        # t12: W3
-            Task(pp_rank=1, batches=[], type=CompType.UPD),                                         # t13: U0
         ],
     ])
 
@@ -157,6 +153,7 @@ NO_PP_SCHEDULE = Schedule2D(
         ]
     ],
 )
+
 
 DUALPIPEV_MB6_SCHEDULE = Schedule2D(
     grid=[
@@ -184,7 +181,6 @@ DUALPIPEV_MB6_SCHEDULE = Schedule2D(
             Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=4)], type=CompType.BWD_W),
             Task(pp_rank=0, batches=[BatchMeta(stage_id=3, mb_idx=5)], type=CompType.BWD_W),
             Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=5)], type=CompType.BWD),
-            Task(pp_rank=0, batches=[], type=CompType.UPD),
             None,
         ],
         [
@@ -212,9 +208,9 @@ DUALPIPEV_MB6_SCHEDULE = Schedule2D(
             Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=5)], type=CompType.BWD_I),
             Task(pp_rank=1, batches=[BatchMeta(stage_id=2, mb_idx=5)], type=CompType.BWD_W),
             Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=5)], type=CompType.BWD_W),
-            Task(pp_rank=1, batches=[], type=CompType.UPD),
         ]
     ])
+
 
 DUALPIPEV_NOZB_MB6_SCHEDULE = Schedule2D(
     grid=[
@@ -347,7 +343,6 @@ INTERLEAVED_1F1B_PP2_MB4_SCHEDULE = Schedule2D(
             Task(pp_rank=0, batches=[BatchMeta(stage_id=2, mb_idx=3)], type=CompType.BWD),
             Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=2)], type=CompType.BWD),
             Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=3)], type=CompType.BWD),
-            Task(pp_rank=0, batches=[BatchMeta(stage_id=0, mb_idx=0)], type=CompType.UPD),
         ],
         [
             None,
@@ -367,7 +362,6 @@ INTERLEAVED_1F1B_PP2_MB4_SCHEDULE = Schedule2D(
             Task(pp_rank=1, batches=[BatchMeta(stage_id=3, mb_idx=3)], type=CompType.BWD),
             Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=2)], type=CompType.BWD),
             Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=3)], type=CompType.BWD),
-            Task(pp_rank=1, batches=[BatchMeta(stage_id=1, mb_idx=0)], type=CompType.UPD),
             None,
         ],
     ])

@@ -10,7 +10,7 @@ from .piper_utils import create_logger, LOG_LEVEL
 @ray.remote(num_gpus=0.2)
 def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, master_addr, master_port, training_func: Callable, *args, **kwargs):
     logger = create_logger("piper_coordinator", LOG_LEVEL)
-    logger.debug(f"Running DP rank {dp_rank+1} of {dp_degree}")
+    logger.debug(f"Running DP rank {dp_rank+1} of {dp_degree} with {master_addr}:{master_port} as master address")
 
     os.environ["PIPER_DP_RANK"] = str(dp_rank)
     os.environ["PIPER_DP_DEGREE"] = str(dp_degree)
@@ -42,6 +42,7 @@ class PiperProgramCoordinator:
         self.master_port = find_free_port()
 
     def run_program(self, training_func: Callable, *args, **kwargs):
+        master_addr = ray.util.get_node_ip_address()
         return ray.get(
             [
                 run_dp_rank.remote(
@@ -49,7 +50,7 @@ class PiperProgramCoordinator:
                     self.dp_degree,
                     self.pp_degree,
                     self.world_size,
-                    "127.0.0.1",
+                    master_addr,
                     self.master_port,
                     training_func,
                     *args,

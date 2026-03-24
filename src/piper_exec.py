@@ -4,7 +4,7 @@ import threading
 import time
 import ray
 import torch.distributed as dist
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from enum import Enum
 from dataclasses import dataclass, field
 import threading
@@ -16,13 +16,21 @@ from .piper_utils import piper_metadata, create_logger, LOG_LEVEL
 
 logger = create_logger("piper_exec", LOG_LEVEL)
 
-class CompType(Enum):
+class TaskType(Enum):
     FWD = "forward"
     BWD = "backward"
     UPD = "update"
     BWD_I = "backward_input"
     BWD_W = "backward_weight"
     FWD_BWD = "forward_backward"
+    SEND = "send"
+    RECV = "recv"
+    ALL_REDUCE = "all_reduce"
+    FWD_A2A = "forward_a2a"
+    BWD_A2A = "backward_a2a"
+
+# Backwards-compatible alias
+CompType = TaskType
 
 
 class BatchMeta(NamedTuple):
@@ -34,10 +42,14 @@ class BatchMeta(NamedTuple):
 class Task(NamedTuple):
     pp_rank: int
     batches: list[BatchMeta]
-    type: CompType
+    type: TaskType
+    bucket_id: int = 0
+    a2a_tensor_idx: Optional[int] = None
 
     def __repr__(self) -> str:
-        return f"Task(pp_rank={self.pp_rank}, batches={[(batch.stage_id, batch.mb_idx) for batch in self.batches]}, type={self.type})"
+        bucket_str = f", bucket_id={self.bucket_id}" if self.bucket_id else ""
+        a2a_str = f", a2a_tensor_idx={self.a2a_tensor_idx}" if self.a2a_tensor_idx is not None else ""
+        return f"Task(pp_rank={self.pp_rank}, batches={[(batch.stage_id, batch.mb_idx) for batch in self.batches]}, type={self.type}{bucket_str}{a2a_str})"
 
 
 @dataclass
@@ -74,6 +86,56 @@ class Schedule2D:
     
     def num_ranks(self) -> int:
         return len(self.grid)
+
+@dataclass
+class TaskNode:
+    """A single node in the task DAG, corresponding to one non-None cell of a
+    Schedule2D grid.
+
+    Edges are of two kinds:
+
+    * **Data-dependency** (``data_preds`` / ``data_succs``): drawn between tasks
+      that share a ``mb_idx`` and are *adjacent* in time – i.e. no other task with
+      the same microbatch index sits between them in the time-step ordering.  These
+      edges may cross rows (actors).
+
+    * **Temporal** (``temporal_pred`` / ``temporal_succ``): drawn between
+      consecutive non-None tasks within the same row, but **only** when those
+      tasks do not already share a data-dependency edge.  Each task has at most
+      one temporal predecessor and one successor.
+    """
+    task: Task
+    pp_rank: int    # row index in Schedule2D.grid
+    time_step: int  # column index in Schedule2D.grid
+
+    # Filled in by schedule_to_dag()
+    data_preds: list["TaskNode"] = field(default_factory=list)
+    data_succs: list["TaskNode"] = field(default_factory=list)
+    temporal_pred: Optional["TaskNode"] = None
+    temporal_succ: Optional["TaskNode"] = None
+
+    # For SEND/RECV nodes: the peer pipeline rank
+    peer_pp_rank: Optional[int] = None
+
+    def node_id(self) -> str:
+        """Unique string identifier for use as a graph node key."""
+        ttype = self.task.type.value if self.task.type is not None else "none"
+        mb = self.task.batches[0].mb_idx if self.task.batches else "x"
+        return f"r{self.pp_rank}_t{self.time_step}_{ttype}_mb{mb}"
+
+
+@dataclass
+class TaskDAG:
+    """DAG of :class:`TaskNode` objects for one training iteration.
+
+    Produced by :func:`~src.piper.schedule_to_dag`.
+    """
+    nodes: list[TaskNode]
+
+    def roots(self) -> list[TaskNode]:
+        """Return nodes that have no predecessors of any kind."""
+        return [n for n in self.nodes if not n.data_preds and n.temporal_pred is None]
+
 
 class DAGEdge(NamedTuple):
     from_stage: int
@@ -256,7 +318,7 @@ def _build_p2p_schedule(schedule, num_stages, num_devices, num_steps, stage_to_d
             task = schedule[j][i]
             if task is None:
                 continue
-            pp_rank, batches, task_type = task
+            pp_rank, batches, task_type, *_ = task
 
             # Forward send (added after forward compute produces output)
             if task_type in (CompType.FWD, CompType.FWD_BWD):
@@ -363,7 +425,7 @@ def piper_exec(
                 continue
             task = schedule[j][i]
             if task:
-                pp_rank, batches, task_type = task
+                pp_rank, batches, task_type, *_ = task
                 actor = actors[j]
                 match task_type:
                     case CompType.UPD:

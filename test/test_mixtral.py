@@ -184,7 +184,7 @@ if __name__ == "__main__":
         log_to_driver=True,
         namespace="mixtral",
         include_dashboard=False,
-        _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
+        _temp_dir="/m-coriander/coriander/mfris/ray_tmp",
     )
     pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp)
     ray.get(pg.ready(), timeout=10)  # Wait for the placement group to be ready before proceeding

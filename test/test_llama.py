@@ -201,7 +201,8 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    ray.init(log_to_driver=True, namespace="llama", include_dashboard=False, _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp")
+    ray.init(log_to_driver=True, namespace="llama", include_dashboard=False)
+    # ray.init(log_to_driver=True, namespace="llama", include_dashboard=False, _temp_dir="/m-coriander/coriander/mfris/ray_tmp")
     pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp)
     ray.get(pg.ready(), timeout=10)  # Wait for the placement group to be ready before proceeding
     print(placement_group_table(pg))

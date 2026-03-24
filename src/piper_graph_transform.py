@@ -13,6 +13,7 @@ import time
 from torch.autograd import Function
 
 from .piper_utils import create_logger, LOG_LEVEL, piper_metadata
+from .piper_exec import TaskType, Schedule2D, Task, TaskNode, TaskDAG
 
 logger = create_logger("piper_graph_transform", LOG_LEVEL)
 
@@ -1381,3 +1382,1604 @@ def _insert_p2p_ops(
     new_gm = fx.GraphModule(root_module, new_graph)
     new_gm.recompile()
     return new_gm
+
+
+# ---------------------------------------------------------------------------
+# Schedule → Task DAG
+# ---------------------------------------------------------------------------
+
+def schedule_to_dag(schedule: Schedule2D) -> TaskDAG:
+    """Convert a :class:`Schedule2D` into a :class:`TaskDAG`.
+
+    Two kinds of edges are built:
+
+    **Data-dependency edges** connect tasks that share a ``mb_idx`` and are
+    *adjacent* in time – i.e. no other task carrying the same microbatch index
+    exists at any time step between them.  These edges may go between rows
+    (actors), representing the point-to-point activation / gradient tensors
+    that cross pipeline stage boundaries.
+
+    **Temporal edges** connect every pair of consecutive non-None tasks within
+    the same row (actor).  They model the serialisation constraint that a single
+    actor executes one cell at a time.
+    """
+    nodes: list[TaskNode] = []
+    grid_nodes: list[list[Optional[TaskNode]]] = []
+
+    for pp_rank, row in enumerate(schedule.grid):
+        row_nodes: list[Optional[TaskNode]] = []
+        for time_step, task in enumerate(row):
+            if task is None:
+                row_nodes.append(None)
+            elif task.type == TaskType.FWD_BWD:
+                # Expand inline into a FWD node followed by a BWD node.
+                # Placing both consecutively in row_nodes causes the temporal-edge
+                # pass to chain: prev_cell → fwd_node → bwd_node → next_cell.
+                fwd_batch, bwd_batch = task.batches[0], task.batches[1]
+                fwd_node = TaskNode(
+                    task=Task(pp_rank=pp_rank, batches=[fwd_batch], type=TaskType.FWD),
+                    pp_rank=pp_rank,
+                    time_step=time_step,
+                )
+                bwd_node = TaskNode(
+                    task=Task(pp_rank=pp_rank, batches=[bwd_batch], type=TaskType.BWD),
+                    pp_rank=pp_rank,
+                    time_step=time_step,
+                )
+                nodes.extend([fwd_node, bwd_node])
+                row_nodes.extend([fwd_node, bwd_node])
+            else:
+                node = TaskNode(task=task, pp_rank=pp_rank, time_step=time_step)
+                nodes.append(node)
+                row_nodes.append(node)
+        grid_nodes.append(row_nodes)
+
+    mb_to_nodes: dict[int, list[TaskNode]] = defaultdict(list)
+    seen_per_mb: dict[int, set[int]] = defaultdict(set)
+
+    for node in nodes:
+        # UPD and BWD_W are purely local: UPD has no cross-stage dependency;
+        # BWD_W only depends on its paired BWD_I (same rank/stage/mb) and must
+        # not appear in the cross-rank data chain so that insert_p2p_ops does
+        # not add spurious SEND/RECV nodes for BWD_W.
+        if node.task.type in (TaskType.UPD, TaskType.BWD_W):
+            continue
+        for batch in node.task.batches:
+            mb_idx = batch.mb_idx
+            node_ident = id(node)
+            if node_ident not in seen_per_mb[mb_idx]:
+                seen_per_mb[mb_idx].add(node_ident)
+                mb_to_nodes[mb_idx].append(node)
+
+    for mb_nodes in mb_to_nodes.values():
+        mb_nodes.sort(key=lambda n: (n.time_step, n.pp_rank))
+        for i in range(len(mb_nodes) - 1):
+            pred, succ = mb_nodes[i], mb_nodes[i + 1]
+            pred.data_succs.append(succ)
+            succ.data_preds.append(pred)
+
+    # Add explicit BWD_I -> BWD_W data edges for each (rank, stage_id, mb_idx)
+    # pair.  BWD_W is excluded from the mb chain above, but it still needs a
+    # data dependency on its upstream BWD_I so the actor knows to wait for it.
+    bwdi_index: dict = {}  # (pp_rank, stage_id, mb_idx) -> BWD_I node
+    for node in nodes:
+        if node.task.type == TaskType.BWD_I:
+            b = node.task.batches[0]
+            bwdi_index[(node.pp_rank, b.stage_id, b.mb_idx)] = node
+    for node in nodes:
+        if node.task.type == TaskType.BWD_W:
+            b = node.task.batches[0]
+            bwdi = bwdi_index.get((node.pp_rank, b.stage_id, b.mb_idx))
+            if bwdi is not None:
+                bwdi.data_succs.append(node)
+                node.data_preds.append(bwdi)
+
+    data_edge_pairs: set[tuple[int, int]] = set()
+    for node in nodes:
+        for succ in node.data_succs:
+            data_edge_pairs.add((id(node), id(succ)))
+            data_edge_pairs.add((id(succ), id(node)))
+
+    for row_nodes in grid_nodes:
+        non_null = [n for n in row_nodes if n is not None]
+        for i in range(len(non_null) - 1):
+            pred, succ = non_null[i], non_null[i + 1]
+            if (id(pred), id(succ)) not in data_edge_pairs:
+                pred.temporal_succ = succ
+                succ.temporal_pred = pred
+
+    return TaskDAG(nodes=nodes)
+
+
+
+# ---------------------------------------------------------------------------
+# Expand bucketed FWD/BWD tasks into per-bucket task chains
+# ---------------------------------------------------------------------------
+
+def expand_bucket_tasks(dag: TaskDAG, bucket_counts: dict) -> TaskDAG:
+    """Replace each FWD/BWD TaskNode for a bucketed stage with a chain of
+    FWD / BWD TaskNodes with explicit bucket_id, one per bucket.
+
+    For FWD stages the chain executes in bucket order 0, 1, …, K-1.
+    For BWD stages the chain executes in reverse order K-1, K-2, …, 0
+    (highest bucket_id first receives the upstream gradient; bucket_id=0 is
+    last to execute and sends the input gradient to the previous stage).
+
+    Incoming data / temporal edges are attached to the first node in the
+    execution chain; outgoing edges are attached to the last node.
+
+    Args:
+        dag: Global TaskDAG produced by schedule_to_dag().
+        bucket_counts: Mapping stage_id -> number of buckets. Only stages
+            present in this dict are expanded.
+
+    Returns:
+        A new TaskDAG with expanded nodes.
+    """
+    TIME_SCALE = 1000
+
+    # ---- Step 2a: create bucket chains for all expandable nodes ----
+    expandable = [
+        n for n in dag.nodes
+        if n.task.type in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I)
+        and n.task.batches[0].stage_id in bucket_counts
+    ]
+
+    # id(orig) -> (first_bkt, last_bkt, chain_list)
+    node_to_first_last: dict = {}
+
+    for orig in expandable:
+        stage_id = orig.task.batches[0].stage_id
+        K = bucket_counts[stage_id]
+
+        if orig.task.type == TaskType.FWD:
+            # Execution order: bucket 0, 1, …, K-1
+            chain = [
+                TaskNode(
+                    task=Task(
+                        pp_rank=orig.pp_rank,
+                        batches=list(orig.task.batches),
+                        type=TaskType.FWD,
+                        bucket_id=b,
+                    ),
+                    pp_rank=orig.pp_rank,
+                    time_step=orig.time_step * TIME_SCALE + i,
+                )
+                for i, b in enumerate(range(K))
+            ]
+        else:  # BWD / BWD_I: execution order K-1, K-2, …, 0
+            chain = [
+                TaskNode(
+                    task=Task(
+                        pp_rank=orig.pp_rank,
+                        batches=list(orig.task.batches),
+                        type=orig.task.type,   # preserve BWD or BWD_I
+                        bucket_id=K - 1 - i,
+                    ),
+                    pp_rank=orig.pp_rank,
+                    time_step=orig.time_step * TIME_SCALE + i,
+                )
+                for i in range(K)
+            ]
+
+        # Data-dep chain between consecutive bucket nodes
+        for i in range(K - 1):
+            chain[i].data_succs.append(chain[i + 1])
+            chain[i + 1].data_preds.append(chain[i])
+
+        first_bkt = chain[0]
+        last_bkt = chain[-1]
+        node_to_first_last[id(orig)] = (first_bkt, last_bkt, chain)
+
+    # ---- Step 2b: redirect all edges ----
+    for orig in expandable:
+        first_bkt, last_bkt, _ = node_to_first_last[id(orig)]
+
+        # Incoming data edges: pred -> orig  =>  new_src -> first_bkt
+        for pred in list(orig.data_preds):
+            if orig in pred.data_succs:
+                pred.data_succs.remove(orig)
+            new_src = node_to_first_last[id(pred)][1] if id(pred) in node_to_first_last else pred
+            if first_bkt not in new_src.data_succs:
+                new_src.data_succs.append(first_bkt)
+                first_bkt.data_preds.append(new_src)
+        orig.data_preds.clear()
+
+        # Outgoing data edges: orig -> succ  =>  last_bkt -> new_dst
+        for succ in list(orig.data_succs):
+            if orig in succ.data_preds:
+                succ.data_preds.remove(orig)
+            new_dst = node_to_first_last[id(succ)][0] if id(succ) in node_to_first_last else succ
+            if new_dst not in last_bkt.data_succs:
+                last_bkt.data_succs.append(new_dst)
+                new_dst.data_preds.append(last_bkt)
+        orig.data_succs.clear()
+
+        # Incoming temporal edge: tp -> orig  =>  new_tp -> first_bkt
+        if orig.temporal_pred is not None:
+            tp = orig.temporal_pred
+            tp.temporal_succ = None  # disconnect old link
+            new_tp = node_to_first_last[id(tp)][1] if id(tp) in node_to_first_last else tp
+            new_tp.temporal_succ = first_bkt
+            first_bkt.temporal_pred = new_tp
+            orig.temporal_pred = None
+
+        # Outgoing temporal edge: orig -> ts  =>  last_bkt -> new_ts
+        if orig.temporal_succ is not None:
+            ts = orig.temporal_succ
+            ts.temporal_pred = None  # disconnect old link
+            new_ts = node_to_first_last[id(ts)][0] if id(ts) in node_to_first_last else ts
+            last_bkt.temporal_succ = new_ts
+            new_ts.temporal_pred = last_bkt
+            orig.temporal_succ = None
+
+    # ---- Step 2c: build new node list ----
+    orig_ids = set(id(n) for n in expandable)
+    expanded_nodes = []
+    for n in dag.nodes:
+        if id(n) in orig_ids:
+            expanded_nodes.extend(node_to_first_last[id(n)][2])
+        else:
+            expanded_nodes.append(n)
+
+    return TaskDAG(nodes=expanded_nodes)
+
+
+# ---------------------------------------------------------------------------
+# Insert SEND / RECV nodes for cross-rank data dependencies
+# ---------------------------------------------------------------------------
+
+def insert_p2p_ops(dag: TaskDAG) -> list[TaskDAG]:
+    """Transform a :class:`TaskDAG` into one :class:`TaskDAG` per PP rank.
+
+    For every cross-rank data-dependency edge ``task1 (rank A) → task2 (rank B)``:
+
+    1. Remove the data-dep edge.
+    2. Create a SEND node on rank A with a data-dep edge ``task1 → SEND``.
+    3. Create a RECV node on rank B with a data-dep edge ``RECV → task2``.
+    4. If ``task1`` had a temporal successor, re-attach it from SEND instead.
+    5. If ``task2`` had a temporal predecessor, re-attach it to RECV instead.
+
+    After the transformation no cross-rank edges should remain.  The function
+    asserts this, then splits the node list by ``pp_rank`` and returns a list of
+    :class:`TaskDAG` objects ordered by ascending PP rank.
+    """
+    all_nodes: list[TaskNode] = list(dag.nodes)
+
+    cross_edges: list[tuple[TaskNode, TaskNode]] = [
+        (src, dst)
+        for src in all_nodes
+        for dst in src.data_succs
+        if src.pp_rank != dst.pp_rank
+    ]
+
+    synthetic_ts: dict[int, int] = {}
+
+    def _next_ts(pp_rank: int) -> int:
+        if pp_rank not in synthetic_ts:
+            synthetic_ts[pp_rank] = -1
+        ts = synthetic_ts[pp_rank]
+        synthetic_ts[pp_rank] -= 1
+        return ts
+
+    for src, dst in cross_edges:
+        src.data_succs.remove(dst)
+        dst.data_preds.remove(src)
+
+        send_node = TaskNode(
+            task=Task(pp_rank=src.pp_rank, batches=list(src.task.batches), type=TaskType.SEND),
+            pp_rank=src.pp_rank,
+            time_step=_next_ts(src.pp_rank),
+            peer_pp_rank=dst.pp_rank,
+        )
+        src.data_succs.append(send_node)
+        send_node.data_preds.append(src)
+
+        if src.temporal_succ is not None:
+            ts_next = src.temporal_succ
+            ts_next.temporal_pred = send_node
+            send_node.temporal_succ = ts_next
+            src.temporal_succ = None
+
+        recv_node = TaskNode(
+            task=Task(pp_rank=dst.pp_rank, batches=list(dst.task.batches), type=TaskType.RECV),
+            pp_rank=dst.pp_rank,
+            time_step=_next_ts(dst.pp_rank),
+            peer_pp_rank=src.pp_rank,
+        )
+        recv_node.data_succs.append(dst)
+        dst.data_preds.append(recv_node)
+
+        if dst.temporal_pred is not None:
+            tp_prev = dst.temporal_pred
+            tp_prev.temporal_succ = recv_node
+            recv_node.temporal_pred = tp_prev
+            dst.temporal_pred = None
+
+        all_nodes.append(send_node)
+        all_nodes.append(recv_node)
+
+    for node in all_nodes:
+        for succ in node.data_succs:
+            assert node.pp_rank == succ.pp_rank, (
+                f"Cross-rank data edge still present: "
+                f"{node.node_id()} (rank {node.pp_rank}) → "
+                f"{succ.node_id()} (rank {succ.pp_rank})"
+            )
+        if node.temporal_succ is not None:
+            assert node.pp_rank == node.temporal_succ.pp_rank, (
+                f"Cross-rank temporal edge present: "
+                f"{node.node_id()} (rank {node.pp_rank}) → "
+                f"{node.temporal_succ.node_id()} (rank {node.temporal_succ.pp_rank})"
+            )
+
+    rank_nodes: dict[int, list[TaskNode]] = defaultdict(list)
+    for node in all_nodes:
+        rank_nodes[node.pp_rank].append(node)
+
+    # Task types that represent real backward compute — UPD must be temporally
+    # ordered after the last of these, not after communication nodes (A2A, AR,
+    # SEND, RECV) whose time_steps may be synthetic and higher than the last BWD.
+    _BWD_COMPUTE_TYPES = {
+        TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W,
+    }
+    upd_ts_counter = -(max(abs(v) for v in synthetic_ts.values()) + 1) if synthetic_ts else -1
+    for rank, nodes in rank_nodes.items():
+        bwd_nodes = [n for n in nodes if n.task.type in _BWD_COMPUTE_TYPES]
+        last = max(
+            bwd_nodes if bwd_nodes else (n for n in nodes if n.time_step >= 0),
+            key=lambda n: n.time_step,
+        )
+        upd_task = Task(pp_rank=rank, batches=list(last.task.batches), type=TaskType.UPD)
+        upd_node = TaskNode(task=upd_task, pp_rank=rank, time_step=upd_ts_counter)
+        upd_ts_counter -= 1
+        last.temporal_succ = upd_node
+        upd_node.temporal_pred = last
+        nodes.append(upd_node)
+
+    return [TaskDAG(nodes=rank_nodes[r]) for r in sorted(rank_nodes)]
+
+
+def insert_ar_ops(per_rank_dags: list) -> list:
+    """Insert ALL_REDUCE nodes into each per-rank DAG for DP gradient sync.
+
+    Two cases are handled:
+
+    For each (stage_id, bucket_id) group of BWD/BWD_I nodes, add one ALL_REDUCE
+    after the final microbatch's node.  The actor all-reduces the pre-allocated
+    flat_grads tensor for that (stage, bucket) pair.
+
+    The ALL_REDUCE node has exactly one data edge: from the final microbatch
+    BWD/BWD_I node.  Synchronisation with UPD is handled at the CUDA level via
+    ar_events in _update_impl.
+    """
+    for rank_dag in per_rank_dags:
+        new_nodes = []
+
+        # Group BWD/BWD_I nodes by (stage_id, bucket_id).  One ALL_REDUCE is
+        # inserted per group, triggered by the final microbatch's node in that group.
+        bwd_groups: dict = defaultdict(list)
+        for node in rank_dag.nodes:
+            if node.task.type in (TaskType.BWD, TaskType.BWD_I):
+                s = node.task.batches[0].stage_id
+                bwd_groups[(s, node.task.bucket_id)].append(node)
+
+        for (stage_id, bucket_id), group in bwd_groups.items():
+            trigger_node = max(group, key=lambda n: n.time_step)
+            ar_task = Task(
+                pp_rank=trigger_node.pp_rank,
+                batches=list(trigger_node.task.batches),
+                type=TaskType.ALL_REDUCE,
+                bucket_id=bucket_id,
+            )
+            ar_node = TaskNode(
+                task=ar_task,
+                pp_rank=trigger_node.pp_rank,
+                time_step=-10000 - len(new_nodes),
+            )
+            trigger_node.data_succs.append(ar_node)
+            ar_node.data_preds.append(trigger_node)
+            new_nodes.append(ar_node)
+
+        rank_dag.nodes.extend(new_nodes)
+
+    return per_rank_dags
+
+
+# ---------------------------------------------------------------------------
+# Graphviz visualisation
+# ---------------------------------------------------------------------------
+
+def _task_node_label(node: TaskNode) -> str:
+    """Short human-readable label for a TaskNode."""
+    task = node.task
+
+    if task.type in (TaskType.SEND, TaskType.RECV):
+        op = "SEND" if task.type == TaskType.SEND else "RECV"
+        return op
+
+    type_abbrev = {
+        TaskType.FWD:     "F",
+        TaskType.BWD:     "B",
+        TaskType.UPD:     "U",
+        TaskType.BWD_I:   "BI",
+        TaskType.BWD_W:   "Bw",
+        TaskType.FWD_BWD: "FB",
+        TaskType.ALL_REDUCE: "AR",
+        TaskType.FWD_A2A: "F_A2A",
+        TaskType.BWD_A2A: "B_A2A",
+    }.get(task.type, "?")
+
+    if task.type == TaskType.UPD:
+        return type_abbrev
+
+    if task.type == TaskType.ALL_REDUCE:
+        stage_id = task.batches[0].stage_id
+        return "AR"
+    
+    if task.type == TaskType.FWD_A2A or task.type == TaskType.BWD_A2A:
+        return "A2A"
+
+    parts = " + ".join(f"S{b.stage_id} M{b.mb_idx}" for b in task.batches)
+    return f"{type_abbrev} {parts}"
+
+
+def visualize_dag(
+    dag: TaskDAG,
+    output_path: str = "dag",
+    fmt: str = "png",
+) -> None:
+    """Render a :class:`TaskDAG` as a labelled image using *graphviz*.
+
+    Nodes are coloured by pipeline rank.  Two edge styles:
+
+    * **Dashed grey** – temporal edges (serialisation within one actor).
+    * **Solid black** – data-dependency edges.
+
+    The image is saved to ``{output_path}.{fmt}``.
+    If *graphviz* is not installed the function logs a warning and returns.
+    """
+    try:
+        import graphviz
+    except ImportError:
+        logger.warning("graphviz Python package not installed; skipping DAG visualisation")
+        return
+
+    if not dag.nodes:
+        logger.warning("Empty task DAG; nothing to visualise")
+        return
+
+    # Build a mapping from pp_rank -> sorted list of stage_ids on that rank.
+    pp_rank_stages: dict[int, list[int]] = {}
+    for n in dag.nodes:
+        if n.task.batches:
+            rank = n.task.pp_rank
+            sid = n.task.batches[0].stage_id
+            if rank not in pp_rank_stages:
+                pp_rank_stages[rank] = []
+            if sid not in pp_rank_stages[rank]:
+                pp_rank_stages[rank].append(sid)
+    for rank in pp_rank_stages:
+        pp_rank_stages[rank].sort()
+
+    _COMPUTE_TYPES = (
+        TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W, TaskType.FWD_BWD,
+    )
+
+    def _node_fill(node: TaskNode) -> str:
+        t = node.task.type
+        if t in (TaskType.SEND, TaskType.RECV, TaskType.FWD_A2A, TaskType.BWD_A2A, TaskType.ALL_REDUCE):
+            return "#FFFFFF"
+        if t == TaskType.FWD:
+            return "#FFA500"  # orange
+        if t in (TaskType.BWD, TaskType.BWD_I):
+            return "#27AE60"  # green
+        if t == TaskType.BWD_W:
+            return "#2E86C1"  # blue
+        return "#D5D8DC"
+
+    def _node_fontcolor(node: TaskNode) -> str:
+        t = node.task.type
+        if t not in _COMPUTE_TYPES or not node.task.batches:
+            return "black"
+        rank = node.task.pp_rank
+        stages = pp_rank_stages.get(rank, [])
+        if len(stages) < 2:
+            return "black"
+        sid = node.task.batches[0].stage_id
+        # First stage -> black text, second (and beyond) stage -> white text
+        return "black" if sid == stages[0] else "white"
+
+    dot = graphviz.Digraph("PiperDAG", comment="Piper Task DAG")
+    dot.attr(rankdir="LR", splines="ortho", nodesep="0.4", ranksep="0.6", fontname="Helvetica")
+    dot.attr("node", shape="box", style="filled", fontsize="9", fontname="Helvetica")
+    dot.attr("edge", fontsize="8", fontname="Helvetica")
+
+    for node in dag.nodes:
+        dot.node(
+            node.node_id(),
+            label=_task_node_label(node),
+            fillcolor=_node_fill(node),
+            fontcolor=_node_fontcolor(node),
+            tooltip=repr(node.task),
+        )
+
+    step_to_nodes: dict[int, list[TaskNode]] = defaultdict(list)
+    for node in dag.nodes:
+        if node.time_step >= 0:
+            step_to_nodes[node.time_step].append(node)
+
+    for col_nodes in step_to_nodes.values():
+        if len(col_nodes) > 1:
+            with dot.subgraph() as sub:
+                sub.attr(rank="same")
+                for node in col_nodes:
+                    sub.node(node.node_id())
+
+    data_pairs: set[tuple[str, str]] = set()
+    for node in dag.nodes:
+        for succ in node.data_succs:
+            data_pairs.add((node.node_id(), succ.node_id()))
+
+    for node in dag.nodes:
+        if node.temporal_succ is not None:
+            key = (node.node_id(), node.temporal_succ.node_id())
+            if key not in data_pairs:
+                dot.edge(
+                    key[0], key[1],
+                    style="dashed", color="grey60",
+                    penwidth="1.0", arrowsize="0.6", constraint="true",
+                )
+
+    seen_edges: set[tuple[str, str]] = set()
+    for node in dag.nodes:
+        for succ in node.data_succs:
+            key = (node.node_id(), succ.node_id())
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            cross_rank = node.pp_rank != succ.pp_rank
+            dot.edge(
+                key[0], key[1],
+                color="black",
+                penwidth="2.0", arrowsize="0.8",
+                constraint="false" if cross_rank else "true",
+            )
+
+    out = dot.render(output_path, format=fmt, cleanup=False)
+    logger.info(f"DAG visualisation saved to {out}")
+
+
+def visualize_schedule(
+    schedule: Schedule2D,
+    output_path: str = "schedule",
+    fmt: str = "png",
+) -> None:
+    """Render a :class:`Schedule2D` as a labelled DAG image using *graphviz*.
+
+    Converts the schedule to a :class:`TaskDAG` via :func:`schedule_to_dag`
+    then delegates to :func:`visualize_dag`.
+    """
+    dag = schedule_to_dag(schedule)
+    visualize_dag(dag, output_path=output_path, fmt=fmt)
+
+
+def print_dag_order(dag: TaskDAG, label: str = "") -> None:
+    """Print the topological execution order of nodes in a :class:`TaskDAG`.
+
+    Uses Kahn's algorithm (same order as ``run_dag``) so the output reflects
+    exactly what the actor will execute.  Useful for debugging schedule issues.
+    """
+    from collections import deque as _deque
+
+    in_degree = {
+        id(n): len(n.data_preds) + (1 if n.temporal_pred is not None else 0)
+        for n in dag.nodes
+    }
+    queue: _deque = _deque(n for n in dag.nodes if in_degree[id(n)] == 0)
+
+    header = f"--- DAG execution order{': ' + label if label else ''} ---"
+    print(header)
+    step = 0
+    while queue:
+        node = queue.popleft()
+        task = node.task
+        ttype = task.type.value if task.type is not None else "?"
+        batches_str = ", ".join(
+            f"s{b.stage_id} mb{b.mb_idx}" for b in task.batches
+        ) if task.batches else ""
+        bkt = f" bkt={task.bucket_id}" if task.bucket_id is not None else ""
+        print(f"  {step:3d}  rank={node.pp_rank}  {ttype:<14s}  {batches_str}{bkt}")
+        step += 1
+        all_succs = list(node.data_succs)
+        if node.temporal_succ is not None:
+            all_succs.append(node.temporal_succ)
+        for succ in all_succs:
+            in_degree[id(succ)] -= 1
+            if in_degree[id(succ)] == 0:
+                queue.append(succ)
+    print("-" * len(header))
+
+
+# ---------------------------------------------------------------------------
+# bucket_parameters – FX graph transformation
+# ---------------------------------------------------------------------------
+
+def _iter_node_args(node: fx.Node):
+    """Yield every :class:`fx.Node` appearing in *node*'s args and kwargs."""
+    def _collect(obj):
+        if isinstance(obj, fx.Node):
+            yield obj
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                yield from _collect(item)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                yield from _collect(v)
+    yield from _collect(node.args)
+    yield from _collect(node.kwargs)
+
+
+def bucket_parameters(
+    gm: fx.GraphModule,
+    bucket_size_bytes: int = 25 * 1024 * 1024,
+) -> list[fx.GraphModule]:
+    """Split an FX GraphModule into sequential sub-modules based on parameter buckets.
+
+    Adjacent parameters (in graph order) are greedily grouped into buckets of
+    approximately *bucket_size_bytes* bytes.  If a parameter is used by compute
+    nodes that fall into more than one bucket's node-range, it is promoted to
+    its own singleton bucket so the graph can be cut cleanly.
+
+    The graph is then cut at bucket boundaries and each segment is wrapped in a
+    new :class:`fx.GraphModule`.  All original model inputs (``placeholder``
+    nodes) are re-created in every sub-module.  Intermediate activation tensors
+    that flow between segments become additional placeholder inputs on the
+    receiving module.
+
+    The modules are ordered so that the *i*-th module's outputs are the
+    additional inputs of the *(i+1)*-th module (appended after the original
+    model inputs), producing a pipeline that replicates the original graph.
+
+    Args:
+        gm: Source ``fx.GraphModule``.  ``node.meta["example_value"]`` is used
+            for parameter size if available; falls back to direct attribute
+            inspection.
+        bucket_size_bytes: Target bucket size in bytes (default 25 MB).
+
+    Returns:
+        A list of ``fx.GraphModule`` objects in execution order.  If there is
+        only one bucket (or no parameters), the list contains *gm* unchanged.
+    """
+    nodes = list(gm.graph.nodes)
+    node_idx: dict[fx.Node, int] = {nd: i for i, nd in enumerate(nodes)}
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _is_param(nd: fx.Node) -> bool:
+        if nd.op != "get_attr":
+            return False
+        obj = gm
+        for part in nd.target.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return False
+        return isinstance(obj, torch.nn.Parameter)
+
+    def _attr_size(nd: fx.Node) -> int:
+        ev = nd.meta.get("example_value")
+        if ev is not None and hasattr(ev, "numel"):
+            return int(ev.numel() * ev.element_size())
+        obj = gm
+        for part in nd.target.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return 0
+        return int(obj.numel() * obj.element_size()) if isinstance(obj, torch.Tensor) else 0
+
+    # ------------------------------------------------------------------ #
+    # Step 1 – Collect parameter nodes                                   #
+    # ------------------------------------------------------------------ #
+    param_nodes: list[fx.Node] = [nd for nd in nodes if _is_param(nd)]
+    if not param_nodes:
+        return [gm]
+
+    # ------------------------------------------------------------------ #
+    # Step 2 – Per-parameter compute-node use range                      #
+    # ------------------------------------------------------------------ #
+    compute_set: frozenset[int] = frozenset(
+        i for i, nd in enumerate(nodes)
+        if nd.op not in ("placeholder", "get_attr", "output")
+    )
+
+    def _use_range(pnd: fx.Node) -> tuple[int, int]:
+        idxs = [node_idx[u] for u in pnd.users if node_idx[u] in compute_set]
+        if not idxs:
+            return (node_idx[pnd], node_idx[pnd])
+        return (min(idxs), max(idxs))
+
+    param_ranges: dict[fx.Node, tuple[int, int]] = {pn: _use_range(pn) for pn in param_nodes}
+
+    # ------------------------------------------------------------------ #
+    # Step 3 – Greedy bucket assignment                                  #
+    # ------------------------------------------------------------------ #
+    bucket_id: dict[fx.Node, int] = {}
+    cur_bucket = 0
+    cur_size = 0
+    for pn in param_nodes:
+        sz = _attr_size(pn)
+        if cur_size + sz > bucket_size_bytes and cur_size > 0:
+            cur_bucket += 1
+            cur_size = 0
+        bucket_id[pn] = cur_bucket
+        cur_size += sz
+    n_initial = cur_bucket + 1
+
+    # ------------------------------------------------------------------ #
+    # Step 4 – Singleton promotion for cross-bucket parameters           #
+    # ------------------------------------------------------------------ #
+    def _initial_bucket_range(bid: int) -> tuple[int, int]:
+        members = [pn for pn in param_nodes if bucket_id[pn] == bid]
+        if not members:
+            return (0, 0)
+        return (
+            min(param_ranges[pn][0] for pn in members),
+            max(param_ranges[pn][1] for pn in members),
+        )
+
+    init_ranges = [_initial_bucket_range(b) for b in range(n_initial)]
+
+    def _initial_bucket_at(idx: int) -> int:
+        for bid, (lo, hi) in enumerate(init_ranges):
+            if lo <= idx <= hi:
+                return bid
+        return 0
+
+    singleton_next = n_initial
+    for pn in param_nodes:
+        first, last = param_ranges[pn]
+        if _initial_bucket_at(first) != _initial_bucket_at(last):
+            bucket_id[pn] = singleton_next
+            singleton_next += 1
+
+    # ------------------------------------------------------------------ #
+    # Step 5 – Build final bucket list, sort, merge overlapping ranges  #
+    # ------------------------------------------------------------------ #
+    bucket_members: dict[int, list[fx.Node]] = defaultdict(list)
+    for pn in param_nodes:
+        bucket_members[bucket_id[pn]].append(pn)
+
+    def _bucket_use_range(members: list[fx.Node]) -> tuple[int, int]:
+        return (
+            min(param_ranges[pn][0] for pn in members),
+            max(param_ranges[pn][1] for pn in members),
+        )
+
+    bucket_list: list[tuple[int, int, list[fx.Node]]] = []
+    for bid, members in bucket_members.items():
+        f, l = _bucket_use_range(members)
+        bucket_list.append((f, l, members))
+    bucket_list.sort(key=lambda t: t[0])
+
+    merged: list[tuple[int, int, list[fx.Node]]] = []
+    for f, l, members in bucket_list:
+        if merged and f <= merged[-1][1]:
+            pf, pl, pm = merged[-1]
+            merged[-1] = (pf, max(pl, l), pm + members)
+        else:
+            merged.append((f, l, members))
+
+    n_segs = len(merged)
+    if n_segs == 1:
+        return [gm]
+
+    # ------------------------------------------------------------------ #
+    # Step 6 – Cut points (max last-use per bucket except the final one) #
+    # ------------------------------------------------------------------ #
+    # cut_after[i] is the node index after which we cut between seg i and i+1.
+    cut_after: list[int] = [merged[i][1] for i in range(n_segs - 1)]
+
+    # ------------------------------------------------------------------ #
+    # Step 7 – Assign each node to a segment                            #
+    # ------------------------------------------------------------------ #
+    def _seg_of(idx: int) -> int:
+        return sum(1 for c in cut_after if c < idx)
+
+    node_seg: dict[fx.Node, int] = {}
+    for nd in nodes:
+        if nd.op == "placeholder":
+            node_seg[nd] = 0
+        elif nd.op == "output":
+            node_seg[nd] = n_segs - 1
+        elif nd.op == "get_attr":
+            user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+            node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
+        else:
+            node_seg[nd] = _seg_of(node_idx[nd])
+
+    # ------------------------------------------------------------------ #
+    # Step 8 – Compute cross-segment activation sets                    #
+    # ------------------------------------------------------------------ #
+    # seg_cross_in[seg] = ordered list of compute nodes produced in segment
+    # < seg that are consumed by any segment >= seg.  Placeholders and
+    # get_attr nodes are excluded: placeholder (model input) tensors are
+    # assumed to be available in every segment directly; parameters never
+    # cross segments after singleton promotion and can be re-issued.
+    node_max_user_seg: dict[fx.Node, int] = {}
+    for nd in nodes:
+        if nd.op == "output":
+            continue
+        node_max_user_seg[nd] = (
+            max(node_seg[u] for u in nd.users) if nd.users else node_seg[nd]
+        )
+
+    seg_cross_in: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for nd in nodes:
+        if nd.op in ("placeholder", "get_attr", "output"):
+            continue
+        s = node_seg[nd]
+        mu = node_max_user_seg[nd]
+        for seg in range(s + 1, mu + 1):
+            seg_cross_in[seg].append(nd)
+    # Lists are already in graph order since we iterate nodes in graph order.
+
+    # For each segment, determine which original placeholder nodes it uses
+    # directly (so we only add the placeholders each segment actually needs).
+    seg_placeholders: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for nd in nodes:
+        if nd.op != "placeholder":
+            continue
+        for seg in range(n_segs):
+            if any(node_seg[u] == seg for u in nd.users):
+                seg_placeholders[seg].append(nd)
+
+    # ------------------------------------------------------------------ #
+    # Step 9 – Build sub-graphs                                          #
+    # ------------------------------------------------------------------ #
+    sub_graphs: list[fx.GraphModule] = []
+
+    for seg in range(n_segs):
+        sub_g = fx.Graph()
+        remap: dict[fx.Node, fx.Node] = {}
+
+        # Original model inputs used directly by this segment.
+        for nd in seg_placeholders[seg]:
+            new_ph = sub_g.placeholder(nd.name)
+            new_ph.type = nd.type
+            remap[nd] = new_ph
+
+        # Cross-segment activation inputs from earlier segments.
+        for orig in seg_cross_in[seg]:
+            new_ph = sub_g.placeholder(f"_xseg_{orig.name}")
+            new_ph.type = orig.type
+            remap[orig] = new_ph
+
+        # get_attr nodes whose attributes belong to this segment.
+        for nd in nodes:
+            if nd.op == "get_attr" and node_seg[nd] == seg:
+                new_ga = sub_g.get_attr(nd.target)
+                new_ga.type = nd.type
+                remap[nd] = new_ga
+
+        # Compute nodes for this segment (graph order preserved).
+        for nd in nodes:
+            if nd.op in ("placeholder", "get_attr", "output"):
+                continue
+            if node_seg[nd] != seg:
+                continue
+            new_nd = sub_g.node_copy(nd, arg_transform=lambda x, r=remap: r[x])
+            remap[nd] = new_nd
+
+        # Output node.
+        if seg == n_segs - 1:
+            orig_out = next(nd for nd in nodes if nd.op == "output")
+            # orig_out.args[0] is the actual return value (node, tuple of nodes, etc.)
+            sub_g.output(fx.map_arg(orig_out.args[0], lambda x: remap[x]))
+        else:
+            out_nodes = [remap[orig] for orig in seg_cross_in[seg + 1]]
+            sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
+
+        sub_g.lint()
+        sub_graphs.append(fx.GraphModule(gm, sub_g))
+
+    return sub_graphs
+
+
+# ---------------------------------------------------------------------------
+# bucket_stage – stage-level parameter bucketing (placeholder params)
+# ---------------------------------------------------------------------------
+
+def bucket_stage(
+    stage_gm: fx.GraphModule,
+    graphargs: list,
+    input_idxs: list[int],
+    param_idxs: list[int],
+    bucket_size_bytes: int = 25 * 1024 * 1024,
+) -> list[tuple[fx.GraphModule, list[int], list[int], list]]:
+    """Split a stage GraphModule into per-parameter-bucket sub-modules.
+
+    Unlike :func:`bucket_parameters`, which handles ``get_attr`` parameter
+    nodes, this function handles stages produced by :func:`_split_gm_by_stages`
+    where trainable parameters are passed as **placeholder inputs** identified
+    by *param_idxs*.
+
+    Args:
+        stage_gm: The stage ``fx.GraphModule`` to split.
+        graphargs: Flat arg list for ``stage_gm.forward``; entries at
+            *param_idxs* are meta tensors, entries at *input_idxs* are None.
+        input_idxs: Positions of activation-input placeholders.
+        param_idxs: Positions of parameter placeholders.
+        bucket_size_bytes: Target bucket size (default 25 MB).
+
+    Returns:
+        A list of ``(bucket_gm, bucket_input_idxs, bucket_param_idxs,
+        bucket_graphargs)`` tuples in execution order.  Returns a
+        single-element list containing the original stage when no split is
+        needed.
+    """
+    nodes = list(stage_gm.graph.nodes)
+    node_idx: dict[fx.Node, int] = {nd: i for i, nd in enumerate(nodes)}
+    ph_nodes = [nd for nd in nodes if nd.op == "placeholder"]
+
+    param_ph_set = {ph_nodes[i] for i in param_idxs if i < len(ph_nodes)}
+    param_ph_list = [ph_nodes[i] for i in param_idxs if i < len(ph_nodes)]
+    input_ph_set  = {ph_nodes[i] for i in input_idxs  if i < len(ph_nodes)}
+
+    if not param_ph_list:
+        return [(stage_gm, list(input_idxs), list(param_idxs), list(graphargs))]
+
+    compute_set: frozenset[int] = frozenset(
+        i for i, nd in enumerate(nodes)
+        if nd.op not in ("placeholder", "get_attr", "output")
+    )
+
+    def _use_range(pnd: fx.Node) -> tuple[int, int]:
+        idxs = [node_idx[u] for u in pnd.users if node_idx[u] in compute_set]
+        return (min(idxs), max(idxs)) if idxs else (node_idx[pnd], node_idx[pnd])
+
+    def _size(pnd: fx.Node) -> int:
+        i = ph_nodes.index(pnd)
+        if i < len(graphargs) and graphargs[i] is not None and hasattr(graphargs[i], "numel"):
+            return int(graphargs[i].numel() * graphargs[i].element_size())
+        ev = pnd.meta.get("example_value")
+        if ev is not None and hasattr(ev, "numel"):
+            return int(ev.numel() * ev.element_size())
+        return 0
+
+    param_ranges = {pn: _use_range(pn) for pn in param_ph_list}
+
+    # Greedy bucket assignment
+    bucket_id: dict[fx.Node, int] = {}
+    cur_b, cur_sz = 0, 0
+    for pn in param_ph_list:
+        sz = _size(pn)
+        if cur_sz + sz > bucket_size_bytes and cur_sz > 0:
+            cur_b += 1
+            cur_sz = 0
+        bucket_id[pn] = cur_b
+        cur_sz += sz
+    n_init = cur_b + 1
+
+    # Singleton promotion
+    def _init_range(b: int) -> tuple[int, int]:
+        ms = [pn for pn in param_ph_list if bucket_id[pn] == b]
+        if not ms:
+            return (0, 0)
+        return (min(param_ranges[pn][0] for pn in ms), max(param_ranges[pn][1] for pn in ms))
+
+    init_ranges = [_init_range(b) for b in range(n_init)]
+
+    def _bucket_at(idx: int) -> int:
+        for b, (lo, hi) in enumerate(init_ranges):
+            if lo <= idx <= hi:
+                return b
+        return 0
+
+    sn = n_init
+    for pn in param_ph_list:
+        f, l = param_ranges[pn]
+        if _bucket_at(f) != _bucket_at(l):
+            bucket_id[pn] = sn
+            sn += 1
+
+    # Build bucket list, sort, merge overlapping ranges
+    bm: dict[int, list[fx.Node]] = defaultdict(list)
+    for pn in param_ph_list:
+        bm[bucket_id[pn]].append(pn)
+
+    blist: list[tuple[int, int, list[fx.Node]]] = []
+    for members in bm.values():
+        f = min(param_ranges[pn][0] for pn in members)
+        l = max(param_ranges[pn][1] for pn in members)
+        blist.append((f, l, members))
+    blist.sort(key=lambda t: t[0])
+
+    merged: list[tuple[int, int, list[fx.Node]]] = []
+    for f, l, ms in blist:
+        if merged and f <= merged[-1][1]:
+            pf, pl, pm = merged[-1]
+            merged[-1] = (pf, max(pl, l), pm + ms)
+        else:
+            merged.append((f, l, ms))
+
+    n_segs = len(merged)
+    if n_segs == 1:
+        return [(stage_gm, list(input_idxs), list(param_idxs), list(graphargs))]
+
+    cut_after = [merged[i][1] for i in range(n_segs - 1)]
+
+    def _seg_of(idx: int) -> int:
+        return sum(1 for c in cut_after if c < idx)
+
+    # Assign nodes to segments
+    node_seg: dict[fx.Node, int] = {}
+    for nd in nodes:
+        if nd.op == "output":
+            node_seg[nd] = n_segs - 1
+        elif nd.op == "placeholder":
+            if nd in param_ph_set:
+                user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+                node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
+            else:
+                node_seg[nd] = 0
+        elif nd.op == "get_attr":
+            user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+            node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
+        else:
+            node_seg[nd] = _seg_of(node_idx[nd])
+
+    # Cross-segment inputs: compute outputs needed in later segments, plus
+    # non-param placeholders (e.g. freqs_cis, attention_mask) that live in
+    # segment 0 but are consumed by compute nodes in later segments.
+    node_max_user_seg: dict[fx.Node, int] = {}
+    for nd in nodes:
+        if nd.op == "output":
+            continue
+        node_max_user_seg[nd] = (
+            max(node_seg[u] for u in nd.users) if nd.users else node_seg[nd]
+        )
+
+    seg_cross_in: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for nd in nodes:
+        if nd.op in ("get_attr", "output"):
+            continue
+        # Param placeholders are assigned to exactly one segment — not cross-segment.
+        if nd.op == "placeholder" and nd in param_ph_set:
+            continue
+        s = node_seg[nd]
+        mu = node_max_user_seg[nd]
+        for seg in range(s + 1, mu + 1):
+            seg_cross_in[seg].append(nd)
+
+    # Build sub-graphs
+    results: list[tuple[fx.GraphModule, list[int], list[int], list]] = []
+
+    for seg in range(n_segs):
+        sub_g = fx.Graph()
+        remap: dict[fx.Node, fx.Node] = {}
+        new_input_idxs: list[int] = []
+        new_param_idxs: list[int] = []
+        new_graphargs: list = []
+        pos = 0
+
+        def _meta_tensor_for(nd: fx.Node):
+            """Return a meta tensor matching nd's shape/dtype, or None if unavailable."""
+            ev = nd.meta.get("example_value")
+            if ev is None:
+                ev = nd.meta.get("val")
+            if ev is not None and hasattr(ev, "shape"):
+                return torch.empty(ev.shape, dtype=ev.dtype, device="meta", requires_grad=ev.requires_grad)
+            return None
+
+        def _add_ph(nd: fx.Node, name: str, is_input: bool) -> None:
+            nonlocal pos
+            new_ph = sub_g.placeholder(name)
+            new_ph.type = nd.type
+            remap[nd] = new_ph
+            if is_input:
+                new_input_idxs.append(pos)
+                meta = _meta_tensor_for(nd)
+                if meta is None:
+                    # Fallback: use the corresponding entry from the incoming graphargs.
+                    # This handles sub-graphs produced by split_by_a2a whose placeholder
+                    # nodes are freshly created and lack example_value metadata.
+                    i_orig = ph_nodes.index(nd) if nd in ph_nodes else -1
+                    if 0 <= i_orig < len(graphargs):
+                        meta = graphargs[i_orig]
+                new_graphargs.append(meta)
+            else:
+                new_param_idxs.append(pos)
+                i_orig = ph_nodes.index(nd) if nd in ph_nodes else -1
+                new_graphargs.append(graphargs[i_orig] if 0 <= i_orig < len(graphargs) else None)
+            pos += 1
+
+        if seg == 0:
+            # Non-param placeholders (activation inputs + other non-param inputs).
+            for nd in nodes:
+                if nd.op == "placeholder" and nd not in param_ph_set:
+                    _add_ph(nd, nd.name, is_input=(nd in input_ph_set))
+        else:
+            # Cross-segment activation inputs from the previous segment.
+            for orig in seg_cross_in[seg]:
+                _add_ph(orig, f"_xseg_{orig.name}", is_input=True)
+
+        # Parameter placeholders belonging to this segment.
+        for nd in nodes:
+            if nd.op == "placeholder" and nd in param_ph_set and node_seg[nd] == seg:
+                _add_ph(nd, nd.name, is_input=False)
+
+        # get_attr nodes for this segment.
+        for nd in nodes:
+            if nd.op == "get_attr" and node_seg[nd] == seg:
+                new_ga = sub_g.get_attr(nd.target)
+                new_ga.type = nd.type
+                remap[nd] = new_ga
+
+        # Compute nodes for this segment (graph order preserved).
+        for nd in nodes:
+            if nd.op in ("placeholder", "get_attr", "output"):
+                continue
+            if node_seg[nd] != seg:
+                continue
+            remap[nd] = sub_g.node_copy(nd, arg_transform=lambda x, r=remap: r[x])
+
+        # Output node.
+        if seg == n_segs - 1:
+            orig_out = next(nd for nd in nodes if nd.op == "output")
+            sub_g.output(fx.map_arg(orig_out.args[0], lambda x: remap[x]))
+        else:
+            out_nodes = [remap[orig] for orig in seg_cross_in[seg + 1]]
+            sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
+
+        sub_g.lint()
+        results.append((fx.GraphModule(stage_gm, sub_g), new_input_idxs, new_param_idxs, new_graphargs))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# split_by_a2a: split an FX GraphModule at all-to-all annotation boundaries
+# ---------------------------------------------------------------------------
+
+def split_by_a2a(
+    stage_gm: fx.GraphModule,
+    graphargs: list,
+    input_idxs: list[int],
+    param_idxs: list[int],
+) -> tuple[list[tuple], list[dict]]:
+    """Split a stage GraphModule at all-to-all annotation boundaries.
+
+    Each all-to-all annotation (``node.meta['custom']['collective'] ==
+    'all_to_all_single'``) marks a tensor that will be communicated via an
+    expert-parallel all-to-all operation.  The annotations must come in pairs;
+    the graph is cut at each boundary so that the A2A operation itself is
+    handled at the DAG level (FWD_A2A / BWD_A2A task types) rather than being
+    embedded in the FX graph.
+
+    Args:
+        stage_gm: The stage ``fx.GraphModule`` to split.
+        graphargs: Flat arg list for ``stage_gm.forward``.
+        input_idxs: Positions of activation-input placeholders.
+        param_idxs: Positions of parameter placeholders.
+
+    Returns:
+        ``(segments, boundary_infos)`` where:
+
+        * *segments* is a list of ``(gm, input_idxs, param_idxs, graphargs)``
+          tuples in execution order.  If no A2A annotations are found the
+          original stage is returned as a single-element list with an empty
+          *boundary_infos*.
+
+        * *boundary_infos* is a list of dicts, one per A2A boundary (length ==
+          number of annotation blocks).  Each dict has keys:
+
+          - ``"tensor_idx"`` (int): index in the output tuple of the preceding
+            segment of the tensor to communicate.
+          - ``"reshape_input"`` (tuple | None): reshape the tensor to this
+            shape before the A2A send.
+          - ``"reshape_output"`` (tuple | None): reshape the A2A result to
+            this shape before feeding the next segment.
+
+    Raises:
+        ValueError: If the number of A2A annotation blocks is not even
+            (annotations must come in pairs).
+    """
+    nodes = list(stage_gm.graph.nodes)
+    node_idx: dict[fx.Node, int] = {nd: i for i, nd in enumerate(nodes)}
+    ph_nodes = [nd for nd in nodes if nd.op == "placeholder"]
+    param_ph_set = {ph_nodes[i] for i in param_idxs if i < len(ph_nodes)}
+    input_ph_set = {ph_nodes[i] for i in input_idxs if i < len(ph_nodes)}
+
+    # ------------------------------------------------------------------
+    # 1. Find all A2A annotation blocks (same logic as _insert_a2a_ops)
+    # ------------------------------------------------------------------
+    annotated_nodes = []
+    for idx, node in enumerate(nodes):
+        # Skip non-compute nodes: get_attr (parameters) and placeholders may
+        # inherit annotations from the enclosing `with annotate(...)` block
+        # but are not A2A compute boundaries.
+        if node.op in ("placeholder", "get_attr", "output"):
+            continue
+        custom = node.meta.get("custom")
+        if isinstance(custom, dict) and custom.get("collective") == "all_to_all_single":
+            reshape = custom.get("reshape")
+            annotation_key = tuple(sorted(custom.items()))
+            annotated_nodes.append((idx, node, annotation_key, reshape))
+
+    if not annotated_nodes:
+        return [(stage_gm, list(input_idxs), list(param_idxs), list(graphargs))], []
+
+    logger.debug(
+        f"split_by_a2a: found {len(annotated_nodes)} annotated nodes:\n"
+        + "\n".join(
+            f"  [{i}] pos={idx} name={nd.name!r} "
+            f"key={'...' + str(ak)[-60:]}"
+            for i, (idx, nd, ak, _) in enumerate(annotated_nodes)
+        )
+    )
+
+    # Group CONSECUTIVE annotated nodes with the same annotation_key into blocks.
+    # This handles multiple layers: each contiguous run of same-key nodes becomes
+    # its own block, so a 2-layer model produces 4 blocks (dispatch0, combine0,
+    # dispatch1, combine1) rather than 2 (all-dispatches, all-combines).
+    # annotated_nodes is already in graph order.
+    blocks: list = []
+    for idx, node, annotation_key, reshape in annotated_nodes:
+        if blocks and blocks[-1]["annotation_key"] == annotation_key:
+            blocks[-1]["nodes"].append((idx, node))
+            blocks[-1]["last_idx"] = idx
+        else:
+            blocks.append({
+                "nodes": [(idx, node)],
+                "last_idx": idx,
+                "reshape": reshape,
+                "annotation_key": annotation_key,
+            })
+    n_boundaries = len(blocks)
+
+    logger.debug(
+        f"split_by_a2a: grouped into {n_boundaries} consecutive blocks:\n"
+        + "\n".join(
+            f"  block[{i}]: {len(b['nodes'])} nodes "
+            f"[{', '.join(nd.name for _, nd in b['nodes'])}] "
+            f"reshape={b['reshape']}"
+            for i, b in enumerate(blocks)
+        )
+    )
+
+    if n_boundaries % 2 != 0:
+        raise ValueError(
+            f"split_by_a2a: expected an even number of A2A annotation blocks "
+            f"(got {n_boundaries}).  Annotations must come in pairs.\n"
+            f"Blocks: " + ", ".join(
+                f"[{' '.join(nd.name for _, nd in b['nodes'])}]" for b in blocks
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # 2. For each block, find the "boundary node" — the block node that
+    #    has users outside the block.  This becomes the A2A output tensor.
+    # ------------------------------------------------------------------
+    boundary_nodes: list[tuple[fx.Node, tuple | None, tuple | None]] = []
+    for block in blocks:
+        block_node_set = {nd for _, nd in block["nodes"]}
+        reshape_hint = block["reshape"]
+        reshape_input = None
+        reshape_output = None
+        if isinstance(reshape_hint, (list, tuple)) and len(reshape_hint) == 2:
+            kind, shape = reshape_hint
+            if kind == "input":
+                reshape_input = tuple(shape)
+            elif kind == "output":
+                reshape_output = tuple(shape)
+
+        # Find output node of the block
+        output_node = None
+        for _, nd in block["nodes"]:
+            for user in nd.users:
+                if user not in block_node_set:
+                    output_node = nd
+                    break
+            if output_node is not None:
+                break
+        if output_node is None:
+            # Fallback: last node in the block by graph position
+            output_node = max((nd for _, nd in block["nodes"]),
+                              key=lambda n: node_idx[n])
+        boundary_nodes.append((output_node, reshape_input, reshape_output))
+
+    # ------------------------------------------------------------------
+    # 3. Assign each node to a segment.
+    #    Segments are separated by boundary_nodes.  Node `n` goes into
+    #    segment `s` where `s` is the number of boundary nodes that appear
+    #    strictly before `n` in graph order (i.e. boundary node itself is in
+    #    the segment BEFORE the cut).
+    # ------------------------------------------------------------------
+    boundary_positions = [node_idx[bn] for bn, _, _ in boundary_nodes]
+    # boundary_positions[i] is the graph index of the i-th boundary node.
+    # Segment i contains nodes with graph index in [prev_cut+1, boundary_pos_i].
+    # Segment n_boundaries contains all nodes after the last boundary.
+    n_segs = n_boundaries + 1
+
+    compute_set: frozenset[int] = frozenset(
+        i for i, nd in enumerate(nodes)
+        if nd.op not in ("placeholder", "get_attr", "output")
+    )
+
+    def _seg_of_idx(idx: int) -> int:
+        """Return the segment index for a graph-node at position idx."""
+        s = 0
+        for bp in boundary_positions:
+            if idx > bp:
+                s += 1
+            else:
+                break
+        return s
+
+    node_seg: dict[fx.Node, int] = {}
+    for nd in nodes:
+        if nd.op == "output":
+            node_seg[nd] = n_segs - 1
+        elif nd.op == "placeholder":
+            if nd in param_ph_set:
+                user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+                node_seg[nd] = _seg_of_idx(min(user_idxs)) if user_idxs else 0
+            else:
+                node_seg[nd] = 0
+        elif nd.op == "get_attr":
+            user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+            node_seg[nd] = _seg_of_idx(min(user_idxs)) if user_idxs else 0
+        else:
+            node_seg[nd] = _seg_of_idx(node_idx[nd])
+
+    # ------------------------------------------------------------------
+    # 4. Compute cross-segment inputs (same pattern as bucket_stage)
+    # ------------------------------------------------------------------
+    node_max_user_seg: dict[fx.Node, int] = {}
+    for nd in nodes:
+        if nd.op == "output":
+            continue
+        node_max_user_seg[nd] = (
+            max(node_seg[u] for u in nd.users) if nd.users else node_seg[nd]
+        )
+
+    seg_cross_in: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for nd in nodes:
+        if nd.op in ("get_attr", "output"):
+            continue
+        if nd.op == "placeholder" and nd in param_ph_set:
+            continue
+        s = node_seg[nd]
+        mu = node_max_user_seg[nd]
+        for seg in range(s + 1, mu + 1):
+            seg_cross_in[seg].append(nd)
+
+    # ------------------------------------------------------------------
+    # 5. Build per-segment sub-graphs (same pattern as bucket_stage)
+    # ------------------------------------------------------------------
+    results: list[tuple[fx.GraphModule, list[int], list[int], list]] = []
+    boundary_infos: list[dict] = []
+
+    for seg in range(n_segs):
+        sub_g = fx.Graph()
+        remap: dict[fx.Node, fx.Node] = {}
+        new_input_idxs: list[int] = []
+        new_param_idxs: list[int] = []
+        new_graphargs: list = []
+        pos = 0
+
+        def _meta_tensor_for(nd: fx.Node):
+            ev = nd.meta.get("example_value")
+            if ev is None:
+                ev = nd.meta.get("val")
+            if ev is not None and hasattr(ev, "shape"):
+                return torch.empty(ev.shape, dtype=ev.dtype, device="meta",
+                                   requires_grad=getattr(ev, "requires_grad", False))
+            return None
+
+        def _add_ph(nd: fx.Node, name: str, is_input: bool) -> None:
+            nonlocal pos
+            new_ph = sub_g.placeholder(name)
+            new_ph.type = nd.type
+            remap[nd] = new_ph
+            if is_input:
+                new_input_idxs.append(pos)
+                new_graphargs.append(_meta_tensor_for(nd))
+            else:
+                new_param_idxs.append(pos)
+                i_orig = ph_nodes.index(nd) if nd in ph_nodes else -1
+                new_graphargs.append(graphargs[i_orig] if 0 <= i_orig < len(graphargs) else None)
+            pos += 1
+
+        if seg == 0:
+            for nd in nodes:
+                if nd.op == "placeholder" and nd not in param_ph_set:
+                    _add_ph(nd, nd.name, is_input=(nd in input_ph_set))
+        else:
+            for orig in seg_cross_in[seg]:
+                _add_ph(orig, f"_xseg_{orig.name}", is_input=True)
+
+        for nd in nodes:
+            if nd.op == "placeholder" and nd in param_ph_set and node_seg[nd] == seg:
+                _add_ph(nd, nd.name, is_input=False)
+
+        for nd in nodes:
+            if nd.op == "get_attr" and node_seg[nd] == seg:
+                new_ga = sub_g.get_attr(nd.target)
+                new_ga.type = nd.type
+                remap[nd] = new_ga
+
+        for nd in nodes:
+            if nd.op in ("placeholder", "get_attr", "output"):
+                continue
+            if node_seg[nd] != seg:
+                continue
+            remap[nd] = sub_g.node_copy(nd, arg_transform=lambda x, r=remap: r[x])
+
+        if seg == n_segs - 1:
+            orig_out = next(nd for nd in nodes if nd.op == "output")
+            sub_g.output(fx.map_arg(orig_out.args[0], lambda x: remap[x]))
+        else:
+            # Output is all cross-segment values for the next segment.
+            out_nodes = [remap[orig] for orig in seg_cross_in[seg + 1]]
+            sub_g.output(tuple(out_nodes) if len(out_nodes) != 1 else out_nodes[0])
+
+            # Record which output position holds the A2A boundary tensor.
+            # boundary_nodes[seg] is the A2A output node for the boundary AFTER seg.
+            boundary_nd, reshape_input, reshape_output = boundary_nodes[seg]
+            cross_out_list = seg_cross_in[seg + 1]
+            if boundary_nd in cross_out_list:
+                tensor_idx = cross_out_list.index(boundary_nd)
+            else:
+                raise ValueError(
+                    f"split_by_a2a: A2A boundary node '{boundary_nd.name}' "
+                    f"(segment {seg}) is not in seg_cross_in[{seg + 1}]; "
+                    f"seg_cross_in = {[n.name for n in cross_out_list]}"
+                )
+            boundary_infos.append({
+                "tensor_idx": tensor_idx,
+                "reshape_input": reshape_input,
+                "reshape_output": reshape_output,
+            })
+
+        sub_g.lint()
+        results.append((fx.GraphModule(stage_gm, sub_g), new_input_idxs, new_param_idxs, new_graphargs))
+
+    return results, boundary_infos
+
+
+# ---------------------------------------------------------------------------
+# expand_a2a_tasks: insert FWD_A2A / BWD_A2A nodes into the task DAG
+# ---------------------------------------------------------------------------
+
+def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
+    """Insert FWD_A2A / BWD_A2A task nodes into the DAG between adjacent bucket
+    nodes at all-to-all boundaries.
+
+    Must be called *after* :func:`expand_bucket_tasks`.
+
+    For the forward pass, between FWD(bucket_id=i) and
+    FWD(bucket_id=i+1) a FWD_A2A node is inserted.
+
+    For the backward pass (which runs in reverse bucket order), between
+    BWD(bucket_id=i+1) and BWD(bucket_id=i) a BWD_A2A node is
+    inserted.
+
+    Args:
+        dag: TaskDAG produced by :func:`expand_bucket_tasks`.
+        a2a_info: Mapping ``stage_id -> {boundary_bucket_id -> tensor_idx}``.
+            Only stages present here are modified.
+
+    Returns:
+        A new TaskDAG with inserted FWD_A2A / BWD_A2A nodes.
+    """
+    if not a2a_info:
+        return dag
+
+    TIME_SCALE = 1000  # same scale used by expand_bucket_tasks
+
+    # Index FWD/BWD/BWD_I nodes by (stage_id, mb_idx, type, bucket_id)
+    bucket_node_map: dict = {}
+    for node in dag.nodes:
+        t = node.task
+        if t.type in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I):
+            sid = t.batches[0].stage_id
+            mid = t.batches[0].mb_idx
+            bucket_node_map[(sid, mid, t.type, t.bucket_id)] = node
+
+    new_nodes: list[TaskNode] = []
+
+    for node in dag.nodes:
+        t = node.task
+        if t.type not in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I):
+            continue
+        sid = t.batches[0].stage_id
+        if sid not in a2a_info:
+            continue
+        boundaries = a2a_info[sid]
+
+        if t.type == TaskType.FWD:
+            # Insert FWD_A2A after FWD(bucket_id) if it's a boundary
+            bkt_id = t.bucket_id
+            if bkt_id not in boundaries:
+                continue
+            tensor_idx = boundaries[bkt_id]
+            mb_idx = t.batches[0].mb_idx
+
+            # Find the successor FWD(bucket_id+1)
+            next_bkt_key = (sid, mb_idx, TaskType.FWD, bkt_id + 1)
+            if next_bkt_key not in bucket_node_map:
+                continue
+            next_node = bucket_node_map[next_bkt_key]
+
+            a2a_node = TaskNode(
+                task=Task(
+                    pp_rank=node.pp_rank,
+                    batches=list(t.batches),
+                    type=TaskType.FWD_A2A,
+                    bucket_id=bkt_id,
+                    a2a_tensor_idx=tensor_idx,
+                ),
+                pp_rank=node.pp_rank,
+                time_step=node.time_step + TIME_SCALE // 2,
+            )
+
+            # Rewire: node -> a2a_node -> next_node  (replacing node -> next_node)
+            if next_node in node.data_succs:
+                node.data_succs.remove(next_node)
+            if node in next_node.data_preds:
+                next_node.data_preds.remove(node)
+
+            node.data_succs.append(a2a_node)
+            a2a_node.data_preds.append(node)
+            a2a_node.data_succs.append(next_node)
+            next_node.data_preds.append(a2a_node)
+
+            new_nodes.append(a2a_node)
+
+        else:  # BWD / BWD_I with bucket_id
+            # Insert BWD_A2A after BWD/BWD_I(bucket_id+1) if there's a boundary there
+            # (i.e. between bkt_id+1 and bkt_id in backward execution order)
+            bkt_id = t.bucket_id
+            if bkt_id not in boundaries:
+                continue
+            # This BWD/BWD_I(bkt_id) is the later node in the backward chain.
+            # We need to insert BWD_A2A between BWD/BWD_I(bkt_id+1) and BWD/BWD_I(bkt_id).
+            # The predecessor in the data chain is BWD/BWD_I(bkt_id+1).
+            tensor_idx = boundaries[bkt_id]
+            mb_idx = t.batches[0].mb_idx
+
+            prev_bkt_key = (sid, mb_idx, t.type, bkt_id + 1)
+            if prev_bkt_key not in bucket_node_map:
+                continue
+            prev_node = bucket_node_map[prev_bkt_key]
+
+            a2a_node = TaskNode(
+                task=Task(
+                    pp_rank=node.pp_rank,
+                    batches=list(t.batches),
+                    type=TaskType.BWD_A2A,
+                    bucket_id=bkt_id,
+                    a2a_tensor_idx=tensor_idx,
+                ),
+                pp_rank=node.pp_rank,
+                time_step=prev_node.time_step + TIME_SCALE // 2,
+            )
+
+            # Rewire: prev_node -> a2a_node -> node  (replacing prev_node -> node)
+            if node in prev_node.data_succs:
+                prev_node.data_succs.remove(node)
+            if prev_node in node.data_preds:
+                node.data_preds.remove(prev_node)
+
+            prev_node.data_succs.append(a2a_node)
+            a2a_node.data_preds.append(prev_node)
+            a2a_node.data_succs.append(node)
+            node.data_preds.append(a2a_node)
+
+            new_nodes.append(a2a_node)
+
+    all_nodes = list(dag.nodes) + new_nodes
+    return TaskDAG(nodes=all_nodes)

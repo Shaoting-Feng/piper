@@ -19,6 +19,17 @@ from .piper import piper
 
 logger = create_logger("piper_compile", LOG_LEVEL)
 
+_RANK0_ADDR_ACTOR = "piper_rank0_addr"
+
+@ray.remote
+class _Rank0AddrStore:
+    """Named actor used to share global rank-0's IP+port across independent dp_rank workers."""
+    def __init__(self, addr: str, port: int):
+        self._addr = addr
+        self._port = port
+    def get(self):
+        return self._addr, self._port
+
 def piper_setup(
     model_class,
     model_args=(),
@@ -29,10 +40,11 @@ def piper_setup(
     schedule: Schedule2D=None,
     naive_gradient_sync=False,
     activation_checkpointing=False,
+    bucketing=False,
     mode="sequential",
     pg=None,
     model_dtype=None,
-    zero_stage: int = 0,
+    nsight=False,
 ):
     """
     Compile a model with the piper backend.
@@ -44,17 +56,16 @@ def piper_setup(
         example_outputs: Example outputs (labels) for tracing.
         schedule: 2D schedule grid (rank x time_step).
         naive_gradient_sync: Use a simple blocking all-reduce instead of
-            pipelined per-param hooks. Ignored when ``zero_stage >= 1``.
-        zero_stage: ZeRO optimisation stage.
-            0 = disabled (standard DDP).
-            1 = strict ZeRO-1 (optimizer sharding + bucketed all-reduce grads).
-            2 = strict ZeRO-2 (optimizer sharding + bucketed reduce-scatter grads).
+            pipelined per-param hooks.
     """
 
     stage_to_device = schedule.stage_to_device()
+    print("Stage to device mapping:", stage_to_device)
     assert len(stage_to_device) > 0
     piper_metadata.stage_to_device = stage_to_device
     piper_metadata.use_activation_checkpointing = activation_checkpointing
+    piper_metadata.bucketing = bucketing
+    piper_metadata.schedule = schedule
 
     num_mbs = schedule.num_mbs()
     num_stages = schedule.num_stages()
@@ -62,15 +73,40 @@ def piper_setup(
 
     _create_actors(
         num_devices, optim_fn, num_mbs, num_stages,
-        naive_gradient_sync, profile=True, mode=mode, stage_to_device=stage_to_device, pg=pg, zero_stage=zero_stage,
+        naive_gradient_sync, profile=nsight, mode=mode, stage_to_device=stage_to_device, pg=pg,
     )
 
+    # All dp_ranks must agree on a single master_addr: the IP of the actor with
+    # global_rank=0 (pp_rank=0, dp_rank=0).  dp_rank=0 publishes it via a named
+    # Ray actor; other dp_ranks wait until it's available.
+    import time
+    dp_rank = int(os.environ["PIPER_DP_RANK"])
+    if dp_rank == 0:
+        # Get IP and a free port from actor 0's node — it will be the TCPStore server.
+        master_addr, master_port = ray.get(piper_metadata.actors[0].get_node_ip_and_free_port.remote())
+        _Rank0AddrStore.options(
+            name=_RANK0_ADDR_ACTOR, lifetime="detached", get_if_exists=True
+        ).remote(master_addr, master_port)
+    else:
+        master_addr = master_port = None
+        while master_addr is None:
+            try:
+                store = ray.get_actor(_RANK0_ADDR_ACTOR)
+                master_addr, master_port = ray.get(store.get.remote())
+            except Exception:
+                time.sleep(0.05)
+    logger.debug(f"Master address for process groups: {master_addr}:{master_port}")
     ray.get(
         [
-            actor._join_process_groups.remote()
+            actor._join_process_groups.remote(master_addr, master_port)
             for actor in piper_metadata.actors.values()
         ]
     )
+    if dp_rank == 0:
+        try:
+            ray.kill(ray.get_actor(_RANK0_ADDR_ACTOR))
+        except Exception:
+            pass
 
     # Build the model directly on meta device
     with torch.device("meta"):
