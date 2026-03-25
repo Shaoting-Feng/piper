@@ -1,27 +1,27 @@
+import logging
 import ray
 import torch
-import bitsandbytes as bnb
 import time
 import argparse
-import json
 import os
 import numpy as np
-import gc
+
+logger = logging.getLogger(__name__)
 
 from ray.util.placement_group import (
     placement_group,
     placement_group_table,
-    remove_placement_group,
 )
 
-from src.piper_exec import piper_exec
-from src.piper_compile import piper_setup, piper_shutdown
 from src.piper_coordinator import PiperProgramCoordinator
+from src.piper_compile import piper_setup
+from src.piper import piper_exec_dag
 from src.piper_utils import piper_metadata
+
 from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B, LLAMA_70B
 from .schedule_helpers import (
-    build_1f1b_schedule, 
-    build_gpipe_schedule, 
+    build_1f1b_schedule,
+    build_gpipe_schedule,
     print_schedule,
     INTERLEAVED_1F1B_PP2_MB4_SCHEDULE,
     INTERLEAVED_1F1B_PP2_MB6_SCHEDULE,
@@ -35,8 +35,6 @@ from .schedule_helpers import (
 
 
 def main(args, pg):
-    
-    # Set model configuration based on argument
     match args.model:
         case 'debug':
             llama_config = LLAMA_DEBUG
@@ -48,14 +46,12 @@ def main(args, pg):
             llama_config = LLAMA_8B
         case '70b':
             llama_config = LLAMA_70B
-    print(args) 
+    print(args)
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
     x = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len))
     y = torch.randn((args.batch_size, args.seq_len, llama_config.vocab_size))
-
-    schedule = None
 
     match args.schedule:
         case "no-pp":
@@ -67,7 +63,7 @@ def main(args, pg):
                 elif args.mbs == 4:
                     schedule = INTERLEAVED_1F1B_PP2_MB4_SCHEDULE
                 else:
-                    raise ValueError(f"Unsupported number of microbatches: for interleaved-1f1b with PP={args.pp}: {args.mbs}")
+                    raise ValueError(f"Unsupported number of microbatches for interleaved-1f1b with PP={args.pp}: {args.mbs}")
             elif args.pp == 4:
                 assert args.mbs == 8
                 schedule = INTERLEAVED_1F1B_PP4_MB8_SCHEDULE
@@ -87,126 +83,110 @@ def main(args, pg):
         case "zerobubble":
             assert args.pp == 2 and args.mbs == 4
             schedule = ZEROBUBBLE_MB4_SCHEDULE
+
     print("Schedule:")
     print_schedule(schedule)
 
     piper_setup(
         Transformer,
         model_args=(llama_config, args.seq_len),
-        optim_fn=bnb.optim.Adam8bit,
+        optim_fn=torch.optim.Adam,
         example_inputs=[x],
         example_outputs=y,
         schedule=schedule,
-        naive_gradient_sync=args.naive_gradient_sync,
-        zero_stage=args.zero_stage,
+        naive_gradient_sync=args.naive_grad_sync,
         activation_checkpointing=args.activation_checkpointing,
+        bucketing=args.bucketing,
         model_dtype=torch.bfloat16,
         pg=pg,
+        nsight=args.nsight,
     )
 
-    # Warmup
     print(f"Running {args.warmup} warmup iterations...")
-    for i in range(args.warmup):
-        piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
-        print(f"Warmup {i} completed")
+    for _ in range(args.warmup):
+        piper_exec_dag(loss_fn)
+        time.sleep(1)
 
-    # Time training steps
+    actors = piper_metadata.actors
+
     print(f"Running {args.iters} timed iterations...")
     iter_times = []
-    for i in range(args.iters):
+    for _ in range(args.iters):
         start = time.perf_counter()
-        piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
+        piper_exec_dag(loss_fn)
         end = time.perf_counter()
         iter_times.append(end - start)
-        print(f"Iter {i} completed")
-        time.sleep(1) 
-    
+        time.sleep(1)
+
     dp_rank = int(os.environ['PIPER_DP_RANK'])
     print(
-        f"rank {dp_rank} iter time= {np.mean(iter_times):.3f} ± {np.std(iter_times):.3f} s ({len(iter_times)} samples)\n"
-        f"rank {dp_rank} throughput= {(args.batch_size * args.mbs * args.seq_len)/np.mean(iter_times):.3f} tokens/sec ({len(iter_times)} samples)"
+        f"rank {dp_rank} iter time= {np.mean(iter_times):.5f} ± {np.std(iter_times):.5f} s "
+        f"({len(iter_times)} samples)\n"
+        f"rank {dp_rank} throughput= "
+        f"{(args.batch_size * args.mbs * args.seq_len) / np.mean(iter_times):.3f} tokens/s"
     )
 
     if args.tracing:
-        actors = piper_metadata.actors
-        ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
-        ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
-        ray.get([actor.start_mem_tracing.remote() for actor in actors.values()])
-
-        print(f"Running {args.warmup} tracing iterations...")
-        for _ in range(args.warmup):
-            piper_exec(schedule, loss_fn, args.dp, args.naive_gradient_sync)
-
-        mem_data_ret = ray.get([actor.get_peak_memory.remote() for actor in actors.values()])
-        for rank, peak_mem in mem_data_ret:
-            print(f"rank {rank} peak memory= {peak_mem:.3f} GB")
-
+        ray.get([actor.set_tracing.remote(True) for actor in actors.values()])
+        print(f"Running {args.trace_iters} tracing iterations...")
+        for _ in range(args.trace_iters):
+            piper_exec_dag(loss_fn)
+            ray.get([actor.flush_timing_events.remote() for actor in actors.values()])
+            time.sleep(1)
         trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
         for rank, trace_data in trace_data_ret:
             for key in trace_data:
                 all_times = trace_data[key]
-                print(f"rank {rank} {key} time= {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
-
-    if args.naive_gradient_sync:
-        suffix = "-naive-sync"
-    else:
-        suffix = ""
-    # Collect task_id -> label mappings from all actors
-    all_task_labels = {}
-    actors = piper_metadata.actors
-    for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
-        all_task_labels.update(labels)
+                print(
+                    f"rank {rank} {key} time= {np.mean(all_times):.3f} ± "
+                    f"{np.std(all_times):.3f} ms ({len(all_times)} samples)"
+                )
 
     os.makedirs("out", exist_ok=True)
-    timeline_filename = f"out/{args.model}-pp{args.pp}-dp{args.dp}-{args.schedule}{suffix}.json"
+    timeline_filename = f"out/llama-dag-pp{args.pp}-dp{args.dp}-{args.schedule}"
     ray.timeline(timeline_filename)
-    labels_filename = timeline_filename.replace(".json", "-labels.json")
-    with open(labels_filename, "w") as f:
-        json.dump(all_task_labels, f)
     print(f"Ray timeline saved to: {timeline_filename}")
-    print(f"Task labels saved to: {labels_filename}")
 
-    piper_shutdown()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
-    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b', '70b'], default='debug',
-                        help='Model configuration: debug, 1b, 3b, or 8b (default: debug)')
-    parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'interleaved-gpipe', 'dualpipev-nozb', 'dualpipev', 'zerobubble', 'no-pp'], default='1f1b',
-                        help='Schedule type: gpipe, 1f1b, interleaved-1f1b, dualpipev, zerobubble, or no-pp (default: 1f1b)')
-    parser.add_argument('--dp', type=int, default=1,
-                        help='Number of data parallel degrees (default: 1)')
-    parser.add_argument('--pp', type=int, default=2,
-                        help='Number of pipeline parallel degrees (default: 2)')
-    parser.add_argument('--batch-size', type=int, default=16,
-                        help='Batch size (default: 16)')
-    parser.add_argument('--mbs', type=int, default=4,
-                        help='Number of microbatches (default: 4)')
-    parser.add_argument('--seq-len', type=int, default=256,
-                        help='Sequence length (default: 256)')
-    parser.add_argument('--warmup', type=int, default=5,
-                        help='Number of warmup iterations (default: 5)')
-    parser.add_argument('--iters', type=int, default=10,
-                        help='Number of timing iterations (default: 10)')
-    parser.add_argument('--tracing', action='store_true', default=False,
-                        help='Enable tracing')
-    parser.add_argument('--naive-gradient-sync', action='store_true', default=False,
-                        help='Enable naive gradient sync')
-    parser.add_argument('--activation-checkpointing', action='store_true', default=False,
-                        help='Enable activation checkpointing')
-    parser.add_argument('--zero-stage', type=int, choices=[0, 1, 2, 3], default=0,
-                        help='ZeRO optimization stage (0: disabled, 1: strict ZeRO-1, 2: strict ZeRO-2, 3: strict ZeRO-3)')
+    parser.add_argument('--model', choices=['debug', '1b', '3b', '8b', '70b'], default='debug')
+    parser.add_argument(
+        '--schedule',
+        choices=['gpipe', '1f1b', 'interleaved-1f1b', 'interleaved-gpipe',
+                 'dualpipev-nozb', 'dualpipev', 'zerobubble', 'no-pp'],
+        default='1f1b',
+    )
+    parser.add_argument('--dp', type=int, default=1)
+    parser.add_argument('--pp', type=int, default=2)
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--mbs', type=int, default=4)
+    parser.add_argument('--seq-len', type=int, default=256)
+    parser.add_argument('--warmup', type=int, default=3)
+    parser.add_argument('--iters', type=int, default=5)
+    parser.add_argument('--trace-iters', type=int, default=3)
+    parser.add_argument('--tracing', action='store_true', default=False)
+    parser.add_argument('--naive-grad-sync', action='store_true', default=False)
+    parser.add_argument('--activation-checkpointing', action='store_true', default=False)
+    parser.add_argument('--bucketing', action='store_true', default=False,
+                        help='Split stages into per-param-bucket sub-modules for overlapped all-reduce')
+    parser.add_argument('--nsight', action='store_true', default=False,
+                        help='Whether to use Nsight Systems for tracing')
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    ray.init(log_to_driver=True, namespace="llama", include_dashboard=False)
-    # ray.init(log_to_driver=True, namespace="llama", include_dashboard=False, _temp_dir="/m-coriander/coriander/mfris/ray_tmp")
-    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp)
-    ray.get(pg.ready(), timeout=10)  # Wait for the placement group to be ready before proceeding
+    print(args)
+    ray.init(
+        namespace="llama",
+        log_to_driver=True,
+        include_dashboard=False,
+    )
+    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="PACK")
+    ray.get(pg.ready(), timeout=600)
     print(placement_group_table(pg))
-    piper_coordinator = PiperProgramCoordinator.remote(dp_degree=args.dp, pp_degree=args.pp)
-    ray.get(piper_coordinator.run_program.remote(main, args, pg))
-    time.sleep(3)
+    piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
+    handles = piper_coordinator.run_program.remote(main, args, pg)
+    ray.get(handles)
     ray.shutdown()

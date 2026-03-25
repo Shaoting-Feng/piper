@@ -5,6 +5,10 @@ import os
 from .piper_utils import create_logger, LOG_LEVEL
 
 
+# Coordinator needs GPUs when using profiling to infer stage boundaries
+# @ray.remote(num_gpus=0.1)
+
+# Use manual stage annotations- more stable
 @ray.remote
 def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, master_addr, master_port, training_func: Callable, *args, **kwargs):
     logger = create_logger("piper_coordinator", LOG_LEVEL)

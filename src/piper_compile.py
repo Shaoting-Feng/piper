@@ -42,7 +42,6 @@ def piper_setup(
     naive_gradient_sync=False,
     activation_checkpointing=False,
     bucketing=False,
-    mode="sequential",
     pg=None,
     nsight=False,
 ):
@@ -73,7 +72,7 @@ def piper_setup(
 
     _create_actors(
         num_devices, optim_fn, num_mbs, num_stages,
-        naive_gradient_sync, profile=nsight, mode=mode, stage_to_device=stage_to_device, pg=pg,
+        naive_gradient_sync, profile=nsight, stage_to_device=stage_to_device, pg=pg,
     )
 
     # All dp_ranks must agree on a single master_addr: the IP of the actor with
@@ -110,9 +109,9 @@ def piper_setup(
 
     # Build the model directly on meta device
     with torch.device("meta"):
-        model = model_class(*model_args, **model_kwargs)
-    if model_dtype is not None:
-        model = model.to(model_dtype)
+        model = model_class(*model_args, **model_kwargs).to(model_dtype)
+        # if model_dtype is not None:
+        #     model = model.to(model_dtype)
 
     num_params = sum(p.numel() for p in model.parameters())
 
@@ -124,14 +123,15 @@ def piper_setup(
         raise ValueError(f"Unsupported model dtype: {model_dtype}")
     print(f"Model size: {num_params/(1e6):.0f} M parameters ({param_size_mb:.2f} GB), dtype: {model_dtype}")
     
-    compiled = torch.compile(model, backend=piper)
+
+    compiled = torch.compile(model, backend=piper, fullgraph=True)
 
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     logger.info(f"DP rank {dp_rank+1} compiling (meta)...")
 
     # Create meta tensors from our example_inputs to pass to the compiled graph
+    
     meta_inputs = [x.to(device="meta") for x in example_inputs]
-
     _ = compiled(*meta_inputs)
 
     logger.info(f"DP rank {dp_rank+1} stage graphs loaded onto actors.")

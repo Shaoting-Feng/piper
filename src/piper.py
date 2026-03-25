@@ -40,6 +40,8 @@ def piper(gm, example_inputs, **kwargs):
         for node in gm.graph.nodes
     )
 
+    logger.info(f"Graph has stage annotations: {has_annotations}")
+
     if has_annotations:
         top_level_gm, submodules = _split_gm_by_stages(gm)
     else:
@@ -168,12 +170,15 @@ def piper(gm, example_inputs, **kwargs):
         if dp_degree > 1:
             per_rank_dags = insert_ar_ops(per_rank_dags)
             logger.info("Inserted ALL_REDUCE nodes for DP gradient sync")
+            # ZeRO-1/2/3: insert AG/RS into the task DAG before/after the appropriate FWD/BWD tasks.
+
 
         piper_metadata.per_rank_dags = per_rank_dags
         actors = piper_metadata.actors
         for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags):
             visualize_dag(per_rank_dag, output_path=f"figs/rank{pp_rank}_dag")
-            print_dag_order(per_rank_dag, label=f"rank {pp_rank}")
+            # uncomment for debugging DAG construction:
+            # print_dag_order(per_rank_dag, label=f"rank {pp_rank}")
         ray.get([
             actors[pp_rank].load_dag.remote(per_rank_dag)
             for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags)

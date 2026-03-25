@@ -306,24 +306,35 @@ class PiperQwen3Model(Qwen3Model):
         attention_masks: Optional[AttentionMasksType] = None,
         positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        num_layers = len(self.layers)
-        layers_per_stage = num_layers // self.num_stages
-
-        # stage 0: embedding + first N layers
-        with torch.fx.traceback.annotate({"stage": 0}):
-            h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-
-            for i in range(layers_per_stage * (self.num_stages - 1)):
-                layer = self.layers[str(i)]
-                h = layer(h, self.rope_cache, attention_masks, positions)
-
-        # stage 1: remaining layers + norm + output
-        with torch.fx.traceback.annotate({"stage": 1}):
-            for i in range(layers_per_stage * (self.num_stages - 1), num_layers):
-                layer = self.layers[str(i)]
-                h = layer(h, self.rope_cache, attention_masks, positions)
-
-            h = self.norm(h) if self.norm is not None else h
-            output = self.output(h) if self.output is not None else h
+        
+        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        for layer in self.layers.values():
+            h = layer(h, self.rope_cache, attention_masks, positions)
+        h = self.norm(h) if self.norm is not None else h
+        output = self.output(h) if self.output is not None else h
 
         return output
+    
+    # def forward(
+    #     self,
+    #     tokens: torch.Tensor,
+    #     attention_masks: Optional[AttentionMasksType] = None,
+    #     positions: Optional[torch.Tensor] = None,
+    # ) -> torch.Tensor:
+    #     num_layers = len(self.layers)
+    #     layers_per_stage = num_layers // self.num_stages
+
+    #     for stage_id in range(self.num_stages):
+    #         with torch.fx.traceback.annotate({"stage": stage_id}):
+    #             if stage_id == 0:
+    #                 h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+
+    #             for i in range(stage_id * layers_per_stage, (stage_id + 1) * layers_per_stage):
+    #                 layer = self.layers[str(i)]
+    #                 h = layer(h, self.rope_cache, attention_masks, positions)
+
+    #             if stage_id == self.num_stages - 1:
+    #                 h = self.norm(h) if self.norm is not None else h
+    #                 output = self.output(h) if self.output is not None else h
+
+    #     return output

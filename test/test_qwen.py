@@ -41,6 +41,9 @@ from .schedule_helpers import (
 )
 
 
+# from triton.backends.amd.driver import HIPDriver
+# HIPDriver.is_active = staticmethod(lambda: False)
+
 def main(args, pg):
     batch_size = args.batch_size
 
@@ -78,20 +81,19 @@ def main(args, pg):
         naive_gradient_sync=args.naive_grad_sync,
         activation_checkpointing=False,
         bucketing=args.bucketing,
-        mode=args.mode,
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
     )
 
-    print(f"Running {args.warmup} warmup iterations (dag path)...")
+    print(f"Running {args.warmup} warmup iterations")
     for _ in range(args.warmup):
         piper_exec_dag(loss_fn)
         time.sleep(1)
 
     actors = piper_metadata.actors
 
-    print(f"Running {args.iters} timed iterations (dag path)...")
+    print(f"Running {args.iters} timed iterations")
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
@@ -105,7 +107,7 @@ def main(args, pg):
         f"rank {dp_rank} iter time= {np.mean(iter_times):.5f} ± {np.std(iter_times):.5f} s "
         f"({len(iter_times)} samples)\n"
         f"rank {dp_rank} throughput= "
-        f"{(args.batch_size * args.mbs * config.block_size) / np.mean(iter_times):.3f} tokens/s"
+        f"{(args.batch_size * args.mbs * args.seq_len) / np.mean(iter_times):.3f} tokens/s"
     )
 
     if args.tracing:
@@ -113,6 +115,7 @@ def main(args, pg):
         print(f"Running {args.trace_iters} tracing iterations...")
         for _ in range(args.trace_iters):
             piper_exec_dag(loss_fn)
+            ray.get([actor.flush_timing_events.remote() for actor in actors.values()])
             time.sleep(1)
         trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
         for rank, trace_data in trace_data_ret:
@@ -123,18 +126,10 @@ def main(args, pg):
                     f"{np.std(all_times):.3f} ms ({len(all_times)} samples)"
                 )
 
-    all_task_labels = {}
-    for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
-        all_task_labels.update(labels)
-
     os.makedirs("out", exist_ok=True)
-    timeline_filename = f"out/mixtral-dag-pp{args.pp}-dp{args.dp}-{args.schedule}-{args.mode}"
+    timeline_filename = f"out/qwen-dag-pp{args.pp}-dp{args.dp}-{args.schedule}"
     ray.timeline(timeline_filename)
-    labels_filename = timeline_filename + "-labels.json"
-    with open(labels_filename, "w") as f:
-        json.dump(all_task_labels, f)
     print(f"Ray timeline saved to: {timeline_filename}")
-    print(f"Task labels saved to: {labels_filename}")
 
 
 def parse_args():
@@ -154,7 +149,6 @@ def parse_args():
     parser.add_argument("--trace-iters", type=int, default=3)
     parser.add_argument("--tracing", action="store_true", default=False)
     parser.add_argument("--naive-grad-sync", action="store_true", default=False)
-    parser.add_argument("--mode", choices=["sequential", "naive", "overlapped"], default="sequential")
     parser.add_argument("--bucketing", action="store_true", default=False,
                         help="Split stages into per-param-bucket sub-modules for overlapped all-reduce")
     parser.add_argument("--nsight", action="store_true", default=False,
@@ -166,12 +160,12 @@ if __name__ == "__main__":
     args = parse_args()
     print(args)
     ray.init(
+        namespace="qwen",
         log_to_driver=True,
-        namespace="mixtral_dag",
         include_dashboard=False,
-        # _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
+        _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
     )
-    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="SPREAD")
+    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="PACK")
     ray.get(pg.ready(), timeout=600)
     print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)

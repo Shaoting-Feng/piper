@@ -124,6 +124,22 @@ class TaskNode:
         return f"r{self.pp_rank}_t{self.time_step}_{ttype}_mb{mb}"
 
 
+def _rebuild_task_dag(node_data):
+    """Reconstruct a TaskDAG from the flat index-based representation produced
+    by TaskDAG.__reduce__.  Must be a module-level function so pickle can find
+    it by name."""
+    nodes = [
+        TaskNode(task=d[0], pp_rank=d[1], time_step=d[2], peer_pp_rank=d[3])
+        for d in node_data
+    ]
+    for node, d in zip(nodes, node_data):
+        node.data_preds    = [nodes[j] for j in d[4]]
+        node.data_succs    = [nodes[j] for j in d[5]]
+        node.temporal_pred = nodes[d[6]] if d[6] is not None else None
+        node.temporal_succ = nodes[d[7]] if d[7] is not None else None
+    return TaskDAG(nodes=nodes)
+
+
 @dataclass
 class TaskDAG:
     """DAG of :class:`TaskNode` objects for one training iteration.
@@ -135,6 +151,23 @@ class TaskDAG:
     def roots(self) -> list[TaskNode]:
         """Return nodes that have no predecessors of any kind."""
         return [n for n in self.nodes if not n.data_preds and n.temporal_pred is None]
+
+    def __reduce__(self):
+        """Serialize as a flat list of index-referenced tuples to avoid the
+        deep recursion that cloudpickle would need when following temporal_succ
+        chains through the full node graph."""
+        idx = {id(n): i for i, n in enumerate(self.nodes)}
+        node_data = [
+            (
+                n.task, n.pp_rank, n.time_step, n.peer_pp_rank,
+                [idx[id(p)] for p in n.data_preds],
+                [idx[id(s)] for s in n.data_succs],
+                idx[id(n.temporal_pred)] if n.temporal_pred is not None else None,
+                idx[id(n.temporal_succ)] if n.temporal_succ is not None else None,
+            )
+            for n in self.nodes
+        ]
+        return (_rebuild_task_dag, (node_data,))
 
 
 class DAGEdge(NamedTuple):

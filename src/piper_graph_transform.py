@@ -251,15 +251,34 @@ def _profile_and_split_gm(gm, num_stages) -> tuple[fx.GraphModule, list[tuple[in
             else:
                 env[node.name] = attr
 
+    def _ensure_real(val):
+        """Recursively replace any meta tensors with real tensors on device."""
+        if isinstance(val, torch.Tensor) and val.device.type == "meta":
+            return _materialize_tensor(val, device)
+        elif isinstance(val, (list, tuple)):
+            return type(val)(_ensure_real(v) for v in val)
+        elif isinstance(val, dict):
+            return {k: _ensure_real(v) for k, v in val.items()}
+        return val
+
     def _fetch_arg(arg):
         if isinstance(arg, fx.Node):
             _ensure_in_env(arg)
-            return env.get(arg.name)
+            val = env.get(arg.name)
+            real_val = _ensure_real(val)
+            if real_val is not val:
+                env[arg.name] = real_val  # cache so future accesses also get real tensor
+            return real_val
         elif isinstance(arg, (list, tuple)):
             vals = [_fetch_arg(a) for a in arg]
             return type(arg)(vals)
         elif isinstance(arg, dict):
             return {k: _fetch_arg(v) for k, v in arg.items()}
+        elif isinstance(arg, torch.Tensor) and arg.device.type == "meta":
+            # Constants baked into node.args at trace time (e.g. RoPE frequency
+            # matrices) are meta tensors when the model was traced on meta device.
+            # Materialize them on the profiling device so call_function nodes don't fail.
+            return _materialize_tensor(arg, device)
         return arg
 
     def _dec_ref(node):
