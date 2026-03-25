@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 from ray.util.placement_group import (
     placement_group,
     placement_group_table,
-    remove_placement_group,
 )
 
 from src.piper_coordinator import PiperProgramCoordinator
@@ -30,7 +29,7 @@ from src.piper_compile import piper_setup
 from src.piper import piper_exec_dag
 from src.piper_utils import piper_metadata
 
-from .models.mixtral import Transformer, ModelArgs
+from .models.qwen3 import PiperQwen3Model, create_qwen3_config
 from .schedule_helpers import (
     build_1f1b_schedule,
     build_gpipe_schedule,
@@ -43,21 +42,9 @@ from .schedule_helpers import (
 
 
 def main(args, pg):
-    world_size = args.dp * args.pp
-    mbs = args.mbs
     batch_size = args.batch_size
 
-    match args.model:
-        case "tiny":
-            config = ModelArgs.from_name("tiny")
-        case "small":
-            config = ModelArgs.from_name("small")
-        case "medium":
-            config = ModelArgs.from_name("medium")
-        case "7b":
-            config = ModelArgs.from_name("Mixtral-8x7B-v0.1")
-        case "22b":
-            config = ModelArgs.from_name("Mixtral-8x22B-v0.1")
+    config = create_qwen3_config(args.model)
 
     match args.schedule:
         case "no-pp":
@@ -76,17 +63,16 @@ def main(args, pg):
     print("Schedule:")
     print_schedule(schedule)
 
-    x = torch.randint(0, config.vocab_size, (batch_size, config.block_size))
-    input_pos = torch.arange(config.block_size)
-    y = torch.randn(batch_size, config.block_size, config.vocab_size)
+    x = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
+    y = torch.randn(batch_size, args.seq_len, config.vocab_size)
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
     piper_setup(
-        Transformer,
-        model_args=(config,),
+        PiperQwen3Model,
+        model_args=(config, args.pp),
         optim_fn=torch.optim.Adam,
-        example_inputs=[x, input_pos],
+        example_inputs=[x],
         example_outputs=y,
         schedule=schedule,
         naive_gradient_sync=args.naive_grad_sync,
@@ -155,19 +141,13 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Test DAG-based piper execution with the Mixtral model"
     )
-    parser.add_argument(
-        "--model",
-        choices=["tiny", "small", "medium", "7b", "22b"],
-        default="tiny",
-    )
-    parser.add_argument(
-        "--schedule",
-        choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "zerobubble"],
-        default="1f1b",
-    )
+    parser.add_argument('--model', choices=['9M', '1B', '9B', '48B', '30B-A3B', '72B'], default='1B',
+                        help='Model configuration: 9M, 1B, 9B, 48B, 30B-A3B, or 72B (default: 1B)')
+    parser.add_argument("--schedule", choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "zerobubble"], default="1f1b",)
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--pp", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--mbs", type=int, default=4)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=5)

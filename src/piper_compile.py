@@ -34,6 +34,7 @@ def piper_setup(
     model_class,
     model_args=(),
     model_kwargs={},
+    model_dtype=torch.bfloat16,
     optim_fn=None,
     example_inputs=None,
     example_outputs=None,
@@ -43,7 +44,6 @@ def piper_setup(
     bucketing=False,
     mode="sequential",
     pg=None,
-    model_dtype=None,
     nsight=False,
 ):
     """
@@ -115,8 +115,14 @@ def piper_setup(
         model = model.to(model_dtype)
 
     num_params = sum(p.numel() for p in model.parameters())
-    param_size_mb = num_params * 4 / (1024**3)  # float32
-    print(f"Model size: {num_params/(1e6):.0f} M parameters ({param_size_mb:.2f} GB)")
+
+    if model_dtype == torch.bfloat16:
+        param_size_mb = num_params * 2 / (1024**3)  # bfloat16
+    elif model_dtype == torch.float32:
+        param_size_mb = num_params * 4 / (1024**3)  # float32
+    else:
+        raise ValueError(f"Unsupported model dtype: {model_dtype}")
+    print(f"Model size: {num_params/(1e6):.0f} M parameters ({param_size_mb:.2f} GB), dtype: {model_dtype}")
     
     compiled = torch.compile(model, backend=piper)
 

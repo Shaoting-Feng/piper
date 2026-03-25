@@ -55,9 +55,9 @@ class ModelArgs:
 
 
 transformer_configs = {
-    "tiny": dict(block_size=128, n_layer=4, n_head=2, n_local_heads=1, dim=256, intermediate_size=512, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
-    "small": dict(block_size=512, n_layer=4, n_head=4, n_local_heads=2, dim=1024, intermediate_size=2048, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
-    "medium": dict(block_size=512, n_layer=4, n_head=8, n_local_heads=4, dim=4096, intermediate_size=14336, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
+    "30M": dict(block_size=128, n_layer=4, n_head=2, n_local_heads=1, dim=256, intermediate_size=512, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
+    "280M": dict(block_size=512, n_layer=4, n_head=4, n_local_heads=2, dim=1024, intermediate_size=2048, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
+    "6B": dict(block_size=512, n_layer=4, n_head=8, n_local_heads=4, dim=4096, intermediate_size=14336, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
     "Mixtral-8x7B-v0.1": dict(block_size=1024, n_layer=2, n_head=32, n_local_heads=8, dim=4096, intermediate_size=14336, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
     # "Mixtral-8x22B-v0.1": dict(block_size=2048, n_layer=4, n_head=48, n_local_heads=8, dim=6144, intermediate_size=16384, rope_base=1000000.0, num_experts=8, num_activated_experts=2),
     "Mixtral-8x22B-v0.1": dict(block_size=1024, n_layer=4, n_head=32, n_local_heads=8, dim=2048, intermediate_size=16384, rope_base=1000000.0, num_experts=8, num_activated_experts=2),

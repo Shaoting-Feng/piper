@@ -65,7 +65,6 @@ class AllToAllSingleFunction(torch.autograd.Function):
 
         comp_stream = torch.cuda.current_stream()
         comm_finished_event = torch.cuda.Event()
-
         ctx.actor_self._start_timing(ctx.stream, "fwd_a2a")
 
         ctx.stream.wait_stream(comp_stream)
@@ -97,7 +96,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
         The backward of all_to_all_single is another all_to_all_single operation
         that reverses the communication pattern.
         """
-        logger.debug(f"Dispatch AllToAllSingleFunction backward rank={ctx.global_rank}, shape={grad_output.shape}")
+        logger.info(f"Dispatch AllToAllSingleFunction backward rank={ctx.global_rank}, shape={grad_output.shape}")
 
         if grad_output is None:
             return None, None, None
@@ -128,6 +127,12 @@ class AllToAllSingleFunction(torch.autograd.Function):
             ctx.actor_self.bwd_a2a_counter += 1
         comp_stream.wait_event(comm_finished_event)
 
+        # logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
+        if ctx.actor_self.trace_data.get('bwd_a2a') and len(ctx.actor_self.trace_data['bwd_a2a']) > 0:
+            logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
+        else:
+            logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank}")
+        
         # Return gradients: grad_output flows to grad_input, None for group
         return grad_input, grad_input, None
 
@@ -525,7 +530,10 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
                     nodes_with_metadata.append((node, stage_annotation_id))
     
     if not nodes_with_metadata:
+        logger.info("No stage nodes found in graph")
         return gm, []
+    else:
+        logger.info(f"Found stage nodes in graph")
     
     # Group nodes by stage ID for creating stage modules
     stage_code = defaultdict(list)  # stage_id -> list of all nodes for this stage
@@ -842,6 +850,7 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
         prev_stage_id = stage_annotation_id - 1
         if prev_stage_id in stage_modules:
             _, _, _, prev_stage_outputs_list, _, _, _, _, _, _ = stage_modules[prev_stage_id]
+            _, _, _, prev_stage_outputs_list, _, _, _, _, _, _ = stage_modules[prev_stage_id]
             prev_stage_outputs = set(prev_stage_outputs_list)
         
         for i, placeholder in enumerate(placeholders):
@@ -862,7 +871,6 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
 
             if isinstance(ex, torch.nn.Parameter):
                 param_idxs.append(i)
-
             # For the first stage, the input indices are everything that's not an attribute
             if stage_annotation_id == 0:
                 if 'self' not in placeholder.name:
@@ -1105,6 +1113,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
     annotation_blocks = list(blocks_by_key.values())
     
     n_a2a_ops = len(annotation_blocks)
+    logger.info(f"Found {len(annotation_blocks)} contiguous annotation blocks")
     
     # For each contiguous block, find the output node (the one used outside the annotation)
     # This is the node that should have communication applied to it
@@ -1136,6 +1145,8 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                 # This happens if the annotated block's output isn't used yet
                 last_node = max(nodes_in_block, key=lambda x: node_list.index(x[0]))
                 annotated_output_nodes.append(last_node)
+    
+    logger.info(f"Found {len(annotated_output_nodes)} annotation blocks requiring communication operations")
     
     # Create a new graph to build the transformed version
     new_graph = fx.Graph()
@@ -1190,11 +1201,16 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
             if reshape_info is not None:
                 reshape_type, reshape_shape = reshape_info
                 if reshape_type == "input":
+                    # DEBUG: Log reshape information
+                    logger.info(f"Applying input reshape {reshape_shape} to node {node.name}")
+                    if isinstance(reshape_shape, (list, tuple)) and -1 in reshape_shape:
+                        logger.warning(f"Input reshape shape contains -1: {reshape_shape}, this may cause shape inference issues")
                     # Reshape before communication
                     new_node = new_graph.call_function(
                         torch.reshape,
                         (new_node, reshape_shape)
                     )
+                    logger.debug(f"Applied input reshape {reshape_shape} for node {node.name}")
             
             # Insert communication operations after this node
             # Following the exact pattern from the comments in mixtral.py:
@@ -1224,6 +1240,11 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                 reshape_type, reshape_shape = reshape_info
                 if reshape_type == "output":
                     # Reshape after communication
+                    # DEBUG: Log reshape information
+                    logger.info(f"Applying output reshape {reshape_shape} to node {node.name}, buf_node shape inference needed")
+                    # Log the reshape shape for debugging
+                    if isinstance(reshape_shape, (list, tuple)) and -1 in reshape_shape:
+                        logger.warning(f"Reshape shape contains -1: {reshape_shape}, this may cause shape inference issues")
                     buf_node = new_graph.call_function(
                         torch.reshape,
                         (buf_node, reshape_shape)

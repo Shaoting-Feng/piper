@@ -5,18 +5,14 @@ import gc
 from torch._dynamo.backends.registry import register_backend
 from .piper_utils import _serialize_graphmodule, piper_metadata, create_logger, LOG_LEVEL
 from .piper_graph_transform import (
-    _get_dp_comm_ops,
     _split_gm_by_stages,
     _profile_and_split_gm,
-    _insert_a2a_ops,
-    _insert_p2p_ops,
     schedule_to_dag,
     insert_p2p_ops,
     insert_ar_ops,
     expand_bucket_tasks,
     expand_a2a_tasks,
     visualize_dag,
-    visualize_schedule,
     print_dag_order,
     bucket_stage,
     split_by_a2a,
@@ -50,8 +46,6 @@ def piper(gm, example_inputs, **kwargs):
         logger.info(f"No stage annotations found, profiling graph to split into {num_stages} stages")
         top_level_gm, submodules = _profile_and_split_gm(gm, num_stages)
 
-    dp_rank = int(os.environ['PIPER_DP_RANK'])
-    pp_degree = int(os.environ['PIPER_PP_DEGREE'])
     dp_degree = int(os.environ['PIPER_DP_DEGREE'])
 
     del top_level_gm

@@ -1,13 +1,21 @@
+"""
+test_dag.py – end-to-end test for the DAG-based execution path (piper_exec_dag).
+
+Run exactly like test_mixtral.py:
+
+    python -m test.test_dag [--model tiny] [--pp 2] [--dp 1] ...
+
+The main difference is that each training step is dispatched through
+piper_exec_dag() rather than the legacy piper_exec() scheduler.
+"""
 import logging
 import ray
 import torch
-import torch.nn as nn
 import argparse
 import json
 import time
 import os
 import numpy as np
-import itertools
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +27,7 @@ from ray.util.placement_group import (
 
 from src.piper_coordinator import PiperProgramCoordinator
 from src.piper_compile import piper_setup
-from src.piper_exec import piper_exec
+from src.piper import piper_exec_dag
 from src.piper_utils import piper_metadata
 
 from .models.mixtral import Transformer, ModelArgs
@@ -29,43 +37,42 @@ from .schedule_helpers import (
     print_schedule,
     NO_PP_SCHEDULE,
     INTERLEAVED_1F1B_PP2_MB4_SCHEDULE,
-    INTERLEAVED_1F1B_PP4_MB8_SCHEDULE,
-    DUALPIPEV_NOZB_MB6_SCHEDULE,
     DUALPIPEV_MB6_SCHEDULE,
+    ZEROBUBBLE_MB4_SCHEDULE,
 )
 
-def main(args, pg):
 
+def main(args, pg):
     world_size = args.dp * args.pp
     mbs = args.mbs
     batch_size = args.batch_size
 
     match args.model:
-        case 'tiny':
-            config = ModelArgs.from_name("tiny")
-        case 'small':
-            config = ModelArgs.from_name("small")
-        case 'medium':
-            config = ModelArgs.from_name("medium")
-        case '7b':
+        case "30M":
+            config = ModelArgs.from_name("30M")
+        case "280M":
+            config = ModelArgs.from_name("280M")
+        case "6B":
+            config = ModelArgs.from_name("6B")
+        case "7b":
             config = ModelArgs.from_name("Mixtral-8x7B-v0.1")
-        case '22b':
+        case "22b":
             config = ModelArgs.from_name("Mixtral-8x22B-v0.1")
 
-    schedule = None
     match args.schedule:
         case "no-pp":
             schedule = NO_PP_SCHEDULE
-        case "interleaved-1f1b":
-            schedule = INTERLEAVED_1F1B_PP2_MB4_SCHEDULE if args.pp == 2 else INTERLEAVED_1F1B_PP4_MB8_SCHEDULE
         case "1f1b":
             schedule = build_1f1b_schedule(args.mbs, args.pp)
         case "gpipe":
             schedule = build_gpipe_schedule(args.mbs, args.pp)
+        case "interleaved-1f1b":
+            schedule = INTERLEAVED_1F1B_PP2_MB4_SCHEDULE
         case "dualpipev":
             schedule = DUALPIPEV_MB6_SCHEDULE
-        case "dualpipev-nozb":
-            schedule = DUALPIPEV_NOZB_MB6_SCHEDULE
+        case "zerobubble":
+            schedule = ZEROBUBBLE_MB4_SCHEDULE
+
     print("Schedule:")
     print_schedule(schedule)
 
@@ -83,61 +90,59 @@ def main(args, pg):
         example_outputs=y,
         schedule=schedule,
         naive_gradient_sync=args.naive_grad_sync,
-        activation_checkpointing=args.activation_checkpointing,
+        activation_checkpointing=False,
+        bucketing=args.bucketing,
         mode=args.mode,
         model_dtype=torch.bfloat16,
-        zero_stage=args.zero_stage,
         pg=pg,
+        nsight=args.nsight,
     )
 
-    print(f"Running {args.warmup} warmup iterations...")
+    print(f"Running {args.warmup} warmup iterations (dag path)...")
     for _ in range(args.warmup):
-        piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync)
+        piper_exec_dag(loss_fn)
         time.sleep(1)
 
     actors = piper_metadata.actors
 
-    # ray.get([actor.enable_nccl_monitoring.remote() for actor in actors.values()])
-    # piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync) 
-    # ray.get([actor.print_nccl_overlaps.remote() for actor in actors.values()])
-    # time.sleep(1)
-
-    print(f"Running {args.iters} timed iterations...")
+    print(f"Running {args.iters} timed iterations (dag path)...")
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
-        piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync)
+        losses = piper_exec_dag(loss_fn)
         end = time.perf_counter()
         iter_times.append(end - start)
         time.sleep(1)
-    
-    dp_rank = int(os.environ['PIPER_DP_RANK'])
+
+    dp_rank = int(os.environ["PIPER_DP_RANK"])
     print(
-        f"rank {dp_rank} iter time= {np.mean(iter_times):.5f} ± {np.std(iter_times):.5f} s ({len(iter_times)} samples)\n"
-        f"rank {dp_rank} throughput= {(args.batch_size * args.mbs * config.block_size)/np.mean(iter_times):.3f} tokens/s ({len(iter_times)} samples)"
+        f"rank {dp_rank} iter time= {np.mean(iter_times):.5f} ± {np.std(iter_times):.5f} s "
+        f"({len(iter_times)} samples)\n"
+        f"rank {dp_rank} throughput= "
+        f"{(args.batch_size * args.mbs * config.block_size) / np.mean(iter_times):.3f} tokens/s"
     )
 
     if args.tracing:
-        ray.get([actor.set_tracing.remote(args.tracing) for actor in actors.values()])
-
+        ray.get([actor.set_tracing.remote(True) for actor in actors.values()])
         print(f"Running {args.trace_iters} tracing iterations...")
         for _ in range(args.trace_iters):
-            piper_exec(schedule, loss_fn, args.dp, args.naive_grad_sync)
+            piper_exec_dag(loss_fn)
             time.sleep(1)
-
         trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
         for rank, trace_data in trace_data_ret:
             for key in trace_data:
                 all_times = trace_data[key]
-                print(f"rank {rank} {key} time= {np.mean(all_times):.3f} ± {np.std(all_times):.3f} ms ({len(all_times)} samples)")
+                print(
+                    f"rank {rank} {key} time= {np.mean(all_times):.3f} ± "
+                    f"{np.std(all_times):.3f} ms ({len(all_times)} samples)"
+                )
 
-    # Collect task_id -> label mappings from all actors
     all_task_labels = {}
     for labels in ray.get([actor.get_task_labels.remote() for actor in actors.values()]):
         all_task_labels.update(labels)
 
     os.makedirs("out", exist_ok=True)
-    timeline_filename = f"out/mixtral-pp{args.pp}-dp{args.dp}-{args.schedule}-{args.mode}"
+    timeline_filename = f"out/mixtral-dag-pp{args.pp}-dp{args.dp}-{args.schedule}-{args.mode}"
     ray.timeline(timeline_filename)
     labels_filename = timeline_filename + "-labels.json"
     with open(labels_filename, "w") as f:
@@ -145,49 +150,49 @@ def main(args, pg):
     print(f"Ray timeline saved to: {timeline_filename}")
     print(f"Task labels saved to: {labels_filename}")
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run LLaMA model with pipeline parallelism')
-    parser.add_argument('--model', choices=['tiny', 'small', 'medium', '7b', '22b'], default='tiny',
-                        help='Model configuration: tiny, small, medium, 7b, or 22b (default: tiny)')
-    parser.add_argument('--schedule', choices=['gpipe', '1f1b', 'interleaved-1f1b', 'dualpipev', 'dualpipev-nozb', 'no-pp'], default='1f1b',
-                        help='Schedule type: gpipe, 1f1b, interleaved-1f1b, dualpipev, dualpipev-nozb, or no-pp (default: 1f1b)')
-    parser.add_argument('--dp', type=int, default=2,
-                        help='Number of data parallel degrees (default: 2)')
-    parser.add_argument('--pp', type=int, default=2,
-                        help='Number of pipeline parallel degrees (default: 2)')
-    parser.add_argument('--batch-size', type=int, default=16,
-                        help='Batch size (default: 16)')
-    parser.add_argument('--mbs', type=int, default=4,
-                        help='Number of microbatches (default: 4)')
-    parser.add_argument('--warmup', type=int, default=3,
-                        help='Number of warmup iterations (default: 3)')
-    parser.add_argument('--iters', type=int, default=5,
-                        help='Number of timing iterations (default: 5)')
-    parser.add_argument('--trace-iters', type=int, default=3,
-                        help='Number of trace iterations (default: 3)')
-    parser.add_argument('--tracing', action='store_true', default=False,
-                        help='Enable tracing')
-    parser.add_argument('--naive-grad-sync', action='store_true', default=False,
-                        help='Enable naive gradient sync')
-    parser.add_argument('--activation-checkpointing', action='store_true', default=False,
-                        help='Enable activation checkpointing')
-    parser.add_argument('--mode', choices=['sequential', 'naive', 'overlapped'], default='overlapped',
-                        help='Mode: sequential, naive, or overlapped (default: overlapped)')
-    parser.add_argument('--zero-stage', type=int, choices=[0, 1, 2], default=0,
-                        help='ZeRO optimization stage (0: disabled, 1: strict ZeRO-1, 2: strict ZeRO-2)')
+    parser = argparse.ArgumentParser(
+        description="Test DAG-based piper execution with the Mixtral model"
+    )
+    parser.add_argument(
+        "--model",
+        choices=["30M", "280M", "6B", "7b", "22b"],
+        default="30M",
+    )
+    parser.add_argument(
+        "--schedule",
+        choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "zerobubble"],
+        default="1f1b",
+    )
+    parser.add_argument("--dp", type=int, default=1)
+    parser.add_argument("--pp", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--mbs", type=int, default=4)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--trace-iters", type=int, default=3)
+    parser.add_argument("--tracing", action="store_true", default=False)
+    parser.add_argument("--naive-grad-sync", action="store_true", default=False)
+    parser.add_argument("--mode", choices=["sequential", "naive", "overlapped"], default="sequential")
+    parser.add_argument("--bucketing", action="store_true", default=False,
+                        help="Split stages into per-param-bucket sub-modules for overlapped all-reduce")
+    parser.add_argument("--nsight", action="store_true", default=False,
+                        help="Whether to use Nsight Systems for tracing")
     return parser.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
     print(args)
     ray.init(
         log_to_driver=True,
-        namespace="mixtral",
+        namespace="mixtral_dag",
         include_dashboard=False,
-        _temp_dir="/m-coriander/coriander/mfris/ray_tmp",
+        # _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
     )
-    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp)
-    ray.get(pg.ready(), timeout=10)  # Wait for the placement group to be ready before proceeding
+    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="SPREAD")
+    ray.get(pg.ready(), timeout=600)
     print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
     handles = piper_coordinator.run_program.remote(main, args, pg)

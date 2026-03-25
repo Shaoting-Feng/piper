@@ -5,7 +5,6 @@ import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 import gc
 import threading
-from torch._guards import CompileId
 from torch.nn import Parameter
 from torch.autograd.graph import GradientEdge, Node
 import torch.distributed as dist
@@ -23,10 +22,11 @@ from .piper_utils import (
 from .backward_utils import get_param_groups, construct_reverse_graph, _get_grad_fn_or_grad_acc
 from .piper_exec import TaskType, TaskDAG, TaskNode
 
-CLEANUP_MEMORY = False
+CLEANUP_MEMORY = True
 
 logger = create_logger("piper_actor", LOG_LEVEL)
 
+torch.autograd.set_detect_anomaly(True, check_nan=False)
 
 def _get_rank(pp_rank, dp_rank, pp_degree):
     return pp_rank + dp_rank * pp_degree
@@ -210,6 +210,7 @@ class PiperActor:
         self.tracing = False
         self.trace_events = dict()
         self.trace_data = defaultdict(list)
+        self.memory_tracing_enabled = False
         self.task_labels = dict()
 
         # DAG execution state
@@ -238,16 +239,113 @@ class PiperActor:
         # stage_id -> mb_idx -> list of (pre_detach_out, detached_input_to_next) per boundary
         self.bucket_boundaries: dict = defaultdict(dict)
 
-        # map stage id -> mb_idx -> parameter groups for backward pass
-        self.bw_param_groups = defaultdict(dict)
-        # map stage id -> mb_idx -> gradient cache for backward pass
-        self.bw_grad_cache = defaultdict(dict)
-        # map stage id -> mb_idx -> upstream gradient cache for backward pass
-        self.upstream_grad_cache = defaultdict(dict)
-
         from .piper_utils import piper_metadata
 
         piper_metadata.actor_self = self
+
+        self.profile = False
+
+        # In PiperActor.__init__, add:
+        self.pytorch_profiler = None
+        self.pytorch_profiler_output_dir = None
+        self.pytorch_profiler_iter_idx = 0
+        self.pytorch_profiler_running = False
+
+    def enable_pytorch_profiler(
+        self, 
+        enabled: bool = True, 
+        output_dir: str = "piper_profiling/chrome_traces/",
+        iter_idx: int = 0
+    ) -> None:
+        """Enable/disable PyTorch profiler on this actor."""
+        if enabled:
+            self.pytorch_profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=True,
+            )
+            # Use context manager entry - this initializes the profiler
+            self.pytorch_profiler.__enter__()
+
+            # Force Kineto to initialize by doing a dummy GPU operation
+            if torch.cuda.is_available():
+                try:
+                    dummy = torch.zeros(1, device=self.device)
+                    _ = dummy + 1
+                    torch.cuda.synchronize()
+                    self.logger.debug(f"Actor {self.global_rank}: Initialized Kineto with dummy GPU op")
+                except Exception as e:
+                    self.logger.warning(f"Actor {self.global_rank}: Failed to initialize Kineto: {e}")
+
+            self.pytorch_profiler_output_dir = output_dir
+            self.pytorch_profiler_iter_idx = iter_idx
+            self.pytorch_profiler_running = True
+            self.logger.info(f"Actor {self.global_rank}: PyTorch profiler enabled, output directory: {self.pytorch_profiler_output_dir}, iteration index: {self.pytorch_profiler_iter_idx}")
+        else:
+            if hasattr(self, 'pytorch_profiler') and hasattr(self, 'pytorch_profiler_running') and self.pytorch_profiler_running:
+                try:
+                    self.pytorch_profiler.__exit__(None, None, None)
+                except RuntimeError:
+                    pass
+                self.pytorch_profiler_running = False
+            if hasattr(self, 'pytorch_profiler'):
+                del self.pytorch_profiler
+            self.logger.info(f"Actor {self.global_rank}: PyTorch profiler disabled")
+
+
+    def stop_pytorch_profiler(self) -> str:
+        """Stop PyTorch profiler and export trace. Returns path to trace file."""
+        if not hasattr(self, 'pytorch_profiler') or self.pytorch_profiler is None:
+            self.logger.warning(f"Actor {self.global_rank}: No profiler to stop")
+            return None
+        
+        if not hasattr(self, 'pytorch_profiler_running') or not self.pytorch_profiler_running:
+            self.logger.warning(f"Actor {self.global_rank}: Profiler not in running state")
+            return None
+        
+        # Stop using context manager exit - this properly stops Kineto
+        try:
+            self.pytorch_profiler.__exit__(None, None, None)
+            self.pytorch_profiler_running = False
+        except RuntimeError as e:
+            error_msg = str(e).lower()
+            if "not running" in error_msg or "not enabled" in error_msg or "can't disable" in error_msg:
+                self.logger.warning(f"Actor {self.global_rank}: Profiler was not running: {e}")
+                self.pytorch_profiler_running = False
+                if hasattr(self, 'pytorch_profiler'):
+                    del self.pytorch_profiler
+                return None
+            else:
+                raise
+        
+        # Export trace
+        if not hasattr(self, 'pytorch_profiler_output_dir') or self.pytorch_profiler_output_dir is None:
+            self.logger.warning(f"Actor {self.global_rank}: No profiler output dir set")
+            if hasattr(self, 'pytorch_profiler'):
+                del self.pytorch_profiler
+            return None
+        
+        try:
+            os.makedirs(self.pytorch_profiler_output_dir, exist_ok=True)
+            trace_path = os.path.join(
+                self.pytorch_profiler_output_dir,
+                f"actor_{self.global_rank}_iter_{self.pytorch_profiler_iter_idx}.pt.trace.json"
+            )
+            self.pytorch_profiler.export_chrome_trace(trace_path)
+            
+            self.logger.info(f"Actor {self.global_rank}: PyTorch profiler trace saved to {trace_path}")
+        except Exception as e:
+            self.logger.error(f"Actor {self.global_rank}: Failed to export profiler trace: {e}")
+            trace_path = None
+        finally:
+            # Cleanup
+            if hasattr(self, 'pytorch_profiler'):
+                del self.pytorch_profiler
+        
+        return trace_path
 
     def _label_task(self, label: str):
         task_id = ray.get_runtime_context().get_task_id()
@@ -279,12 +377,50 @@ class PiperActor:
 
     def stop_mem_tracing(self) -> None:
         torch.cuda.memory._dump_snapshot(
-            f"actor{self.global_rank}_memory_snapshot_mb4_gpipe.pickle"
+            f"/m-coriander/coriander/shubham/moe-scheduling/piper_profiling/actor{self.global_rank}_memory_snapshot_mb4_gpipe.pickle"
         )
         self.logger.info(
             f"Saved memory snapshot to actor{self.global_rank}_memory_snapshot_mb4_gpipe.pickle"
         )
         torch.cuda.memory._record_memory_history(enabled=None)
+    
+    def enable_profiling(self, enabled: bool = True) -> None:
+        """Enable/disable per-task profiling (Chrome traces)."""
+        self.profile = enabled
+        self.logger.info(
+            f"Actor {self.global_rank}: Profiling {'enabled' if enabled else 'disabled'}"
+        )
+
+    def enable_memory_tracing(self, enabled: bool = True) -> None:
+        """Enable/disable memory tracing."""
+        self.memory_tracing_enabled = enabled
+        if enabled:
+            torch.cuda.memory._record_memory_history()
+            self.logger.info(f"Actor {self.global_rank}: Memory tracing enabled")
+        else:
+            if hasattr(self, 'memory_tracing_enabled') and self.memory_tracing_enabled:
+                # Dump snapshot before disabling
+                snapshot_path = f"actor{self.global_rank}_iter_memory.pickle"
+                os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+                torch.cuda.memory._dump_snapshot(snapshot_path)
+                self.logger.info(f"Saved memory snapshot to {snapshot_path}")
+            torch.cuda.memory._record_memory_history(enabled=None)
+            self.memory_tracing_enabled = False
+            self.logger.info(f"Actor {self.global_rank}: Memory tracing disabled")
+
+    def dump_memory_snapshot(self, filename: str = None) -> str:
+        """Dump current memory snapshot. Returns snapshot path."""
+        if not (hasattr(self, 'memory_tracing_enabled') and self.memory_tracing_enabled):
+            self.logger.warning("Memory tracing not enabled, cannot dump snapshot")
+            return None
+        
+        if filename is None:
+            filename = f"actor{self.global_rank}_iter_memory.pickle"
+        
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        torch.cuda.memory._dump_snapshot(filename)
+        self.logger.info(f"Saved memory snapshot to {filename}")
+        return filename
 
     def reset_peak_memory(self):
         torch.cuda.reset_peak_memory_stats()
@@ -404,6 +540,264 @@ class PiperActor:
         dist.destroy_process_group()
 
 
+    @staticmethod
+    def _replace_meta_constants(gm, device):
+        """Replace any constants on meta device with tensors on the actual device."""
+        import torch.fx as fx
+        from .piper_utils import create_logger, LOG_LEVEL
+        from torch._subclasses.fake_tensor import FakeTensor
+        logger = create_logger("piper_actor", LOG_LEVEL)
+        
+        replaced_count = 0
+        params_count = 0
+        buffers_count = 0
+        get_attr_count = 0
+        constants_count = 0
+        attrs_count = 0
+        node_args_count = 0
+        node_meta_count = 0
+        submodule_count = 0
+        
+        def is_meta_or_fake(t):
+            """Check if tensor is on meta device or is a FakeTensor."""
+            if isinstance(t, FakeTensor):
+                return True
+            if isinstance(t, torch.Tensor):
+                return t.device.type == 'meta'
+            return False
+        
+        def replace_meta_tensor(t):
+            if is_meta_or_fake(t):
+                return torch.empty_like(t, device=device)
+            return t
+        
+        def replace_in_module(module, module_name=""):
+            """Recursively replace meta tensors in a module and all its submodules."""
+            nonlocal replaced_count, params_count, buffers_count, get_attr_count, constants_count, attrs_count, node_args_count, node_meta_count, submodule_count
+            
+            # replace all parameters that are on meta device or FakeTensor
+            for name, param in module.named_parameters(recurse=False):
+                if is_meta_or_fake(param):
+                    full_name = f"{module_name}.{name}" if module_name else name
+                    logger.info(f"Replacing parameter '{full_name}' from meta/fake to {device} (shape={param.shape}, dtype={param.dtype}, requires_grad={param.requires_grad})")
+                    new_param = torch.empty_like(param, device=device)
+                    new_param.requires_grad_(param.requires_grad)
+                    setattr(module, name, torch.nn.Parameter(new_param, requires_grad=param.requires_grad))
+                    params_count += 1
+                    replaced_count += 1
+            
+            # replace all buffers that are on meta device or FakeTensor
+            for name, buffer in module.named_buffers(recurse=False):
+                if is_meta_or_fake(buffer):
+                    full_name = f"{module_name}.{name}" if module_name else name
+                    logger.info(f"Replacing buffer '{full_name}' from meta/fake to {device} (shape={buffer.shape}, dtype={buffer.dtype})")
+                    new_buffer = torch.empty_like(buffer, device=device)
+                    setattr(module, name, new_buffer)
+                    buffers_count += 1
+                    replaced_count += 1
+            
+            # check gm 
+            if isinstance(module, fx.GraphModule):
+                # replace in get_attr nodes
+                for node in module.graph.nodes:
+                    if node.op == 'get_attr':
+                        try:
+                            attr_value = getattr(module, node.target)
+                            if is_meta_or_fake(attr_value):
+                                full_name = f"{module_name}.{node.target}" if module_name else node.target
+                                logger.info(f"Replacing get_attr '{full_name}' from meta/fake to {device} (shape={attr_value.shape}, dtype={attr_value.dtype})")
+                                new_tensor = torch.empty_like(attr_value, device=device)
+                                setattr(module, node.target, new_tensor)
+                                get_attr_count += 1
+                                replaced_count += 1
+                        except AttributeError:
+                            pass
+                    
+                    # check node.meta for tensor values
+                    if hasattr(node, 'meta') and isinstance(node.meta, dict):
+                        for key, value in node.meta.items():
+                            if is_meta_or_fake(value):
+                                full_name = f"{module_name}.{node.name}.meta['{key}']" if module_name else f"{node.name}.meta['{key}']"
+                                logger.info(f"Replacing node.meta['{key}'] for node '{node.name}' from meta/fake to {device} (shape={value.shape}, dtype={value.dtype})")
+                                node.meta[key] = torch.empty_like(value, device=device)
+                                node_meta_count += 1
+                                replaced_count += 1
+                
+                # replace in constants dict if it exists
+                if hasattr(module, '_constants'):
+                    for key, value in module._constants.items():
+                        if is_meta_or_fake(value):
+                            full_name = f"{module_name}._constants['{key}']" if module_name else f"_constants['{key}']"
+                            logger.info(f"Replacing constant '{full_name}' from meta/fake to {device} (shape={value.shape}, dtype={value.dtype})")
+                            module._constants[key] = torch.empty_like(value, device=device)
+                            constants_count += 1
+                            replaced_count += 1
+                
+                # traverse all nodes and replace meta tensors in args/kwargs
+                for node in module.graph.nodes:
+                    # replace in args
+                    new_args = []
+                    for arg in node.args:
+                        if is_meta_or_fake(arg):
+                            full_name = f"{module_name}.{node.name}" if module_name else node.name
+                            logger.info(f"Replacing meta/fake tensor in node '{full_name}' args (shape={arg.shape}, dtype={arg.dtype})")
+                            new_args.append(torch.empty_like(arg, device=device))
+                            node_args_count += 1
+                            replaced_count += 1
+                        elif isinstance(arg, torch.device) and arg.type == 'meta':
+                            # replace meta device objects with the actual device
+                            full_name = f"{module_name}.{node.name}" if module_name else node.name
+                            logger.info(f"Replacing meta device object in node '{full_name}' args with {device}")
+                            new_args.append(torch.device(device))
+                            node_args_count += 1
+                            replaced_count += 1
+                        elif isinstance(arg, (list, tuple)):
+                            new_args.append(type(arg)(replace_meta_tensor(x) for x in arg))
+                        else:
+                            new_args.append(arg)
+                    node.args = tuple(new_args)
+                    
+                    # replace in kwargs
+                    new_kwargs = {}
+                    for key, value in node.kwargs.items():
+                        if is_meta_or_fake(value):
+                            full_name = f"{module_name}.{node.name}" if module_name else node.name
+                            logger.info(f"Replacing meta/fake tensor in node '{full_name}' kwargs['{key}'] (shape={value.shape}, dtype={value.dtype})")
+                            new_kwargs[key] = torch.empty_like(value, device=device)
+                            node_args_count += 1
+                            replaced_count += 1
+                        elif isinstance(value, torch.device) and value.type == 'meta':
+                            # replace meta device objects with the actual device
+                            full_name = f"{module_name}.{node.name}" if module_name else node.name
+                            logger.info(f"Replacing meta device object in node '{full_name}' kwargs['{key}'] with {device}")
+                            new_kwargs[key] = torch.device(device)
+                            node_args_count += 1
+                            replaced_count += 1
+                        elif isinstance(value, (list, tuple)):
+                            new_kwargs[key] = type(value)(replace_meta_tensor(x) for x in value)
+                        else:
+                            new_kwargs[key] = value
+                    node.kwargs = new_kwargs
+                
+                # recompile the GraphModule after modifications
+                module.recompile()
+            
+            # recursively process all submodules
+            for name, submodule in module.named_children():
+                submodule_name = f"{module_name}.{name}" if module_name else name
+                replace_in_module(submodule, submodule_name)
+                submodule_count += 1
+        
+        replace_in_module(gm)
+        
+        if replaced_count > 0:
+            logger.info(
+                f"_replace_meta_constants: Replaced {replaced_count} meta device tensors "
+                f"(params: {params_count}, buffers: {buffers_count}, get_attr: {get_attr_count}, "
+                f"constants: {constants_count}, attrs: {attrs_count}, node_args: {node_args_count}, "
+                f"node_meta: {node_meta_count}, checked {submodule_count} submodules)"
+            )
+        else:
+            logger.warning(f"_replace_meta_constants: No meta device tensors found to replace! (checked {submodule_count} submodules)")
+        
+        return gm
+
+    def _load_stage_kernels(self):
+        try:
+            import torchtitan.models.common.moe.kernels
+            import torchtitan.models.common.moe.utils
+            import torch._higher_order_ops.triton_kernel_wrap
+
+            # Trigger module initialization by accessing a function
+            from torchtitan.models.common.moe.kernels import generate_permute_indices
+            from torchtitan.models.common.moe.kernels import fill_indices_wrapper
+            self.logger.info(f"Actor {self.global_rank} imported and initialized Triton kernel modules")
+        except ImportError as e:
+            self.logger.warning(
+                f"Actor {self.global_rank} failed to import Triton kernel modules: {e}. "
+                f"This may cause issues with Triton kernels in the graph."
+            )
+
+        # HACK: manually register Triton kernel in the side table
+        # the graph expects kernel_idx=0, so we need to register it at that index
+        self.logger.info(f"Manually registering Triton kernel at index 0 on actor {self.global_rank}...")
+        try:
+            # Import the kernel wrapper
+            from torchtitan.models.common.moe.kernels import fill_indices_wrapper
+            
+            # create a dummy function that uses the Triton kernel
+            # This needs to be compiled with torch.compile to register the kernel
+            def dummy_kernel_user(tokens, starts, offsets):
+                return fill_indices_wrapper(
+                    tokens, starts, offsets,
+                    experts_per_rank=1, num_ranks=1, max_len=8, block_size=128
+                )
+            
+            # Compile the function to trigger kernel registration
+            device_idx = int(self.device.split(":")[1]) if ":" in self.device else 0
+            with torch.cuda.device(device_idx):
+                # Create dummy inputs
+                dummy_tokens = torch.zeros(8, dtype=torch.int32, device=self.device)
+                dummy_start = torch.zeros(8, dtype=torch.int64, device=self.device)
+                dummy_offsets = torch.zeros(1, dtype=torch.int64, device=self.device)
+                
+                # Compile and run to register the kernel
+                compiled_dummy = torch.compile(dummy_kernel_user, mode="reduce-overhead")
+                _ = compiled_dummy(dummy_tokens, dummy_start, dummy_offsets)
+            
+            # now try to access the kernel side table and register at index 0
+            from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+            
+            # move the kernel to index 0
+            if hasattr(kernel_side_table, 'id_to_kernel') and hasattr(kernel_side_table, 'constant_args'):
+                registered_kernels = list(kernel_side_table.id_to_kernel.items())
+                registered_constants = list(kernel_side_table.constant_args.items())
+                
+                if len(registered_kernels) > 0:
+                    # get the most recently registered kernel (highest index)
+                    max_idx, kernel = max(registered_kernels, key=lambda x: x[0])
+                    # manually register it at index 0
+                    kernel_side_table.id_to_kernel[0] = kernel
+                    
+                    # register constant args if available
+                    # the graph might expect constant_args_idx=1, so we need to check what was registered
+                    if len(registered_constants) > 0:
+                        # get the constant args that correspond to our kernel
+                        max_const_idx, const_args = max(registered_constants, key=lambda x: x[0])
+                        for idx in range(20):
+                            kernel_side_table.constant_args[idx] = const_args
+                        self.logger.info(
+                            f"Actor {self.global_rank} manually registered kernel at index 0 "
+                            f"(copied from index {max_idx}, total kernels: {len(registered_kernels)}) "
+                            f"and constant_args at index 1 (copied from index {max_const_idx}, total constants: {len(registered_constants)})"
+                        )
+                    else:
+                        # If no constant args were registered, we might need to create empty ones
+                        # But let's see if the graph actually needs them
+                        self.logger.info(
+                            f"Actor {self.global_rank} manually registered kernel at index 0 "
+                            f"(copied from index {max_idx}, total kernels: {len(registered_kernels)}) "
+                            f"but no constant_args found"
+                        )
+                else:
+                    self.logger.warning(
+                        f"Actor {self.global_rank} no kernels found in side table after compilation"
+                    )
+            else:
+                # try accessing via different attribute names
+                attrs = [attr for attr in dir(kernel_side_table) if not attr.startswith('_')]
+                self.logger.warning(
+                    f"Actor {self.global_rank} kernel_side_table doesn't have expected attributes. "
+                    f"Available attributes: {attrs}"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"Actor {self.global_rank} failed to manually register kernel: {e}. "
+                f"This may cause Triton kernel errors."
+            )
+            import traceback
+            self.logger.info(f"Traceback: {traceback.format_exc()}")
+
     def _load_stage(
         self,
         stage_id: int,
@@ -434,11 +828,14 @@ class PiperActor:
         g = torch.Generator(device=self.device)
         g.manual_seed(1000 * self.global_rank + stage_id)
 
+        self._load_stage_kernels()
+
         first_gm = None
         last_gm = None
 
         for b_idx, bd in enumerate(modules_data):
             gm = _deserialize_graphmodule(bd["gm_data"])
+            gm = self._replace_meta_constants(gm, self.device)
             if b_idx == 0:
                 first_gm = gm
             last_gm = gm
