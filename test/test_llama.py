@@ -182,6 +182,7 @@ if __name__ == "__main__":
         namespace="llama",
         log_to_driver=True,
         include_dashboard=False,
+        _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
     )
     pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="PACK")
     ray.get(pg.ready(), timeout=600)

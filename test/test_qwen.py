@@ -37,6 +37,7 @@ from .schedule_helpers import (
     NO_PP_SCHEDULE,
     INTERLEAVED_1F1B_PP2_MB4_SCHEDULE,
     DUALPIPEV_MB6_SCHEDULE,
+    DUALPIPEV_SEQUENTIAL_MB6_SCHEDULE,
     ZEROBUBBLE_MB4_SCHEDULE,
 )
 
@@ -52,16 +53,25 @@ def main(args, pg):
     match args.schedule:
         case "no-pp":
             schedule = NO_PP_SCHEDULE
+            num_stages = 1
         case "1f1b":
             schedule = build_1f1b_schedule(args.mbs, args.pp)
+            num_stages = args.pp
         case "gpipe":
             schedule = build_gpipe_schedule(args.mbs, args.pp)
+            num_stages = args.pp
         case "interleaved-1f1b":
             schedule = INTERLEAVED_1F1B_PP2_MB4_SCHEDULE
+            num_stages = args.pp * 2
         case "dualpipev":
             schedule = DUALPIPEV_MB6_SCHEDULE
+            num_stages = args.pp * 2
+        case "dualpipev-seq":
+            schedule = DUALPIPEV_SEQUENTIAL_MB6_SCHEDULE
+            num_stages = args.pp * 2    
         case "zerobubble":
             schedule = ZEROBUBBLE_MB4_SCHEDULE
+            num_stages = args.pp
 
     print("Schedule:")
     print_schedule(schedule)
@@ -73,7 +83,7 @@ def main(args, pg):
 
     piper_setup(
         PiperQwen3Model,
-        model_args=(config, args.pp),
+        model_args=(config, num_stages),
         optim_fn=torch.optim.Adam,
         example_inputs=[x],
         example_outputs=y,
@@ -136,9 +146,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Test DAG-based piper execution with the Mixtral model"
     )
-    parser.add_argument('--model', choices=['9M', '1B', '9B', '48B', '30B-A3B', '72B'], default='1B',
-                        help='Model configuration: 9M, 1B, 9B, 48B, 30B-A3B, or 72B (default: 1B)')
-    parser.add_argument("--schedule", choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "zerobubble"], default="1f1b",)
+    parser.add_argument('--model', choices=['9M', '1B', '9B', '48B', '30B-A3B', '30-A3B-half', '72B'], default='1B',
+                        help='Model configuration: 9M, 1B, 9B, 48B, 30B-A3B, 30-A3B-half, or 72B (default: 1B)')
+    parser.add_argument("--schedule", choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "dualpipev-seq", "zerobubble"], default="1f1b",)
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--pp", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)

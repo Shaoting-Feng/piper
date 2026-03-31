@@ -5,8 +5,8 @@ Run with:
     python3 -m test.print_schedules
 """
 
-from .schedule_helpers import INTERLEAVED_1F1B_PP2_MB4_SCHEDULE, build_1f1b_schedule, print_schedule
-from src.piper_exec import TaskType
+from .schedule_helpers import DUALPIPEV_SEQUENTIAL_MB6_SCHEDULE, INTERLEAVED_1F1B_PP2_MB4_SCHEDULE, build_1f1b_schedule, print_schedule
+from src.piper_exec import DAGEdge, TaskType, _validate_schedule
 from src.piper_graph_transform import schedule_to_dag, insert_p2p_ops, visualize_schedule, visualize_dag
 
 
@@ -40,13 +40,13 @@ def print_dag(dag, title: str) -> None:
     for node in sorted(dag.nodes, key=lambda n: (n.pp_rank, n.time_step)):
         data_preds  = [_node_str(p) for p in node.data_preds]
         data_succs  = [_node_str(s) for s in node.data_succs]
-        temp_pred   = _node_str(node.temporal_pred)  if node.temporal_pred  else "—"
-        temp_succ   = _node_str(node.temporal_succ)  if node.temporal_succ  else "—"
+        temp_preds  = [_node_str(p) for p in node.temporal_preds]
+        temp_succs  = [_node_str(s) for s in node.temporal_succs]
         print(f"  {_node_str(node)}")
-        print(f"    data_preds : {data_preds or '—'}")
-        print(f"    data_succs : {data_succs or '—'}")
-        print(f"    temp_pred  : {temp_pred}")
-        print(f"    temp_succ  : {temp_succ}")
+        print(f"    data_preds  : {data_preds or '—'}")
+        print(f"    data_succs  : {data_succs or '—'}")
+        print(f"    temp_preds  : {temp_preds or '—'}")
+        print(f"    temp_succs  : {temp_succs or '—'}")
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +57,9 @@ print("\n" + "="*60)
 print("  STEP 1 — 1F1B Schedule2D  (PP=2, MB=2)")
 print("="*60)
 schedule = build_1f1b_schedule(n_mbs=2, n_stages=2)
-schedule = INTERLEAVED_1F1B_PP2_MB4_SCHEDULE
+schedule = DUALPIPEV_SEQUENTIAL_MB6_SCHEDULE
 print_schedule(schedule)
+_validate_schedule(schedule.grid, dag_edges=(DAGEdge(0, 1), DAGEdge(1, 2), DAGEdge(2, 3)), num_mbs=6)
 
 # ---------------------------------------------------------------------------
 # Step 2: Convert to TaskDAG (with cross-rank data edges)
@@ -69,7 +70,7 @@ print_dag(dag, "STEP 2 — TaskDAG (cross-rank data edges present)")
 
 # Summarise edge counts
 n_data  = sum(len(n.data_succs) for n in dag.nodes)
-n_temp  = sum(1 for n in dag.nodes if n.temporal_succ is not None)
+n_temp  = sum(len(n.temporal_succs) for n in dag.nodes)
 n_cross = sum(
     1 for n in dag.nodes for s in n.data_succs if n.pp_rank != s.pp_rank
 )
@@ -88,7 +89,7 @@ for rank, rank_dag in enumerate(rank_dags):
     visualize_dag(rank_dag, f"rank{rank}_dag")
     print_dag(rank_dag, f"STEP 3 — Per-rank DAG for PP rank {rank}")
     n_data = sum(len(n.data_succs) for n in rank_dag.nodes)
-    n_temp = sum(1 for n in rank_dag.nodes if n.temporal_succ is not None)
+    n_temp = sum(len(n.temporal_succs) for n in rank_dag.nodes)
     print(f"\n  nodes={len(rank_dag.nodes)}  data_edges={n_data}  temporal_edges={n_temp}")
 
 print()

@@ -487,10 +487,10 @@ class Transformer(nn.Module):
         with torch.fx.traceback.annotate({"stage": 0}):
             h = self.tok_embeddings(tokens)
             start_pos = 0
-            for layer in self.layers[:self.n_layers//2+2]:
+            for layer in self.layers[:self.n_layers//2]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
         with torch.fx.traceback.annotate({"stage": 1}):
-            for layer in self.layers[self.n_layers//2+2:]:
+            for layer in self.layers[self.n_layers//2:]:
                 h = layer(h, start_pos, self.freqs_cis, self.mask)
             h = self.norm(h)
             output = self.output(h).float()

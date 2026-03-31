@@ -43,13 +43,9 @@ class Task(NamedTuple):
     pp_rank: int
     batches: list[BatchMeta]
     type: TaskType
-    bucket_id: int = 0
-    a2a_tensor_idx: Optional[int] = None
 
     def __repr__(self) -> str:
-        bucket_str = f", bucket_id={self.bucket_id}" if self.bucket_id else ""
-        a2a_str = f", a2a_tensor_idx={self.a2a_tensor_idx}" if self.a2a_tensor_idx is not None else ""
-        return f"Task(pp_rank={self.pp_rank}, batches={[(batch.stage_id, batch.mb_idx) for batch in self.batches]}, type={self.type}{bucket_str}{a2a_str})"
+        return f"Task(pp_rank={self.pp_rank}, batches={[(batch.stage_id, batch.mb_idx) for batch in self.batches]}, type={self.type})"
 
 
 @dataclass
@@ -99,10 +95,11 @@ class TaskNode:
       the same microbatch index sits between them in the time-step ordering.  These
       edges may cross rows (actors).
 
-    * **Temporal** (``temporal_pred`` / ``temporal_succ``): drawn between
-      consecutive non-None tasks within the same row, but **only** when those
-      tasks do not already share a data-dependency edge.  Each task has at most
-      one temporal predecessor and one successor.
+    * **Temporal** (``temporal_preds`` / ``temporal_succs``): drawn between
+      consecutive non-None tasks within the same row.  Normally each task has
+      at most one temporal predecessor and one successor (a linear chain), but
+      :func:`overlap_a2a_tasks` can introduce forks and joins so the fields
+      are lists, mirroring ``data_preds`` / ``data_succs``.
     """
     task: Task
     pp_rank: int    # row index in Schedule2D.grid
@@ -111,11 +108,15 @@ class TaskNode:
     # Filled in by schedule_to_dag()
     data_preds: list["TaskNode"] = field(default_factory=list)
     data_succs: list["TaskNode"] = field(default_factory=list)
-    temporal_pred: Optional["TaskNode"] = None
-    temporal_succ: Optional["TaskNode"] = None
+    temporal_preds: list["TaskNode"] = field(default_factory=list)
+    temporal_succs: list["TaskNode"] = field(default_factory=list)
 
     # For SEND/RECV nodes: the peer pipeline rank
     peer_pp_rank: Optional[int] = None
+
+    # Set by graph-transform passes (not meaningful for raw schedule tasks)
+    bucket_id: int = 0
+    a2a_tensor_idx: Optional[int] = None
 
     def node_id(self) -> str:
         """Unique string identifier for use as a graph node key."""
@@ -129,14 +130,15 @@ def _rebuild_task_dag(node_data):
     by TaskDAG.__reduce__.  Must be a module-level function so pickle can find
     it by name."""
     nodes = [
-        TaskNode(task=d[0], pp_rank=d[1], time_step=d[2], peer_pp_rank=d[3])
+        TaskNode(task=d[0], pp_rank=d[1], time_step=d[2], peer_pp_rank=d[3],
+                 bucket_id=d[8], a2a_tensor_idx=d[9])
         for d in node_data
     ]
     for node, d in zip(nodes, node_data):
-        node.data_preds    = [nodes[j] for j in d[4]]
-        node.data_succs    = [nodes[j] for j in d[5]]
-        node.temporal_pred = nodes[d[6]] if d[6] is not None else None
-        node.temporal_succ = nodes[d[7]] if d[7] is not None else None
+        node.data_preds     = [nodes[j] for j in d[4]]
+        node.data_succs     = [nodes[j] for j in d[5]]
+        node.temporal_preds = [nodes[j] for j in d[6]]
+        node.temporal_succs = [nodes[j] for j in d[7]]
     return TaskDAG(nodes=nodes)
 
 
@@ -150,7 +152,7 @@ class TaskDAG:
 
     def roots(self) -> list[TaskNode]:
         """Return nodes that have no predecessors of any kind."""
-        return [n for n in self.nodes if not n.data_preds and n.temporal_pred is None]
+        return [n for n in self.nodes if not n.data_preds and not n.temporal_preds]
 
     def __reduce__(self):
         """Serialize as a flat list of index-referenced tuples to avoid the
@@ -162,8 +164,9 @@ class TaskDAG:
                 n.task, n.pp_rank, n.time_step, n.peer_pp_rank,
                 [idx[id(p)] for p in n.data_preds],
                 [idx[id(s)] for s in n.data_succs],
-                idx[id(n.temporal_pred)] if n.temporal_pred is not None else None,
-                idx[id(n.temporal_succ)] if n.temporal_succ is not None else None,
+                [idx[id(p)] for p in n.temporal_preds],
+                [idx[id(s)] for s in n.temporal_succs],
+                n.bucket_id, n.a2a_tensor_idx,
             )
             for n in self.nodes
         ]

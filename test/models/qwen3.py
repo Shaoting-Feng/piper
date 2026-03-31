@@ -14,7 +14,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             return Qwen3ModelArgs(
                 vocab_size=2048,
                 dim=256,
-                n_layers=8,
+                n_layers=4,
                 n_heads=8,
                 n_kv_heads=4,
                 head_dim=32,
@@ -169,6 +169,33 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
                     load_balance_coeff=None,
                 ),
             )
+        case '30B-A3B-half':
+            return Qwen3ModelArgs(
+                vocab_size=151936,
+                dim=2048,
+                n_layers=24,
+                n_heads=32,
+                n_kv_heads=4,
+                head_dim=128,
+                hidden_dim=6144,
+                norm_eps=1e-6,
+                qk_norm=True,
+                max_seq_len=262144,
+                rope_theta=1000000.0,
+                enable_weight_tying=False,
+                moe_enabled=True,
+                moe_inter_dim=768,
+                moe_args=MoEArgs(
+                    num_experts=64,
+                    num_shared_experts=0,
+                    top_k=8,
+                    score_func="softmax",
+                    route_norm=True,
+                    route_scale=1.0,
+                    score_before_experts=False,
+                    load_balance_coeff=None,
+                ),
+            )
         case '72B':
             return Qwen3ModelArgs(
                 vocab_size=152064,
@@ -300,41 +327,41 @@ class PiperQwen3Model(Qwen3Model):
         for layer_id in range(config.n_layers):
             self.layers[str(layer_id)] = AnnotatedQwen3TransformerBlock(layer_id, config)
 
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        attention_masks: Optional[AttentionMasksType] = None,
-        positions: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        for layer in self.layers.values():
-            h = layer(h, self.rope_cache, attention_masks, positions)
-        h = self.norm(h) if self.norm is not None else h
-        output = self.output(h) if self.output is not None else h
-
-        return output
-    
     # def forward(
     #     self,
     #     tokens: torch.Tensor,
     #     attention_masks: Optional[AttentionMasksType] = None,
     #     positions: Optional[torch.Tensor] = None,
     # ) -> torch.Tensor:
-    #     num_layers = len(self.layers)
-    #     layers_per_stage = num_layers // self.num_stages
-
-    #     for stage_id in range(self.num_stages):
-    #         with torch.fx.traceback.annotate({"stage": stage_id}):
-    #             if stage_id == 0:
-    #                 h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-
-    #             for i in range(stage_id * layers_per_stage, (stage_id + 1) * layers_per_stage):
-    #                 layer = self.layers[str(i)]
-    #                 h = layer(h, self.rope_cache, attention_masks, positions)
-
-    #             if stage_id == self.num_stages - 1:
-    #                 h = self.norm(h) if self.norm is not None else h
-    #                 output = self.output(h) if self.output is not None else h
+        
+    #     h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+    #     for layer in self.layers.values():
+    #         h = layer(h, self.rope_cache, attention_masks, positions)
+    #     h = self.norm(h) if self.norm is not None else h
+    #     output = self.output(h) if self.output is not None else h
 
     #     return output
+    
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        attention_masks: Optional[AttentionMasksType] = None,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_layers = len(self.layers)
+        layers_per_stage = num_layers // self.num_stages
+
+        for stage_id in range(self.num_stages):
+            with torch.fx.traceback.annotate({"stage": stage_id}):
+                if stage_id == 0:
+                    h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+
+                for i in range(stage_id * layers_per_stage, (stage_id + 1) * layers_per_stage):
+                    layer = self.layers[str(i)]
+                    h = layer(h, self.rope_cache, attention_masks, positions)
+
+                if stage_id == self.num_stages - 1:
+                    h = self.norm(h) if self.norm is not None else h
+                    output = self.output(h) if self.output is not None else h
+
+        return output

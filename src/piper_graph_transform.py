@@ -4,7 +4,7 @@ import ray
 import torch
 import torch.fx as fx
 import torch.distributed as dist
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
 import operator
@@ -96,7 +96,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
         The backward of all_to_all_single is another all_to_all_single operation
         that reverses the communication pattern.
         """
-        logger.info(f"Dispatch AllToAllSingleFunction backward rank={ctx.global_rank}, shape={grad_output.shape}")
+        logger.debug(f"Dispatch AllToAllSingleFunction backward rank={ctx.global_rank}, shape={grad_output.shape}")
 
         if grad_output is None:
             return None, None, None
@@ -127,11 +127,7 @@ class AllToAllSingleFunction(torch.autograd.Function):
             ctx.actor_self.bwd_a2a_counter += 1
         comp_stream.wait_event(comm_finished_event)
 
-        # logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
-        if ctx.actor_self.trace_data.get('bwd_a2a') and len(ctx.actor_self.trace_data['bwd_a2a']) > 0:
-            logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank} time={ctx.actor_self.trace_data['bwd_a2a'][-1]:.2f} ms")
-        else:
-            logger.info(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank}")
+        logger.debug(f"Completed AllToAllSingleFunction backward rank={ctx.global_rank}")
         
         # Return gradients: grad_output flows to grad_input, None for group
         return grad_input, grad_input, None
@@ -549,10 +545,10 @@ def _split_gm_by_stages(gm) -> tuple[fx.GraphModule, list[tuple[int, fx.GraphMod
                     nodes_with_metadata.append((node, stage_annotation_id))
     
     if not nodes_with_metadata:
-        logger.info("No stage nodes found in graph")
+        logger.debug("No stage nodes found in graph")
         return gm, []
     else:
-        logger.info(f"Found stage nodes in graph")
+        logger.debug(f"Found stage nodes in graph")
     
     # Group nodes by stage ID for creating stage modules
     stage_code = defaultdict(list)  # stage_id -> list of all nodes for this stage
@@ -1132,7 +1128,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
     annotation_blocks = list(blocks_by_key.values())
     
     n_a2a_ops = len(annotation_blocks)
-    logger.info(f"Found {len(annotation_blocks)} contiguous annotation blocks")
+    logger.debug(f"Found {len(annotation_blocks)} contiguous annotation blocks")
     
     # For each contiguous block, find the output node (the one used outside the annotation)
     # This is the node that should have communication applied to it
@@ -1165,7 +1161,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                 last_node = max(nodes_in_block, key=lambda x: node_list.index(x[0]))
                 annotated_output_nodes.append(last_node)
     
-    logger.info(f"Found {len(annotated_output_nodes)} annotation blocks requiring communication operations")
+    logger.debug(f"Found {len(annotated_output_nodes)} annotation blocks requiring communication operations")
     
     # Create a new graph to build the transformed version
     new_graph = fx.Graph()
@@ -1221,7 +1217,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                 reshape_type, reshape_shape = reshape_info
                 if reshape_type == "input":
                     # DEBUG: Log reshape information
-                    logger.info(f"Applying input reshape {reshape_shape} to node {node.name}")
+                    logger.debug(f"Applying input reshape {reshape_shape} to node {node.name}")
                     if isinstance(reshape_shape, (list, tuple)) and -1 in reshape_shape:
                         logger.warning(f"Input reshape shape contains -1: {reshape_shape}, this may cause shape inference issues")
                     # Reshape before communication
@@ -1229,7 +1225,6 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                         torch.reshape,
                         (new_node, reshape_shape)
                     )
-                    logger.debug(f"Applied input reshape {reshape_shape} for node {node.name}")
             
             # Insert communication operations after this node
             # Following the exact pattern from the comments in mixtral.py:
@@ -1260,7 +1255,7 @@ def _insert_a2a_ops(gm: fx.GraphModule) -> tuple[fx.GraphModule, int]:
                 if reshape_type == "output":
                     # Reshape after communication
                     # DEBUG: Log reshape information
-                    logger.info(f"Applying output reshape {reshape_shape} to node {node.name}, buf_node shape inference needed")
+                    logger.debug(f"Applying output reshape {reshape_shape} to node {node.name}, buf_node shape inference needed")
                     # Log the reshape shape for debugging
                     if isinstance(reshape_shape, (list, tuple)) and -1 in reshape_shape:
                         logger.warning(f"Reshape shape contains -1: {reshape_shape}, this may cause shape inference issues")
@@ -1441,14 +1436,21 @@ def schedule_to_dag(schedule: Schedule2D) -> TaskDAG:
 
     **Temporal edges** connect every pair of consecutive non-None tasks within
     the same row (actor).  They model the serialisation constraint that a single
-    actor executes one cell at a time.
+    actor executes one cell at a time.  A task pair may carry both a temporal
+    edge and a data edge simultaneously.
     """
     nodes: list[TaskNode] = []
     grid_nodes: list[list[Optional[TaskNode]]] = []
+    # col_meta records the original 2D schedule position of each node so that
+    # data edges can be constructed from (col_idx, sub_idx) order rather than
+    # time_step.  sub_idx distinguishes the FWD and BWD sub-nodes that expand
+    # from a single FWD_BWD cell (same col_idx, different sub_idx).  This dict
+    # is used only inside schedule_to_dag and is not stored on the nodes.
+    col_meta: dict[int, tuple[int, int]] = {}
 
     for pp_rank, row in enumerate(schedule.grid):
         row_nodes: list[Optional[TaskNode]] = []
-        for time_step, task in enumerate(row):
+        for col_idx, task in enumerate(row):
             if task is None:
                 row_nodes.append(None)
             elif task.type == TaskType.FWD_BWD:
@@ -1459,17 +1461,20 @@ def schedule_to_dag(schedule: Schedule2D) -> TaskDAG:
                 fwd_node = TaskNode(
                     task=Task(pp_rank=pp_rank, batches=[fwd_batch], type=TaskType.FWD),
                     pp_rank=pp_rank,
-                    time_step=time_step,
+                    time_step=col_idx,
                 )
                 bwd_node = TaskNode(
                     task=Task(pp_rank=pp_rank, batches=[bwd_batch], type=TaskType.BWD),
                     pp_rank=pp_rank,
-                    time_step=time_step,
+                    time_step=col_idx,
                 )
+                col_meta[id(fwd_node)] = (col_idx, 0)
+                col_meta[id(bwd_node)] = (col_idx, 1)
                 nodes.extend([fwd_node, bwd_node])
                 row_nodes.extend([fwd_node, bwd_node])
             else:
-                node = TaskNode(task=task, pp_rank=pp_rank, time_step=time_step)
+                node = TaskNode(task=task, pp_rank=pp_rank, time_step=col_idx)
+                col_meta[id(node)] = (col_idx, 0)
                 nodes.append(node)
                 row_nodes.append(node)
         grid_nodes.append(row_nodes)
@@ -1492,7 +1497,7 @@ def schedule_to_dag(schedule: Schedule2D) -> TaskDAG:
                 mb_to_nodes[mb_idx].append(node)
 
     for mb_nodes in mb_to_nodes.values():
-        mb_nodes.sort(key=lambda n: (n.time_step, n.pp_rank))
+        mb_nodes.sort(key=lambda n: (*col_meta[id(n)], n.pp_rank))
         for i in range(len(mb_nodes) - 1):
             pred, succ = mb_nodes[i], mb_nodes[i + 1]
             pred.data_succs.append(succ)
@@ -1514,19 +1519,26 @@ def schedule_to_dag(schedule: Schedule2D) -> TaskDAG:
                 bwdi.data_succs.append(node)
                 node.data_preds.append(bwdi)
 
-    data_edge_pairs: set[tuple[int, int]] = set()
-    for node in nodes:
-        for succ in node.data_succs:
-            data_edge_pairs.add((id(node), id(succ)))
-            data_edge_pairs.add((id(succ), id(node)))
-
     for row_nodes in grid_nodes:
         non_null = [n for n in row_nodes if n is not None]
+        if not non_null:
+            continue
         for i in range(len(non_null) - 1):
             pred, succ = non_null[i], non_null[i + 1]
-            if (id(pred), id(succ)) not in data_edge_pairs:
-                pred.temporal_succ = succ
-                succ.temporal_pred = pred
+            pred.temporal_succs.append(succ)
+            succ.temporal_preds.append(pred)
+        # Synthesize a UPD node as the terminal task for this rank's temporal
+        # chain.  time_step is a placeholder; assign_time_steps sets the real
+        # value after all three expansion passes complete.
+        last = non_null[-1]
+        upd_node = TaskNode(
+            task=Task(pp_rank=last.pp_rank, batches=list(last.task.batches), type=TaskType.UPD),
+            pp_rank=last.pp_rank,
+            time_step=0,
+        )
+        last.temporal_succs.append(upd_node)
+        upd_node.temporal_preds.append(last)
+        nodes.append(upd_node)
 
     return TaskDAG(nodes=nodes)
 
@@ -1580,10 +1592,10 @@ def expand_bucket_tasks(dag: TaskDAG, bucket_counts: dict) -> TaskDAG:
                         pp_rank=orig.pp_rank,
                         batches=list(orig.task.batches),
                         type=TaskType.FWD,
-                        bucket_id=b,
                     ),
                     pp_rank=orig.pp_rank,
                     time_step=orig.time_step * TIME_SCALE + i,
+                    bucket_id=b,
                 )
                 for i, b in enumerate(range(K))
             ]
@@ -1594,18 +1606,20 @@ def expand_bucket_tasks(dag: TaskDAG, bucket_counts: dict) -> TaskDAG:
                         pp_rank=orig.pp_rank,
                         batches=list(orig.task.batches),
                         type=orig.task.type,   # preserve BWD or BWD_I
-                        bucket_id=K - 1 - i,
                     ),
                     pp_rank=orig.pp_rank,
                     time_step=orig.time_step * TIME_SCALE + i,
+                    bucket_id=K - 1 - i,
                 )
                 for i in range(K)
             ]
 
-        # Data-dep chain between consecutive bucket nodes
+        # Data-dep and temporal chain between consecutive bucket nodes
         for i in range(K - 1):
             chain[i].data_succs.append(chain[i + 1])
             chain[i + 1].data_preds.append(chain[i])
+            chain[i].temporal_succs.append(chain[i + 1])
+            chain[i + 1].temporal_preds.append(chain[i])
 
         first_bkt = chain[0]
         last_bkt = chain[-1]
@@ -1635,23 +1649,21 @@ def expand_bucket_tasks(dag: TaskDAG, bucket_counts: dict) -> TaskDAG:
                 new_dst.data_preds.append(last_bkt)
         orig.data_succs.clear()
 
-        # Incoming temporal edge: tp -> orig  =>  new_tp -> first_bkt
-        if orig.temporal_pred is not None:
-            tp = orig.temporal_pred
-            tp.temporal_succ = None  # disconnect old link
+        # Incoming temporal edges: tp -> orig  =>  new_tp -> first_bkt
+        for tp in list(orig.temporal_preds):
+            tp.temporal_succs.remove(orig)
             new_tp = node_to_first_last[id(tp)][1] if id(tp) in node_to_first_last else tp
-            new_tp.temporal_succ = first_bkt
-            first_bkt.temporal_pred = new_tp
-            orig.temporal_pred = None
+            new_tp.temporal_succs.append(first_bkt)
+            first_bkt.temporal_preds.append(new_tp)
+        orig.temporal_preds.clear()
 
-        # Outgoing temporal edge: orig -> ts  =>  last_bkt -> new_ts
-        if orig.temporal_succ is not None:
-            ts = orig.temporal_succ
-            ts.temporal_pred = None  # disconnect old link
+        # Outgoing temporal edges: orig -> ts  =>  last_bkt -> new_ts
+        for ts in list(orig.temporal_succs):
+            ts.temporal_preds.remove(orig)
             new_ts = node_to_first_last[id(ts)][0] if id(ts) in node_to_first_last else ts
-            last_bkt.temporal_succ = new_ts
-            new_ts.temporal_pred = last_bkt
-            orig.temporal_succ = None
+            last_bkt.temporal_succs.append(new_ts)
+            new_ts.temporal_preds.append(last_bkt)
+        orig.temporal_succs.clear()
 
     # ---- Step 2c: build new node list ----
     orig_ids = set(id(n) for n in expandable)
@@ -1677,8 +1689,13 @@ def insert_p2p_ops(dag: TaskDAG) -> list[TaskDAG]:
     1. Remove the data-dep edge.
     2. Create a SEND node on rank A with a data-dep edge ``task1 → SEND``.
     3. Create a RECV node on rank B with a data-dep edge ``RECV → task2``.
-    4. If ``task1`` had a temporal successor, re-attach it from SEND instead.
-    5. If ``task2`` had a temporal predecessor, re-attach it to RECV instead.
+
+    SEND / RECV nodes are not inserted into the temporal chain.  Their
+    ``time_step`` is set relative to their compute neighbour: SEND gets
+    ``src.time_step + 1``; RECV gets ``dst.time_step - 1``.
+
+    :func:`assign_time_steps` must have been called on *dag* before this
+    function so that the compute nodes carry their final ``time_step`` values.
 
     After the transformation no cross-rank edges should remain.  The function
     asserts this, then splits the node list by ``pp_rank`` and returns a list of
@@ -1693,15 +1710,6 @@ def insert_p2p_ops(dag: TaskDAG) -> list[TaskDAG]:
         if src.pp_rank != dst.pp_rank
     ]
 
-    synthetic_ts: dict[int, int] = {}
-
-    def _next_ts(pp_rank: int) -> int:
-        if pp_rank not in synthetic_ts:
-            synthetic_ts[pp_rank] = -1
-        ts = synthetic_ts[pp_rank]
-        synthetic_ts[pp_rank] -= 1
-        return ts
-
     for src, dst in cross_edges:
         src.data_succs.remove(dst)
         dst.data_preds.remove(src)
@@ -1709,32 +1717,20 @@ def insert_p2p_ops(dag: TaskDAG) -> list[TaskDAG]:
         send_node = TaskNode(
             task=Task(pp_rank=src.pp_rank, batches=list(src.task.batches), type=TaskType.SEND),
             pp_rank=src.pp_rank,
-            time_step=_next_ts(src.pp_rank),
+            time_step=src.time_step + 1,
             peer_pp_rank=dst.pp_rank,
         )
         src.data_succs.append(send_node)
         send_node.data_preds.append(src)
 
-        if src.temporal_succ is not None:
-            ts_next = src.temporal_succ
-            ts_next.temporal_pred = send_node
-            send_node.temporal_succ = ts_next
-            src.temporal_succ = None
-
         recv_node = TaskNode(
             task=Task(pp_rank=dst.pp_rank, batches=list(dst.task.batches), type=TaskType.RECV),
             pp_rank=dst.pp_rank,
-            time_step=_next_ts(dst.pp_rank),
+            time_step=dst.time_step - 1,
             peer_pp_rank=src.pp_rank,
         )
         recv_node.data_succs.append(dst)
         dst.data_preds.append(recv_node)
-
-        if dst.temporal_pred is not None:
-            tp_prev = dst.temporal_pred
-            tp_prev.temporal_succ = recv_node
-            recv_node.temporal_pred = tp_prev
-            dst.temporal_pred = None
 
         all_nodes.append(send_node)
         all_nodes.append(recv_node)
@@ -1746,44 +1742,22 @@ def insert_p2p_ops(dag: TaskDAG) -> list[TaskDAG]:
                 f"{node.node_id()} (rank {node.pp_rank}) → "
                 f"{succ.node_id()} (rank {succ.pp_rank})"
             )
-        if node.temporal_succ is not None:
-            assert node.pp_rank == node.temporal_succ.pp_rank, (
+        for ts in node.temporal_succs:
+            assert node.pp_rank == ts.pp_rank, (
                 f"Cross-rank temporal edge present: "
                 f"{node.node_id()} (rank {node.pp_rank}) → "
-                f"{node.temporal_succ.node_id()} (rank {node.temporal_succ.pp_rank})"
+                f"{ts.node_id()} (rank {ts.pp_rank})"
             )
 
     rank_nodes: dict[int, list[TaskNode]] = defaultdict(list)
     for node in all_nodes:
         rank_nodes[node.pp_rank].append(node)
 
-    # Task types that represent real backward compute — UPD must be temporally
-    # ordered after the last of these, not after communication nodes (A2A, AR,
-    # SEND, RECV) whose time_steps may be synthetic and higher than the last BWD.
-    _BWD_COMPUTE_TYPES = {
-        TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W,
-    }
-    upd_ts_counter = -(max(abs(v) for v in synthetic_ts.values()) + 1) if synthetic_ts else -1
-    for rank, nodes in rank_nodes.items():
-        bwd_nodes = [n for n in nodes if n.task.type in _BWD_COMPUTE_TYPES]
-        last = max(
-            bwd_nodes if bwd_nodes else (n for n in nodes if n.time_step >= 0),
-            key=lambda n: n.time_step,
-        )
-        upd_task = Task(pp_rank=rank, batches=list(last.task.batches), type=TaskType.UPD)
-        upd_node = TaskNode(task=upd_task, pp_rank=rank, time_step=upd_ts_counter)
-        upd_ts_counter -= 1
-        last.temporal_succ = upd_node
-        upd_node.temporal_pred = last
-        nodes.append(upd_node)
-
     return [TaskDAG(nodes=rank_nodes[r]) for r in sorted(rank_nodes)]
 
 
-def insert_ar_ops(per_rank_dags: list) -> list:
+def insert_ar_ops(per_rank_dags: list, trainable_bucket_keys: set | None = None) -> list:
     """Insert ALL_REDUCE nodes into each per-rank DAG for DP gradient sync.
-
-    Two cases are handled:
 
     For each (stage_id, bucket_id) group of BWD/BWD_I nodes, add one ALL_REDUCE
     after the final microbatch's node.  The actor all-reduces the pre-allocated
@@ -1792,6 +1766,13 @@ def insert_ar_ops(per_rank_dags: list) -> list:
     The ALL_REDUCE node has exactly one data edge: from the final microbatch
     BWD/BWD_I node.  Synchronisation with UPD is handled at the CUDA level via
     ar_events in _update_impl.
+
+    Args:
+        per_rank_dags: Per-rank TaskDAG list to mutate in-place.
+        trainable_bucket_keys: If provided, only insert ALL_REDUCE for
+            (stage_id, bucket_id) pairs present in this set.  Parameterless
+            buckets (e.g. A2A dispatch/combine segments in MoE models) must be
+            excluded or the actor will crash with a None flat_grads tensor.
     """
     for rank_dag in per_rank_dags:
         new_nodes = []
@@ -1802,7 +1783,10 @@ def insert_ar_ops(per_rank_dags: list) -> list:
         for node in rank_dag.nodes:
             if node.task.type in (TaskType.BWD, TaskType.BWD_I):
                 s = node.task.batches[0].stage_id
-                bwd_groups[(s, node.task.bucket_id)].append(node)
+                key = (s, node.bucket_id)
+                if trainable_bucket_keys is not None and key not in trainable_bucket_keys:
+                    continue
+                bwd_groups[key].append(node)
 
         for (stage_id, bucket_id), group in bwd_groups.items():
             trigger_node = max(group, key=lambda n: n.time_step)
@@ -1810,12 +1794,12 @@ def insert_ar_ops(per_rank_dags: list) -> list:
                 pp_rank=trigger_node.pp_rank,
                 batches=list(trigger_node.task.batches),
                 type=TaskType.ALL_REDUCE,
-                bucket_id=bucket_id,
             )
             ar_node = TaskNode(
                 task=ar_task,
                 pp_rank=trigger_node.pp_rank,
-                time_step=-10000 - len(new_nodes),
+                time_step=trigger_node.time_step + 1,
+                bucket_id=bucket_id,
             )
             trigger_node.data_succs.append(ar_node)
             ar_node.data_preds.append(trigger_node)
@@ -1930,46 +1914,77 @@ def visualize_dag(
         # First stage -> black text, second (and beyond) stage -> white text
         return "black" if sid == stages[0] else "white"
 
+    # Compute topological order using Kahn's algorithm (data + temporal edges).
+    from collections import deque as _deque
+    _in_degree: dict[str, int] = {
+        n.node_id(): len(n.data_preds) + len(n.temporal_preds)
+        for n in dag.nodes
+    }
+    _topo_order: dict[str, int] = {}
+    _queue: _deque = _deque(n for n in dag.nodes if _in_degree[n.node_id()] == 0)
+    _step = 0
+    while _queue:
+        _n = _queue.popleft()
+        _topo_order[_n.node_id()] = _step
+        _step += 1
+        for _s in list(_n.data_succs) + list(_n.temporal_succs):
+            _in_degree[_s.node_id()] -= 1
+            if _in_degree[_s.node_id()] == 0:
+                _queue.append(_s)
+
     dot = graphviz.Digraph("PiperDAG", comment="Piper Task DAG")
     dot.attr(rankdir="LR", splines="ortho", nodesep="0.4", ranksep="0.6", fontname="Helvetica")
     dot.attr("node", shape="box", style="filled", fontsize="9", fontname="Helvetica")
     dot.attr("edge", fontsize="8", fontname="Helvetica")
 
     for node in dag.nodes:
+        label = f"{node.time_step}\n{_task_node_label(node)}"
         dot.node(
             node.node_id(),
-            label=_task_node_label(node),
+            label=label,
             fillcolor=_node_fill(node),
             fontcolor=_node_fontcolor(node),
             tooltip=repr(node.task),
         )
 
-    step_to_nodes: dict[int, list[TaskNode]] = defaultdict(list)
-    for node in dag.nodes:
-        if node.time_step >= 0:
-            step_to_nodes[node.time_step].append(node)
+    # Assign column positions so that every temporal edge spans exactly one column.
+    # Assign column positions via BFS from temporal roots.
+    # When the temporal graph has forks/joins (after overlap_a2a_tasks), use
+    # max-predecessor depth to place join nodes correctly.
+    # SEND/RECV/AR nodes have no temporal edges and are left unranked.
+    _tdepth: dict[str, int] = {}
+    _tq: _deque = _deque()
+    for _n in dag.nodes:
+        if not _n.temporal_preds and _n.temporal_succs:
+            _tdepth[_n.node_id()] = 0
+            _tq.append(_n)
+    while _tq:
+        _n = _tq.popleft()
+        for _s in _n.temporal_succs:
+            new_d = _tdepth[_n.node_id()] + 1
+            if _s.node_id() not in _tdepth or _tdepth[_s.node_id()] < new_d:
+                _tdepth[_s.node_id()] = new_d
+                _tq.append(_s)
 
-    for col_nodes in step_to_nodes.values():
-        if len(col_nodes) > 1:
-            with dot.subgraph() as sub:
-                sub.attr(rank="same")
-                for node in col_nodes:
-                    sub.node(node.node_id())
-
-    data_pairs: set[tuple[str, str]] = set()
+    depth_to_nodes: dict[int, list[TaskNode]] = defaultdict(list)
     for node in dag.nodes:
-        for succ in node.data_succs:
-            data_pairs.add((node.node_id(), succ.node_id()))
+        if node.node_id() in _tdepth:
+            depth_to_nodes[_tdepth[node.node_id()]].append(node)
+
+    for col_nodes in depth_to_nodes.values():
+        with dot.subgraph() as sub:
+            sub.attr(rank="same")
+            for node in col_nodes:
+                sub.node(node.node_id())
 
     for node in dag.nodes:
-        if node.temporal_succ is not None:
-            key = (node.node_id(), node.temporal_succ.node_id())
-            if key not in data_pairs:
-                dot.edge(
-                    key[0], key[1],
-                    style="dashed", color="grey60",
-                    penwidth="1.0", arrowsize="0.6", constraint="true",
-                )
+        for ts in node.temporal_succs:
+            key = (node.node_id(), ts.node_id())
+            dot.edge(
+                key[0], key[1],
+                style="dashed", color="grey60",
+                penwidth="1.0", arrowsize="0.6", constraint="true",
+            )
 
     seen_edges: set[tuple[str, str]] = set()
     for node in dag.nodes:
@@ -2013,7 +2028,7 @@ def print_dag_order(dag: TaskDAG, label: str = "") -> None:
     from collections import deque as _deque
 
     in_degree = {
-        id(n): len(n.data_preds) + (1 if n.temporal_pred is not None else 0)
+        id(n): len(n.data_preds) + len(n.temporal_preds)
         for n in dag.nodes
     }
     queue: _deque = _deque(n for n in dag.nodes if in_degree[id(n)] == 0)
@@ -2028,13 +2043,10 @@ def print_dag_order(dag: TaskDAG, label: str = "") -> None:
         batches_str = ", ".join(
             f"s{b.stage_id} mb{b.mb_idx}" for b in task.batches
         ) if task.batches else ""
-        bkt = f" bkt={task.bucket_id}" if task.bucket_id is not None else ""
+        bkt = f" bkt={node.bucket_id}" if node.bucket_id else ""
         print(f"  {step:3d}  rank={node.pp_rank}  {ttype:<14s}  {batches_str}{bkt}")
         step += 1
-        all_succs = list(node.data_succs)
-        if node.temporal_succ is not None:
-            all_succs.append(node.temporal_succ)
-        for succ in all_succs:
+        for succ in list(node.data_succs) + list(node.temporal_succs):
             in_degree[id(succ)] -= 1
             if in_degree[id(succ)] == 0:
                 queue.append(succ)
@@ -2660,23 +2672,35 @@ def split_by_a2a(
         )
     )
 
-    # Group CONSECUTIVE annotated nodes with the same annotation_key into blocks.
-    # This handles multiple layers: each contiguous run of same-key nodes becomes
-    # its own block, so a 2-layer model produces 4 blocks (dispatch0, combine0,
-    # dispatch1, combine1) rather than 2 (all-dispatches, all-combines).
-    # annotated_nodes is already in graph order.
+    # Group CONSECUTIVE annotated nodes with the same annotation_key into blocks,
+    # but only if they are graph-adjacent (no other compute nodes between them).
+    # Adjacency is required to handle models where all A2A annotations share the
+    # same key (e.g. dispatch and gather both tagged "all_to_all_single"): without
+    # the adjacency check they would all merge into one block.
+    # The grouping still handles the case where a single A2A boundary spans
+    # multiple truly-adjacent nodes (e.g. reshape + contiguous inside one
+    # `with annotate(...)` block).
+    annotated_idx_set = {idx for idx, _, _, _ in annotated_nodes}
     blocks: list = []
     for idx, node, annotation_key, reshape in annotated_nodes:
         if blocks and blocks[-1]["annotation_key"] == annotation_key:
-            blocks[-1]["nodes"].append((idx, node))
-            blocks[-1]["last_idx"] = idx
-        else:
-            blocks.append({
-                "nodes": [(idx, node)],
-                "last_idx": idx,
-                "reshape": reshape,
-                "annotation_key": annotation_key,
-            })
+            prev_last_idx = blocks[-1]["last_idx"]
+            # Only merge if no non-annotated compute nodes exist in the gap.
+            gap_has_compute = any(
+                nodes[j].op not in ("placeholder", "get_attr", "output")
+                and j not in annotated_idx_set
+                for j in range(prev_last_idx + 1, idx)
+            )
+            if not gap_has_compute:
+                blocks[-1]["nodes"].append((idx, node))
+                blocks[-1]["last_idx"] = idx
+                continue
+        blocks.append({
+            "nodes": [(idx, node)],
+            "last_idx": idx,
+            "reshape": reshape,
+            "annotation_key": annotation_key,
+        })
     n_boundaries = len(blocks)
 
     logger.debug(
@@ -2918,8 +2942,6 @@ def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
     if not a2a_info:
         return dag
 
-    TIME_SCALE = 1000  # same scale used by expand_bucket_tasks
-
     # Index FWD/BWD/BWD_I nodes by (stage_id, mb_idx, type, bucket_id)
     bucket_node_map: dict = {}
     for node in dag.nodes:
@@ -2927,7 +2949,7 @@ def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
         if t.type in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I):
             sid = t.batches[0].stage_id
             mid = t.batches[0].mb_idx
-            bucket_node_map[(sid, mid, t.type, t.bucket_id)] = node
+            bucket_node_map[(sid, mid, t.type, node.bucket_id)] = node
 
     new_nodes: list[TaskNode] = []
 
@@ -2942,7 +2964,7 @@ def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
 
         if t.type == TaskType.FWD:
             # Insert FWD_A2A after FWD(bucket_id) if it's a boundary
-            bkt_id = t.bucket_id
+            bkt_id = node.bucket_id
             if bkt_id not in boundaries:
                 continue
             tensor_idx = boundaries[bkt_id]
@@ -2959,14 +2981,14 @@ def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
                     pp_rank=node.pp_rank,
                     batches=list(t.batches),
                     type=TaskType.FWD_A2A,
-                    bucket_id=bkt_id,
-                    a2a_tensor_idx=tensor_idx,
                 ),
                 pp_rank=node.pp_rank,
-                time_step=node.time_step + TIME_SCALE // 2,
+                time_step=0,  # assigned later by assign_time_steps
+                bucket_id=bkt_id,
+                a2a_tensor_idx=tensor_idx,
             )
 
-            # Rewire: node -> a2a_node -> next_node  (replacing node -> next_node)
+            # Rewire data: node -> a2a_node -> next_node  (replacing node -> next_node)
             if next_node in node.data_succs:
                 node.data_succs.remove(next_node)
             if node in next_node.data_preds:
@@ -2977,12 +2999,20 @@ def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
             a2a_node.data_succs.append(next_node)
             next_node.data_preds.append(a2a_node)
 
+            # Splice into temporal chain: node → a2a_node → next_node
+            node.temporal_succs.remove(next_node)
+            next_node.temporal_preds.remove(node)
+            node.temporal_succs.append(a2a_node)
+            a2a_node.temporal_preds.append(node)
+            a2a_node.temporal_succs.append(next_node)
+            next_node.temporal_preds.append(a2a_node)
+
             new_nodes.append(a2a_node)
 
         else:  # BWD / BWD_I with bucket_id
             # Insert BWD_A2A after BWD/BWD_I(bucket_id+1) if there's a boundary there
             # (i.e. between bkt_id+1 and bkt_id in backward execution order)
-            bkt_id = t.bucket_id
+            bkt_id = node.bucket_id
             if bkt_id not in boundaries:
                 continue
             # This BWD/BWD_I(bkt_id) is the later node in the backward chain.
@@ -3001,14 +3031,14 @@ def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
                     pp_rank=node.pp_rank,
                     batches=list(t.batches),
                     type=TaskType.BWD_A2A,
-                    bucket_id=bkt_id,
-                    a2a_tensor_idx=tensor_idx,
                 ),
                 pp_rank=node.pp_rank,
-                time_step=prev_node.time_step + TIME_SCALE // 2,
+                time_step=0,  # assigned later by assign_time_steps
+                bucket_id=bkt_id,
+                a2a_tensor_idx=tensor_idx,
             )
 
-            # Rewire: prev_node -> a2a_node -> node  (replacing prev_node -> node)
+            # Rewire data: prev_node -> a2a_node -> node  (replacing prev_node -> node)
             if node in prev_node.data_succs:
                 prev_node.data_succs.remove(node)
             if prev_node in node.data_preds:
@@ -3019,7 +3049,161 @@ def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
             a2a_node.data_succs.append(node)
             node.data_preds.append(a2a_node)
 
+            # Splice into temporal chain: prev_node → a2a_node → node
+            prev_node.temporal_succs.remove(node)
+            node.temporal_preds.remove(prev_node)
+            prev_node.temporal_succs.append(a2a_node)
+            a2a_node.temporal_preds.append(prev_node)
+            a2a_node.temporal_succs.append(node)
+            node.temporal_preds.append(a2a_node)
+
             new_nodes.append(a2a_node)
 
     all_nodes = list(dag.nodes) + new_nodes
     return TaskDAG(nodes=all_nodes)
+
+# ---------------------------------------------------------------------------
+# Overlap compute and A2A tasks across consecutive task pairs
+# ---------------------------------------------------------------------------
+
+def _find_task_chain_endpoints(dag: TaskDAG, task: Task) -> tuple[TaskNode, TaskNode]:
+    """Return (first_node, last_node) in the temporal chain for the given task.
+
+    "First" is the node in the group none of whose temporal_preds are also in
+    the group; "last" is the node none of whose temporal_succs are in the group.
+
+    The "group" for a task is all DAG nodes sharing the same pp_rank,
+    stage_id, mb_idx, and either the task's compute type or its paired A2A type.
+    """
+    stage_id = task.batches[0].stage_id
+    mb_idx   = task.batches[0].mb_idx
+    compute_type = task.type
+    a2a_type = TaskType.FWD_A2A if compute_type == TaskType.FWD else TaskType.BWD_A2A
+
+    group = [
+        n for n in dag.nodes
+        if n.pp_rank == task.pp_rank
+        and n.task.batches
+        and n.task.batches[0].stage_id == stage_id
+        and n.task.batches[0].mb_idx   == mb_idx
+        and n.task.type in (compute_type, a2a_type)
+    ]
+    assert group, (
+        f"No DAG nodes found for task pp_rank={task.pp_rank} "
+        f"stage={stage_id} mb={mb_idx} type={compute_type}"
+    )
+
+    group_ids = {id(n) for n in group}
+    first = next(
+        n for n in group
+        if not any(id(p) in group_ids for p in n.temporal_preds)
+    )
+    last = next(
+        n for n in group
+        if not any(id(s) in group_ids for s in n.temporal_succs)
+    )
+    return first, last
+
+
+def overlap_a2a_tasks(dag: TaskDAG, task_pairs: list[tuple[Task, Task]]) -> TaskDAG:
+    """Overlap compute and A2A tasks across each consecutive task pair.
+
+    For each pair ``(t1, t2)`` the pre-transform temporal chain contains:
+
+        T1_first → … → T1_last → T2_first → … → T2_last
+
+    This function rewires the temporal dependencies so that T2 starts as soon
+    as T1 starts (not after T1 finishes), while still requiring T2_last to
+    complete after T1_last:
+
+      1. Remove  T1_last  → T2_first  (from temporal_succs / temporal_preds)
+      2. Add     T1_first → T2_first  (appended to temporal_succs / temporal_preds)
+      3. Add     T1_last  → T2_last   (appended to temporal_succs / temporal_preds)
+
+    After :func:`assign_time_steps` (which now does a topological sort), nodes
+    in T1 and T2 that have no other dependency between them receive the *same*
+    ``time_step``, allowing the actor to dispatch them to their respective CUDA
+    streams concurrently — e.g. T1's A2A overlaps with T2's compute and vice
+    versa.
+
+    Args:
+        dag: TaskDAG produced by :func:`expand_a2a_tasks`.
+        task_pairs: List of ``(t1, t2)`` pairs where each ``Task`` identifies
+            a compute-task group in the DAG by its pp_rank, stage_id, mb_idx,
+            and type.  The two tasks in each pair must be on the same pp_rank
+            and T2 must immediately follow T1 in the temporal chain.
+
+    Returns:
+        The same ``dag`` object with temporal edges mutated in-place.
+    """
+    for t1, t2 in task_pairs:
+        t1_first, t1_last = _find_task_chain_endpoints(dag, t1)
+        t2_first, t2_last = _find_task_chain_endpoints(dag, t2)
+
+        # Assert T2 directly follows T1 in the pre-transform temporal chain.
+        assert t2_first in t1_last.temporal_succs, (
+            f"overlap_a2a_tasks: expected T2_first ({t2_first.node_id()}) to be "
+            f"an immediate temporal successor of T1_last ({t1_last.node_id()})"
+        )
+        assert t1_last in t2_first.temporal_preds, (
+            f"overlap_a2a_tasks: expected T1_last ({t1_last.node_id()}) to be "
+            f"a temporal predecessor of T2_first ({t2_first.node_id()})"
+        )
+
+        # 1. Remove T1_last → T2_first
+        t1_last.temporal_succs.remove(t2_first)
+        t2_first.temporal_preds.remove(t1_last)
+
+        # 2. Add T1_first → T2_first
+        t1_first.temporal_succs.append(t2_first)
+        t2_first.temporal_preds.append(t1_first)
+
+        # 3. Add T1_last → T2_last (merged join point)
+        t1_last.temporal_succs.append(t2_last)
+        t2_last.temporal_preds.append(t1_last)
+
+    return dag
+
+
+# ---------------------------------------------------------------------------
+# Assign time_step from temporal chain position
+# ---------------------------------------------------------------------------
+
+def assign_time_steps(dag: TaskDAG) -> None:
+    """Assign ``time_step`` to every node based on its position in the temporal
+    dependency graph.
+
+    Must be called after :func:`expand_a2a_tasks` (and
+    :func:`overlap_a2a_tasks` if used) and before :func:`insert_p2p_ops`.
+
+    Each node's ``time_step`` is ``max(pred.time_step for all temporal preds) + 1``,
+    with roots (no temporal predecessors) receiving ``time_step = 0``.  When the
+    temporal graph is a simple chain this matches the previous sequential
+    assignment; when :func:`overlap_a2a_tasks` introduces forks and joins the
+    topological sort correctly assigns shared time steps to concurrent nodes
+    and deferred time steps to join points.
+
+    SEND / RECV / ALL_REDUCE nodes are added later by :func:`insert_p2p_ops`
+    and :func:`insert_ar_ops`; they receive ``time_step = adjacent_node ± 1``
+    at insertion time.
+    """
+    # Kahn's toposort over the temporal graph (temporal_preds / temporal_succs).
+    # time_step = max(pred.time_step for all temporal preds) + 1.
+    # When the graph is a simple chain this matches the previous sequential
+    # assignment; forks and joins from overlap_a2a_tasks are handled correctly.
+    in_degree: dict[int, int] = {id(n): len(n.temporal_preds) for n in dag.nodes}
+    ts_map: dict[int, int] = {}
+    queue: deque[TaskNode] = deque()
+    for node in dag.nodes:
+        if in_degree[id(node)] == 0:
+            ts_map[id(node)] = 0
+            queue.append(node)
+
+    while queue:
+        node = queue.popleft()
+        node.time_step = ts_map[id(node)]
+        for succ in node.temporal_succs:
+            in_degree[id(succ)] -= 1
+            ts_map[id(succ)] = max(ts_map.get(id(succ), 0), node.time_step + 1)
+            if in_degree[id(succ)] == 0:
+                queue.append(succ)

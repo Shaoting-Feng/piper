@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from typing import Any, Optional
 
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "DEBUG"
 
 """ 
 Print the backward graph of a tensor
@@ -340,6 +340,12 @@ class PiperMetadata:
     schedule = None   # Schedule2D set by piper_setup; used by the piper backend
     task_dag = None   # TaskDAG built from schedule by the piper backend
     per_rank_dags = None  # Per-rank TaskDAGs built by the piper backend
+    stage_bucket_counts: dict = {}   # stage_id -> number of buckets (set by piper backend)
+    trainable_bucket_keys: set = set()  # (stage_id, bucket_id) pairs with trainable params
+    # Populated by the piper backend on dp_rank=0; broadcast to dp_rank>0 by piper_setup
+    # so they can skip torch.compile entirely.  Contains serialized graph + param metadata
+    # (no actual weight values) for all stages, plus the built per-rank TaskDAGs.
+    compiled_stage_data: dict = None
 
 piper_metadata = PiperMetadata()
 
