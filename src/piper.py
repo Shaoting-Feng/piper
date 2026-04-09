@@ -3,8 +3,10 @@ import torch
 import torch.fx as fx
 import os
 import gc
+import pickle
+import time
 from torch._dynamo.backends.registry import register_backend
-from .piper_utils import _serialize_graphmodule, piper_metadata, create_logger, LOG_LEVEL
+from .piper_utils import _serialize_graphmodule, piper_metadata, create_logger, LOG_LEVEL, get_gpu_peak_flops_bf16
 
 
 def _collect_triton_constant_args(gm):
@@ -33,19 +35,19 @@ def _collect_triton_constant_args(gm):
 from .piper_graph_transform import (
     _split_gm_by_stages,
     _profile_and_split_gm,
-    schedule_to_dag,
+    expand_chunks_to_dags,
+    add_temporal_dependencies,
+    split_dag_by_rank,
     assign_time_steps,
-    insert_p2p_ops,
-    insert_ar_ops,
-    expand_bucket_tasks,
-    expand_a2a_tasks,
+    find_overlappable_tasks,
     overlap_a2a_tasks,
     visualize_dag,
+    compute_critical_path,
     print_dag_order,
     bucket_stage,
     split_by_a2a,
 )
-from .piper_exec import Task, TaskType, BatchMeta
+from .piper_exec import Chunk, TaskType, BatchMeta
 from .piper_actor import _get_actor
 
 logger = create_logger("piper_backend", LOG_LEVEL)
@@ -89,6 +91,10 @@ def piper(gm, example_inputs, **kwargs):
     trainable_bucket_keys: set = set()
     # Collected for DP broadcasting: stage_id -> (modules_data, a2a_boundaries)
     all_stage_compiled: dict = {}
+    # Running counter for assigning globally unique bucket IDs (same ordering as
+    # expand_chunks_to_dags Pass 1.5, which sorts by stage_id).  Populated after
+    # all stages are compiled so we can compute offsets in a second pass.
+    _stage_ubid_offsets: dict = {}  # stage_id -> first unique_bucket_id for that stage
 
     for (stage_id, stage_gm, input_idxs, param_idxs, graphargs, placeholders) in submodules:
         actor_id = piper_metadata.stage_to_device[stage_id]
@@ -154,14 +160,8 @@ def piper(gm, example_inputs, **kwargs):
             }
             for bgm, b_in, b_param, bargs in all_modules
         ]
-        refs.append(actor._load_stage.remote(
-            stage_id,
-            modules_data,
-            a2a_boundaries,
-            use_activation_checkpointing=piper_metadata.use_activation_checkpointing,
-        ))
 
-        all_stage_compiled[stage_id] = (modules_data, a2a_boundaries)
+        all_stage_compiled[stage_id] = (modules_data, a2a_boundaries, actor)
 
         del stage_gm
         del graphargs
@@ -170,6 +170,30 @@ def piper(gm, example_inputs, **kwargs):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Compute globally unique bucket IDs for each (stage_id, stage_bucket_id) pair.
+    # Stages are sorted by stage_id to match the ordering in expand_chunks_to_dags
+    # Pass 1.5, ensuring DAG task.unique_bucket_id matches actor data structure keys.
+    _ubid = 0
+    for s in sorted(stage_bucket_counts.keys()):
+        _stage_ubid_offsets[s] = _ubid
+        _ubid += stage_bucket_counts[s]
+
+    # Now dispatch _load_stage with unique_bucket_ids embedded in modules_data.
+    refs = []
+    for stage_id, (modules_data, a2a_boundaries, actor) in all_stage_compiled.items():
+        K = stage_bucket_counts[stage_id]
+        ubid_offset = _stage_ubid_offsets[stage_id]
+        for b_idx, md in enumerate(modules_data):
+            md["unique_bucket_id"] = ubid_offset + b_idx
+        refs.append(actor._load_stage.remote(
+            stage_id,
+            modules_data,
+            a2a_boundaries,
+            use_activation_checkpointing=piper_metadata.use_activation_checkpointing,
+        ))
+        # Remove actor from stored compiled data (not needed downstream)
+        all_stage_compiled[stage_id] = (modules_data, a2a_boundaries)
+
     ray.get(refs)
 
     piper_metadata.stage_bucket_counts = stage_bucket_counts
@@ -177,82 +201,53 @@ def piper(gm, example_inputs, **kwargs):
 
     # Build task DAG from the schedule stored by piper_setup.
     if piper_metadata.schedule is not None:
-        piper_metadata.task_dag = schedule_to_dag(piper_metadata.schedule)
+        dag = expand_chunks_to_dags(
+            piper_metadata.schedule,
+            piper_metadata.stage_bucket_counts,
+            stage_a2a_boundaries,
+            dp_degree,
+        )
         logger.debug(
-            f"Built task DAG: {len(piper_metadata.task_dag.nodes)} nodes, "
-            f"{sum(len(n.data_succs) for n in piper_metadata.task_dag.nodes)} data edges, "
-            f"{sum(len(n.temporal_succs) for n in piper_metadata.task_dag.nodes)} temporal edges"
+            f"Built task DAG: {len(dag.nodes)} nodes, "
+            f"{sum(len(n.data_succs) for n in dag.nodes)} data edges"
         )
 
-        dag = piper_metadata.task_dag
+        add_temporal_dependencies(dag, piper_metadata.schedule)
+        logger.debug(
+            f"Added temporal dependencies: "
+            f"{sum(len(n.temporal_succs) for n in dag.nodes)} temporal edges"
+        )
 
-        # Expand multi-segment stages into per-segment FWD/BWD task chains.
-        # This covers both param-bucketed stages (--bucketing) and A2A-split stages
-        # (--dp > 1 with MoE), both of which load multiple modules per stage.
-        # Only expand stages that actually have more than one segment.
-        bucket_counts = {
-            sid: n for sid, n in piper_metadata.stage_bucket_counts.items() if n > 1
-        }
-        if bucket_counts:
-            dag = expand_bucket_tasks(dag, bucket_counts)
-            logger.debug(
-                f"Expanded stages {list(bucket_counts.keys())} into "
-                f"per-segment FWD/BWD nodes"
-            )
-
-        # Insert FWD_A2A / BWD_A2A nodes for expert-parallel all-to-all boundaries.
         if dp_degree > 1 and stage_a2a_boundaries:
-            dag = expand_a2a_tasks(dag, stage_a2a_boundaries)
-            logger.debug(
-                f"Inserted A2A task nodes for stages {list(stage_a2a_boundaries.keys())}"
-            )
-
-            # Overlap compute and A2A tasks across FWD_BWD task pairs so that
-            # one task's A2A communication runs concurrently with the other's compute.
-            fwdbwd_pairs: list[tuple[Task, Task]] = []
-            for row in piper_metadata.schedule.grid:
-                for cell in row:
-                    if cell is not None and cell.type == TaskType.FWD_BWD:
-                        fwd_task = Task(
-                            pp_rank=cell.pp_rank,
-                            batches=[cell.batches[0]],
-                            type=TaskType.FWD,
-                        )
-                        bwd_task = Task(
-                            pp_rank=cell.pp_rank,
-                            batches=[cell.batches[1]],
-                            type=TaskType.BWD,
-                        )
-                        fwdbwd_pairs.append((fwd_task, bwd_task))
-            # fwdbwd_pairs.append((
-            #     Task(pp_rank=0, batches=[BatchMeta(0, 1)], type=TaskType.FWD), 
-            #     Task(pp_rank=0, batches=[BatchMeta(0, 2)], type=TaskType.FWD)))
-            if fwdbwd_pairs:
-                dag = overlap_a2a_tasks(dag, fwdbwd_pairs)
-                logger.debug(
-                    f"Overlapped A2A and compute tasks for {len(fwdbwd_pairs)} FWD_BWD pairs"
+            overlappable = find_overlappable_tasks(piper_metadata.schedule)
+            for t1, t2 in overlappable:
+                logger.info(
+                    f"Found adjacent task pair for A2A/compute overlap: "
+                    f"{t1} -> {t2}"
                 )
+            # if overlappable:
+            #     dag = overlap_a2a_tasks(dag, overlappable)
+            #     logger.debug(
+            #         f"Overlapped {len(overlappable)} adjacent task pair(s) for A2A/compute overlap"
+            #     )
 
-        # Assign final time_step values from the temporal dependency graph.
         assign_time_steps(dag)
 
+        # Save a deep copy of the full DAG before split_dag_by_rank removes
+        # cross-rank data edges.  Used later for profiling and critical-path analysis.
+        piper_metadata.full_dag_no_overlap = pickle.loads(pickle.dumps(dag))
+
         # Split into per-rank DAGs.
-        per_rank_dags = insert_p2p_ops(dag)
-
-        # Insert all-reduce nodes when using data parallelism.
-        if dp_degree > 1:
-            per_rank_dags = insert_ar_ops(per_rank_dags, piper_metadata.trainable_bucket_keys)
-            logger.debug("Inserted ALL_REDUCE nodes for DP gradient sync")
-            # ZeRO-1/2/3: insert AG/RS into the task DAG before/after the appropriate FWD/BWD tasks.
-
+        per_rank_dags = split_dag_by_rank(dag)
 
         piper_metadata.per_rank_dags = per_rank_dags
         actors = piper_metadata.actors
-        for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags):
-            try:
-                visualize_dag(per_rank_dag, output_path=f"figs/rank{pp_rank}_dag")
-            except Exception as e:
-                logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
+        if piper_metadata.visualize_dag:
+            for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags):
+                try:
+                    visualize_dag(per_rank_dag, output_path=f"out/rank{pp_rank}_dag")
+                except Exception as e:
+                    logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
             # uncomment for debugging DAG construction:
             # print_dag_order(per_rank_dag, label=f"rank {pp_rank}")
         ray.get([
@@ -269,6 +264,7 @@ def piper(gm, example_inputs, **kwargs):
             "stage_bucket_counts": stage_bucket_counts,
             "trainable_bucket_keys": trainable_bucket_keys,
             "per_rank_dags": per_rank_dags,
+            "full_dag_no_overlap": piper_metadata.full_dag_no_overlap,
         }
 
     example_outputs = original_gm(*example_inputs)
@@ -292,11 +288,19 @@ def piper(gm, example_inputs, **kwargs):
 # DAG-based execution entry point
 # ---------------------------------------------------------------------------
 
-def piper_exec_dag(loss_fn) -> list:
+def piper_exec_dag(loss_fn, profiling: bool = False, log_stats: bool = False) -> list:
     """Execute one training step using the per-rank TaskDAG and :meth:`run_dag`.
 
     Per-rank DAGs are built and loaded onto actors by the piper backend during
     compilation.  This function just invokes ``run_dag`` in parallel on all actors.
+
+    Args:
+        loss_fn: Loss function passed through to each actor's run_dag.
+        profiling: If True, each actor times every node and accumulates the
+            measurement into ``node.profiling_measurements``.
+        log_stats: If True, log step time, throughput, MFU (when
+            ``model_flops_per_token`` was set in :func:`piper_setup`), and
+            peak GPU memory for each rank.
 
     Returns:
         Flat list of per-microbatch losses collected from all actors.
@@ -307,8 +311,48 @@ def piper_exec_dag(loss_fn) -> list:
     )
     actors = piper_metadata.actors
     run_refs = [
-        actors[pp_rank].run_dag.remote(loss_fn=loss_fn)
+        actors[pp_rank].run_dag.remote(loss_fn=loss_fn, profiling=profiling)
         for pp_rank in range(len(piper_metadata.per_rank_dags))
     ]
+    t0 = time.perf_counter()
     results = ray.get(run_refs)
+    step_time = time.perf_counter() - t0
+
+    if log_stats or piper_metadata.model_flops_per_token is not None:
+        _log_step_stats(step_time, log_stats, actors)
+
     return [item for sublist in results if sublist for item in sublist]
+
+
+def _log_step_stats(step_time: float, log_memory: bool, actors: dict) -> None:
+    """Log throughput, MFU, and optionally per-rank peak GPU memory."""
+    stats = [f"step_time={step_time:.3f}s"]
+
+    tokens = piper_metadata.tokens_per_step
+    if tokens is not None:
+        stats.append(f"throughput={tokens / step_time:.1f} tok/s")
+
+    flops_per_token = piper_metadata.model_flops_per_token
+    if tokens is not None and flops_per_token is not None:
+        peak_flops = 1979e12
+        if peak_flops is not None:
+            dp_degree = int(os.environ.get("PIPER_DP_DEGREE", "1"))
+            total_gpus = len(actors) * dp_degree
+            achieved_flops = flops_per_token * tokens / step_time
+            mfu = achieved_flops / (peak_flops * total_gpus)
+            stats.append(f"MFU={mfu:.2%}")
+        else:
+            logger.warning(
+                "MFU not computed: GPU peak FLOPs unknown for this device. "
+                "Add it to _GPU_PEAK_FLOPS_BF16 in piper_utils.py."
+            )
+
+    if log_memory:
+        mem_refs = [
+            actors[pp_rank].get_and_reset_peak_memory_stats.remote()
+            for pp_rank in range(len(piper_metadata.per_rank_dags))
+        ]
+        for global_rank, max_alloc_bytes in ray.get(mem_refs):
+            stats.append(f"rank{global_rank}_peak_mem={max_alloc_bytes / 1e9:.2f}GB")
+
+    logger.info("  ".join(stats))

@@ -13,7 +13,7 @@ import time
 from torch.autograd import Function
 
 from .piper_utils import create_logger, LOG_LEVEL, piper_metadata
-from .piper_exec import TaskType, Schedule2D, Task, TaskNode, TaskDAG
+from .piper_exec import TaskType, PipelineSchedule, Chunk, Task, TaskDAG, logical_time
 
 logger = create_logger("piper_graph_transform", LOG_LEVEL)
 
@@ -164,8 +164,17 @@ def _profile_and_split_gm(gm, num_stages) -> tuple[fx.GraphModule, list[tuple[in
 
     # Check for cached split from a previous profiling run
     cache_dir = Path.home() / ".cache" / "piper" / "splits"
+
+    def _stable_target(target):
+        """Return a stable string for a node target, avoiding memory addresses."""
+        if isinstance(target, str):
+            return target
+        if callable(target) and hasattr(target, '__module__') and hasattr(target, '__qualname__'):
+            return f"{target.__module__}.{target.__qualname__}"
+        return str(target)
+
     graph_signature = hashlib.sha256(
-        json.dumps([(n.name, n.op, str(n.target)) for n in compute_nodes] + [num_stages]).encode()
+        json.dumps([(n.name, n.op, _stable_target(n.target)) for n in compute_nodes] + [num_stages]).encode()
     ).hexdigest()[:16]
     cache_file = cache_dir / f"{graph_signature}.json"
 
@@ -1420,322 +1429,532 @@ def _insert_p2p_ops(
 
 
 # ---------------------------------------------------------------------------
-# Schedule → Task DAG
+# Per-chunk task-chain builder (internal helper)
 # ---------------------------------------------------------------------------
 
-def schedule_to_dag(schedule: Schedule2D) -> TaskDAG:
-    """Convert a :class:`Schedule2D` into a :class:`TaskDAG`.
+def _splice_a2a_nodes(
+    chain: list,
+    boundaries: dict,
+    task_type,
+    pp_rank: int,
+    source_chunk,
+) -> list:
+    """Splice A2A nodes into a bucket chain at all-to-all boundaries.
 
-    Two kinds of edges are built:
+    For FWD: inserts FWD_A2A after FWD(bkt_id) when bkt_id is a boundary.
+    For BWD/BWD_I: inserts BWD_A2A before BWD(bkt_id) in execution order
+    (i.e. between BWD(bkt_id+1) and BWD(bkt_id)).
 
-    **Data-dependency edges** connect tasks that share a ``mb_idx`` and are
-    *adjacent* in time – i.e. no other task carrying the same microbatch index
-    exists at any time step between them.  These edges may go between rows
-    (actors), representing the point-to-point activation / gradient tensors
-    that cross pipeline stage boundaries.
-
-    **Temporal edges** connect every pair of consecutive non-None tasks within
-    the same row (actor).  They model the serialisation constraint that a single
-    actor executes one cell at a time.  A task pair may carry both a temporal
-    edge and a data edge simultaneously.
+    Updates data and temporal edges in-place; returns the new chain list
+    with A2A nodes interleaved.
     """
-    nodes: list[TaskNode] = []
-    grid_nodes: list[list[Optional[TaskNode]]] = []
-    # col_meta records the original 2D schedule position of each node so that
-    # data edges can be constructed from (col_idx, sub_idx) order rather than
-    # time_step.  sub_idx distinguishes the FWD and BWD sub-nodes that expand
-    # from a single FWD_BWD cell (same col_idx, different sub_idx).  This dict
-    # is used only inside schedule_to_dag and is not stored on the nodes.
-    col_meta: dict[int, tuple[int, int]] = {}
+    a2a_type = TaskType.FWD_A2A if task_type == TaskType.FWD else TaskType.BWD_A2A
+    new_chain: list = []
 
-    for pp_rank, row in enumerate(schedule.grid):
-        row_nodes: list[Optional[TaskNode]] = []
-        for col_idx, task in enumerate(row):
-            if task is None:
-                row_nodes.append(None)
-            elif task.type == TaskType.FWD_BWD:
-                # Expand inline into a FWD node followed by a BWD node.
-                # Placing both consecutively in row_nodes causes the temporal-edge
-                # pass to chain: prev_cell → fwd_node → bwd_node → next_cell.
-                fwd_batch, bwd_batch = task.batches[0], task.batches[1]
-                fwd_node = TaskNode(
-                    task=Task(pp_rank=pp_rank, batches=[fwd_batch], type=TaskType.FWD),
+    for i, task in enumerate(chain):
+        bkt_id = task.bucket_id
+        is_last = (i == len(chain) - 1)
+
+        if task_type == TaskType.FWD:
+            new_chain.append(task)
+            if bkt_id in boundaries and not is_last:
+                next_task = chain[i + 1]
+                a2a_node = Task(
+                    chunk=Chunk(pp_rank=pp_rank, batches=list(task.chunk.batches), type=a2a_type),
                     pp_rank=pp_rank,
-                    time_step=col_idx,
+                    time_step=0,
+                    bucket_id=bkt_id,
+                    custom_metadata={"a2a_tensor_idx": boundaries[bkt_id]},
+                    source_chunk=source_chunk,
                 )
-                bwd_node = TaskNode(
-                    task=Task(pp_rank=pp_rank, batches=[bwd_batch], type=TaskType.BWD),
+                # Rewire data: task → next_task  ⟹  task → a2a → next_task
+                task.data_succs.remove(next_task)
+                next_task.data_preds.remove(task)
+                task.data_succs.append(a2a_node)
+                a2a_node.data_preds.append(task)
+                a2a_node.data_succs.append(next_task)
+                next_task.data_preds.append(a2a_node)
+                # Rewire temporal
+                task.temporal_succs.remove(next_task)
+                next_task.temporal_preds.remove(task)
+                task.temporal_succs.append(a2a_node)
+                a2a_node.temporal_preds.append(task)
+                a2a_node.temporal_succs.append(next_task)
+                next_task.temporal_preds.append(a2a_node)
+                new_chain.append(a2a_node)
+        else:
+            # BWD / BWD_I: insert A2A before task (i.e. between chain[i-1] and chain[i])
+            if bkt_id in boundaries and i > 0:
+                prev_task = chain[i - 1]
+                a2a_node = Task(
+                    chunk=Chunk(pp_rank=pp_rank, batches=list(task.chunk.batches), type=a2a_type),
                     pp_rank=pp_rank,
-                    time_step=col_idx,
+                    time_step=0,
+                    bucket_id=bkt_id,
+                    custom_metadata={"a2a_tensor_idx": boundaries[bkt_id]},
+                    source_chunk=source_chunk,
                 )
-                col_meta[id(fwd_node)] = (col_idx, 0)
-                col_meta[id(bwd_node)] = (col_idx, 1)
-                nodes.extend([fwd_node, bwd_node])
-                row_nodes.extend([fwd_node, bwd_node])
-            else:
-                node = TaskNode(task=task, pp_rank=pp_rank, time_step=col_idx)
-                col_meta[id(node)] = (col_idx, 0)
-                nodes.append(node)
-                row_nodes.append(node)
-        grid_nodes.append(row_nodes)
+                # Rewire data: prev_task → task  ⟹  prev_task → a2a → task
+                prev_task.data_succs.remove(task)
+                task.data_preds.remove(prev_task)
+                prev_task.data_succs.append(a2a_node)
+                a2a_node.data_preds.append(prev_task)
+                a2a_node.data_succs.append(task)
+                task.data_preds.append(a2a_node)
+                # Rewire temporal
+                prev_task.temporal_succs.remove(task)
+                task.temporal_preds.remove(prev_task)
+                prev_task.temporal_succs.append(a2a_node)
+                a2a_node.temporal_preds.append(prev_task)
+                a2a_node.temporal_succs.append(task)
+                task.temporal_preds.append(a2a_node)
+                new_chain.append(a2a_node)
+            new_chain.append(task)
 
-    mb_to_nodes: dict[int, list[TaskNode]] = defaultdict(list)
-    seen_per_mb: dict[int, set[int]] = defaultdict(set)
-
-    for node in nodes:
-        # UPD and BWD_W are purely local: UPD has no cross-stage dependency;
-        # BWD_W only depends on its paired BWD_I (same rank/stage/mb) and must
-        # not appear in the cross-rank data chain so that insert_p2p_ops does
-        # not add spurious SEND/RECV nodes for BWD_W.
-        if node.task.type in (TaskType.UPD, TaskType.BWD_W):
-            continue
-        for batch in node.task.batches:
-            mb_idx = batch.mb_idx
-            node_ident = id(node)
-            if node_ident not in seen_per_mb[mb_idx]:
-                seen_per_mb[mb_idx].add(node_ident)
-                mb_to_nodes[mb_idx].append(node)
-
-    for mb_nodes in mb_to_nodes.values():
-        mb_nodes.sort(key=lambda n: (*col_meta[id(n)], n.pp_rank))
-        for i in range(len(mb_nodes) - 1):
-            pred, succ = mb_nodes[i], mb_nodes[i + 1]
-            pred.data_succs.append(succ)
-            succ.data_preds.append(pred)
-
-    # Add explicit BWD_I -> BWD_W data edges for each (rank, stage_id, mb_idx)
-    # pair.  BWD_W is excluded from the mb chain above, but it still needs a
-    # data dependency on its upstream BWD_I so the actor knows to wait for it.
-    bwdi_index: dict = {}  # (pp_rank, stage_id, mb_idx) -> BWD_I node
-    for node in nodes:
-        if node.task.type == TaskType.BWD_I:
-            b = node.task.batches[0]
-            bwdi_index[(node.pp_rank, b.stage_id, b.mb_idx)] = node
-    for node in nodes:
-        if node.task.type == TaskType.BWD_W:
-            b = node.task.batches[0]
-            bwdi = bwdi_index.get((node.pp_rank, b.stage_id, b.mb_idx))
-            if bwdi is not None:
-                bwdi.data_succs.append(node)
-                node.data_preds.append(bwdi)
-
-    for row_nodes in grid_nodes:
-        non_null = [n for n in row_nodes if n is not None]
-        if not non_null:
-            continue
-        for i in range(len(non_null) - 1):
-            pred, succ = non_null[i], non_null[i + 1]
-            pred.temporal_succs.append(succ)
-            succ.temporal_preds.append(pred)
-        # Synthesize a UPD node as the terminal task for this rank's temporal
-        # chain.  time_step is a placeholder; assign_time_steps sets the real
-        # value after all three expansion passes complete.
-        last = non_null[-1]
-        upd_node = TaskNode(
-            task=Task(pp_rank=last.pp_rank, batches=list(last.task.batches), type=TaskType.UPD),
-            pp_rank=last.pp_rank,
-            time_step=0,
-        )
-        last.temporal_succs.append(upd_node)
-        upd_node.temporal_preds.append(last)
-        nodes.append(upd_node)
-
-    return TaskDAG(nodes=nodes)
+    return new_chain
 
 
+def _build_chunk_task_chain(
+    chunk,
+    pp_rank: int,
+    col_idx: int,
+    bucket_counts: dict,
+    a2a_info: dict,
+) -> tuple:
+    """Build the expanded task chain for a single schedule chunk.
 
-# ---------------------------------------------------------------------------
-# Expand bucketed FWD/BWD tasks into per-bucket task chains
-# ---------------------------------------------------------------------------
+    For FWD / BWD / BWD_I chunks with bucketing: returns a chain of K bucket
+    tasks with internal data + temporal edges.  A2A nodes are spliced in at
+    boundaries.  For all other chunk types a single task is returned.
 
-def expand_bucket_tasks(dag: TaskDAG, bucket_counts: dict) -> TaskDAG:
-    """Replace each FWD/BWD TaskNode for a bucketed stage with a chain of
-    FWD / BWD TaskNodes with explicit bucket_id, one per bucket.
-
-    For FWD stages the chain executes in bucket order 0, 1, …, K-1.
-    For BWD stages the chain executes in reverse order K-1, K-2, …, 0
-    (highest bucket_id first receives the upstream gradient; bucket_id=0 is
-    last to execute and sends the input gradient to the previous stage).
-
-    Incoming data / temporal edges are attached to the first node in the
-    execution chain; outgoing edges are attached to the last node.
-
-    Args:
-        dag: Global TaskDAG produced by schedule_to_dag().
-        bucket_counts: Mapping stage_id -> number of buckets. Only stages
-            present in this dict are expanded.
+    All created tasks have ``source_chunk`` set to *chunk*.
 
     Returns:
-        A new TaskDAG with expanded nodes.
+        ``(all_tasks, head, tail)`` where *head* is the first task in
+        execution order and *tail* is the last.
     """
     TIME_SCALE = 1000
 
-    # ---- Step 2a: create bucket chains for all expandable nodes ----
-    expandable = [
-        n for n in dag.nodes
-        if n.task.type in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I)
-        and n.task.batches[0].stage_id in bucket_counts
-    ]
+    task_type = chunk.type
+    stage_id = chunk.batches[0].stage_id if chunk.batches else None
+    K = bucket_counts.get(stage_id, 1) if stage_id is not None else 1
 
-    # id(orig) -> (first_bkt, last_bkt, chain_list)
-    node_to_first_last: dict = {}
+    # FWD, BWD, BWD_I, BWD_W all support per-bucket tasks
+    if task_type not in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W):
+        K = 1
 
-    for orig in expandable:
-        stage_id = orig.task.batches[0].stage_id
-        K = bucket_counts[stage_id]
+    if K == 1:
+        task = Task(
+            chunk=chunk,
+            pp_rank=pp_rank,
+            time_step=col_idx,
+            source_chunk=chunk,
+        )
+        return [task], task, task
 
-        if orig.task.type == TaskType.FWD:
-            # Execution order: bucket 0, 1, …, K-1
-            chain = [
-                TaskNode(
-                    task=Task(
-                        pp_rank=orig.pp_rank,
-                        batches=list(orig.task.batches),
-                        type=TaskType.FWD,
-                    ),
-                    pp_rank=orig.pp_rank,
-                    time_step=orig.time_step * TIME_SCALE + i,
-                    bucket_id=b,
-                )
-                for i, b in enumerate(range(K))
-            ]
-        else:  # BWD / BWD_I: execution order K-1, K-2, …, 0
-            chain = [
-                TaskNode(
-                    task=Task(
-                        pp_rank=orig.pp_rank,
-                        batches=list(orig.task.batches),
-                        type=orig.task.type,   # preserve BWD or BWD_I
-                    ),
-                    pp_rank=orig.pp_rank,
-                    time_step=orig.time_step * TIME_SCALE + i,
-                    bucket_id=K - 1 - i,
-                )
-                for i in range(K)
-            ]
+    # --- Bucketed chain ---
+    if task_type == TaskType.FWD:
+        # Execution order: bucket 0, 1, …, K-1
+        chain = [
+            Task(
+                chunk=Chunk(pp_rank=pp_rank, batches=list(chunk.batches), type=TaskType.FWD),
+                pp_rank=pp_rank,
+                time_step=col_idx * TIME_SCALE + i,
+                bucket_id=b,
+                source_chunk=chunk,
+            )
+            for i, b in enumerate(range(K))
+        ]
+    else:
+        # BWD / BWD_I: execution order K-1, K-2, …, 0
+        chain = [
+            Task(
+                chunk=Chunk(pp_rank=pp_rank, batches=list(chunk.batches), type=task_type),
+                pp_rank=pp_rank,
+                time_step=col_idx * TIME_SCALE + i,
+                bucket_id=K - 1 - i,
+                source_chunk=chunk,
+            )
+            for i in range(K)
+        ]
 
-        # Data-dep and temporal chain between consecutive bucket nodes
-        for i in range(K - 1):
-            chain[i].data_succs.append(chain[i + 1])
-            chain[i + 1].data_preds.append(chain[i])
-            chain[i].temporal_succs.append(chain[i + 1])
-            chain[i + 1].temporal_preds.append(chain[i])
+    # Connect consecutive bucket tasks with data + temporal edges
+    for i in range(K - 1):
+        chain[i].data_succs.append(chain[i + 1])
+        chain[i + 1].data_preds.append(chain[i])
+        chain[i].temporal_succs.append(chain[i + 1])
+        chain[i + 1].temporal_preds.append(chain[i])
 
-        first_bkt = chain[0]
-        last_bkt = chain[-1]
-        node_to_first_last[id(orig)] = (first_bkt, last_bkt, chain)
+    # Insert A2A nodes at boundaries if applicable.
+    # BWD_W (weight gradients) are computed locally and don't need A2A separation.
+    if task_type != TaskType.BWD_W:
+        boundaries = a2a_info.get(stage_id, {}) if stage_id is not None else {}
+        if boundaries:
+            chain = _splice_a2a_nodes(chain, boundaries, task_type, pp_rank, chunk)
 
-    # ---- Step 2b: redirect all edges ----
-    for orig in expandable:
-        first_bkt, last_bkt, _ = node_to_first_last[id(orig)]
-
-        # Incoming data edges: pred -> orig  =>  new_src -> first_bkt
-        for pred in list(orig.data_preds):
-            if orig in pred.data_succs:
-                pred.data_succs.remove(orig)
-            new_src = node_to_first_last[id(pred)][1] if id(pred) in node_to_first_last else pred
-            if first_bkt not in new_src.data_succs:
-                new_src.data_succs.append(first_bkt)
-                first_bkt.data_preds.append(new_src)
-        orig.data_preds.clear()
-
-        # Outgoing data edges: orig -> succ  =>  last_bkt -> new_dst
-        for succ in list(orig.data_succs):
-            if orig in succ.data_preds:
-                succ.data_preds.remove(orig)
-            new_dst = node_to_first_last[id(succ)][0] if id(succ) in node_to_first_last else succ
-            if new_dst not in last_bkt.data_succs:
-                last_bkt.data_succs.append(new_dst)
-                new_dst.data_preds.append(last_bkt)
-        orig.data_succs.clear()
-
-        # Incoming temporal edges: tp -> orig  =>  new_tp -> first_bkt
-        for tp in list(orig.temporal_preds):
-            tp.temporal_succs.remove(orig)
-            new_tp = node_to_first_last[id(tp)][1] if id(tp) in node_to_first_last else tp
-            new_tp.temporal_succs.append(first_bkt)
-            first_bkt.temporal_preds.append(new_tp)
-        orig.temporal_preds.clear()
-
-        # Outgoing temporal edges: orig -> ts  =>  last_bkt -> new_ts
-        for ts in list(orig.temporal_succs):
-            ts.temporal_preds.remove(orig)
-            new_ts = node_to_first_last[id(ts)][0] if id(ts) in node_to_first_last else ts
-            last_bkt.temporal_succs.append(new_ts)
-            new_ts.temporal_preds.append(last_bkt)
-        orig.temporal_succs.clear()
-
-    # ---- Step 2c: build new node list ----
-    orig_ids = set(id(n) for n in expandable)
-    expanded_nodes = []
-    for n in dag.nodes:
-        if id(n) in orig_ids:
-            expanded_nodes.extend(node_to_first_last[id(n)][2])
-        else:
-            expanded_nodes.append(n)
-
-    return TaskDAG(nodes=expanded_nodes)
+    return chain, chain[0], chain[-1]
 
 
 # ---------------------------------------------------------------------------
-# Insert SEND / RECV nodes for cross-rank data dependencies
+# expand_chunks_to_dags: build the full task DAG chunk-by-chunk
 # ---------------------------------------------------------------------------
 
-def insert_p2p_ops(dag: TaskDAG) -> list[TaskDAG]:
-    """Transform a :class:`TaskDAG` into one :class:`TaskDAG` per PP rank.
+def expand_chunks_to_dags(
+    schedule,
+    bucket_counts: dict,
+    a2a_info: dict,
+    dp_degree: int,
+) -> "TaskDAG":
+    """Build a :class:`TaskDAG` by expanding every schedule chunk in-place.
 
-    For every cross-rank data-dependency edge ``task1 (rank A) → task2 (rank B)``:
+    Replaces the former pipeline of ``schedule_to_dag`` →
+    ``expand_bucket_tasks`` → ``expand_a2a_tasks`` →
+    ``insert_p2p_ops`` → ``insert_ar_ops``.
 
-    1. Remove the data-dep edge.
-    2. Create a SEND node on rank A with a data-dep edge ``task1 → SEND``.
-    3. Create a RECV node on rank B with a data-dep edge ``RECV → task2``.
+    For each non-``None`` cell of *schedule*, :func:`_build_chunk_task_chain`
+    produces the expanded task chain (with bucketing and A2A nodes already
+    wired).  Cross-chunk data edges, SEND/RECV nodes, and ALL_REDUCE nodes
+    are then added in subsequent passes.
 
-    SEND / RECV nodes are not inserted into the temporal chain.  Their
-    ``time_step`` is set relative to their compute neighbour: SEND gets
-    ``src.time_step + 1``; RECV gets ``dst.time_step - 1``.
+    Every task created here has its ``source_chunk`` field set to the
+    originating :class:`Chunk` from the pipeline schedule.
 
-    :func:`assign_time_steps` must have been called on *dag* before this
-    function so that the compute nodes carry their final ``time_step`` values.
+    The returned :class:`TaskDAG` has data edges and within-chain temporal
+    edges only.  Between-chunk temporal edges are inserted by the separate
+    :func:`add_temporal_dependencies` pass.
 
-    After the transformation no cross-rank edges should remain.  The function
-    asserts this, then splits the node list by ``pp_rank`` and returns a list of
-    :class:`TaskDAG` objects ordered by ascending PP rank.
+    Args:
+        schedule: The 2-D pipeline pipeline schedule.
+        bucket_counts: Mapping ``stage_id -> K`` for stages with ``K > 1``
+            buckets.  Stages absent from this dict use a single bucket.
+        a2a_info: Mapping ``stage_id -> {boundary_bucket_id -> tensor_idx}``
+            for expert-parallel stages.  May be empty.
+        dp_degree: Number of data-parallel replicas.  When ``> 1``,
+            ALL_REDUCE nodes are inserted for every BWD/BWD_W bucket.
+            Whether a bucket actually has trainable parameters is checked
+            at runtime in run_dag, keeping the schedule model-agnostic.
+
+    Returns:
+        A new :class:`TaskDAG` containing all compute, A2A, SEND/RECV, and
+        (if *dp_degree* > 1) ALL_REDUCE task nodes.
     """
-    all_nodes: list[TaskNode] = list(dag.nodes)
+    # mb_to_entries[mb_idx] = list of (col_idx, sub_idx, head, tail, pp_rank)
+    # Used to build cross-chunk data edges in time order.
+    mb_to_entries: dict = defaultdict(list)
 
-    cross_edges: list[tuple[TaskNode, TaskNode]] = [
+    # (pp_rank, stage_id, mb_idx, bucket_id) -> BWD_I task (for per-bucket BWD_I → BWD_W edges)
+    bwdi_tasks: dict = {}
+
+    all_tasks: list = []
+
+    # ------------------------------------------------------------------
+    # Pass 1: build per-chunk task chains
+    # ------------------------------------------------------------------
+    # Precompute logical start times for cross-rank ordering keys.
+    start_times = schedule._compute_start_times()
+
+    for pp_rank, row in enumerate(schedule.grid):
+        for col_idx, chunk in enumerate(row):
+            if chunk.type == TaskType.FWD_BWD:
+                fwd_batch, bwd_batch = chunk.batches[0], chunk.batches[1]
+
+                fwd_sub = Chunk(pp_rank=pp_rank, batches=[fwd_batch], type=TaskType.FWD)
+                fwd_chain, fwd_head, fwd_tail = _build_chunk_task_chain(
+                    fwd_sub, pp_rank, col_idx, bucket_counts, a2a_info
+                )
+                for t in fwd_chain:
+                    t.source_chunk = chunk  # override to point at original FWD_BWD cell
+
+                bwd_sub = Chunk(pp_rank=pp_rank, batches=[bwd_batch], type=TaskType.BWD)
+                bwd_chain, bwd_head, bwd_tail = _build_chunk_task_chain(
+                    bwd_sub, pp_rank, col_idx, bucket_counts, a2a_info
+                )
+                for t in bwd_chain:
+                    t.source_chunk = chunk
+
+                # Within-cell ordering: FWD executes before BWD
+                fwd_tail.temporal_succs.append(bwd_head)
+                bwd_head.temporal_preds.append(fwd_tail)
+
+                all_tasks.extend(fwd_chain + bwd_chain)
+                logical_t = start_times[pp_rank][col_idx]
+                mb_to_entries[fwd_batch.mb_idx].append((logical_t, 0, fwd_head, fwd_tail, pp_rank))
+                mb_to_entries[bwd_batch.mb_idx].append((logical_t, 1, bwd_head, bwd_tail, pp_rank))
+
+            else:
+                tasks, head, tail = _build_chunk_task_chain(
+                    chunk, pp_rank, col_idx, bucket_counts, a2a_info
+                )
+                all_tasks.extend(tasks)
+
+                # UPD and BWD_W are excluded from the cross-stage mb chain
+                if chunk.type not in (TaskType.UPD, TaskType.BWD_W):
+                    logical_t = start_times[pp_rank][col_idx]
+                    for batch in chunk.batches:
+                        mb_to_entries[batch.mb_idx].append(
+                            (logical_t, 0, head, tail, pp_rank)
+                        )
+
+                # Track per-bucket BWD_I tasks for BWD_I → BWD_W data edges
+                if chunk.type == TaskType.BWD_I and chunk.batches:
+                    b = chunk.batches[0]
+                    for t in tasks:
+                        if t.chunk.type == TaskType.BWD_I:
+                            bwdi_tasks[(pp_rank, b.stage_id, b.mb_idx, t.bucket_id)] = t
+
+    # ------------------------------------------------------------------
+    # Pass 1.5: assign unique_bucket_id and compute_loss
+    # ------------------------------------------------------------------
+    # Build a sorted (stage_id, stage_bucket_id) → unique_bucket_id mapping.
+    # Sorting by stage_id ensures the mapping is deterministic and consistent
+    # with the offset computation in piper.py that passes unique_bucket_ids
+    # to _load_stage.
+    _compute_types = (TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W)
+    _stage_bucket_pairs = sorted(
+        {(t.chunk.batches[0].stage_id, t.bucket_id)
+         for t in all_tasks
+         if t.chunk.type in _compute_types and t.chunk.batches},
+        key=lambda x: (x[0], x[1]),
+    )
+    _sb_to_ubid: dict = {sb: i for i, sb in enumerate(_stage_bucket_pairs)}
+
+    _last_stage_id = max(
+        (t.chunk.batches[0].stage_id
+         for t in all_tasks
+         if t.chunk.type in _compute_types and t.chunk.batches),
+        default=None,
+    )
+
+    for task in all_tasks:
+        if task.chunk.type in _compute_types and task.chunk.batches:
+            s = task.chunk.batches[0].stage_id
+            task.unique_bucket_id = _sb_to_ubid.get((s, task.bucket_id))
+
+    # Set compute_loss=True on the first-to-run BWD/BWD_I task of the last stage.
+    # "First to run" = highest bucket_id (BWD executes in reverse bucket order).
+    if _last_stage_id is not None:
+        _last_stage_K = bucket_counts.get(_last_stage_id, 1)
+        _last_bkt = _last_stage_K - 1
+        for task in all_tasks:
+            if (task.chunk.type in (TaskType.BWD, TaskType.BWD_I)
+                    and task.chunk.batches
+                    and task.chunk.batches[0].stage_id == _last_stage_id
+                    and task.bucket_id == _last_bkt):
+                task.compute_loss = True
+
+    # ------------------------------------------------------------------
+    # Pass 2: per-bucket BWD_I → BWD_W data edges
+    # ------------------------------------------------------------------
+    bwd_w_tasks: dict = {}  # (pp_rank, stage_id, mb_idx, bucket_id) -> Task
+    for task in all_tasks:
+        if task.chunk.type == TaskType.BWD_W and task.chunk.batches:
+            b = task.chunk.batches[0]
+            bwd_w_tasks[(task.pp_rank, b.stage_id, b.mb_idx, task.bucket_id)] = task
+
+    for key, bwdi_task in bwdi_tasks.items():
+        bwdw_task = bwd_w_tasks.get(key)
+        if bwdw_task is not None:
+            bwdi_task.data_succs.append(bwdw_task)
+            bwdw_task.data_preds.append(bwdi_task)
+
+    # ------------------------------------------------------------------
+    # Pass 3: cross-chunk data edges
+    # ------------------------------------------------------------------
+    for mb_idx, entries in mb_to_entries.items():
+        entries.sort(key=lambda e: (e[0], e[1], e[4]))  # col_idx, sub_idx, pp_rank
+        for i in range(len(entries) - 1):
+            _ci, _si, _head_i, tail_i, _ri = entries[i]
+            _cn, _sn, head_n, _tn, _rn = entries[i + 1]
+            tail_i.data_succs.append(head_n)
+            head_n.data_preds.append(tail_i)
+
+
+    # ------------------------------------------------------------------
+    # Pass 4: SEND / RECV nodes for cross-rank data edges
+    # ------------------------------------------------------------------
+    cross_edges = [
         (src, dst)
-        for src in all_nodes
-        for dst in src.data_succs
+        for src in list(all_tasks)
+        for dst in list(src.data_succs)
         if src.pp_rank != dst.pp_rank
     ]
-
     for src, dst in cross_edges:
         src.data_succs.remove(dst)
         dst.data_preds.remove(src)
 
-        send_node = TaskNode(
-            task=Task(pp_rank=src.pp_rank, batches=list(src.task.batches), type=TaskType.SEND),
+        send_node = Task(
+            chunk=Chunk(pp_rank=src.pp_rank, batches=list(src.chunk.batches), type=TaskType.SEND),
             pp_rank=src.pp_rank,
-            time_step=src.time_step + 1,
+            time_step=0,  # assigned later by assign_time_steps
             peer_pp_rank=dst.pp_rank,
+            source_chunk=src.source_chunk,
         )
         src.data_succs.append(send_node)
         send_node.data_preds.append(src)
 
-        recv_node = TaskNode(
-            task=Task(pp_rank=dst.pp_rank, batches=list(dst.task.batches), type=TaskType.RECV),
+        recv_metadata = {}
+        if dst.chunk.type in (TaskType.BWD, TaskType.BWD_I):
+            recv_metadata["fwd_ubid"] = dst.unique_bucket_id
+        recv_node = Task(
+            chunk=Chunk(pp_rank=dst.pp_rank, batches=list(dst.chunk.batches), type=TaskType.RECV),
             pp_rank=dst.pp_rank,
-            time_step=dst.time_step - 1,
+            time_step=0,  # assigned later by assign_time_steps
             peer_pp_rank=src.pp_rank,
+            source_chunk=dst.source_chunk,
+            custom_metadata=recv_metadata,
         )
         recv_node.data_succs.append(dst)
         dst.data_preds.append(recv_node)
 
-        all_nodes.append(send_node)
-        all_nodes.append(recv_node)
+        all_tasks.append(send_node)
+        all_tasks.append(recv_node)
 
-    for node in all_nodes:
+    # ------------------------------------------------------------------
+    # Pass 5: ALL_REDUCE nodes for data-parallel gradient sync
+    # ------------------------------------------------------------------
+    if dp_degree > 1:
+        bwd_groups: dict = defaultdict(list)
+        for task in all_tasks:
+            if task.chunk.type in (TaskType.BWD, TaskType.BWD_W) and task.chunk.batches:
+                s = task.chunk.batches[0].stage_id
+                key = (s, task.bucket_id)
+                bwd_groups[key].append(task)
+
+        for (stage_id, bucket_id), group in bwd_groups.items():
+            trigger = max(group, key=lambda n: n.time_step)
+            ar_node = Task(
+                chunk=Chunk(
+                    pp_rank=trigger.pp_rank,
+                    batches=list(trigger.chunk.batches),
+                    type=TaskType.ALL_REDUCE,
+                ),
+                pp_rank=trigger.pp_rank,
+                time_step=trigger.time_step + 1,
+                bucket_id=bucket_id,
+                source_chunk=trigger.source_chunk,
+            )
+            trigger.data_succs.append(ar_node)
+            ar_node.data_preds.append(trigger)
+            all_tasks.append(ar_node)
+
+    return TaskDAG(nodes=all_tasks)
+
+
+# ---------------------------------------------------------------------------
+# add_temporal_dependencies: insert temporal edges between adjacent chunks
+# ---------------------------------------------------------------------------
+
+_CRITICAL_PATH_TYPES = frozenset({
+    TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W,
+    TaskType.FWD_BWD, TaskType.FWD_A2A, TaskType.BWD_A2A,
+})
+
+
+def add_temporal_dependencies(dag: "TaskDAG", schedule) -> None:
+    """Insert temporal edges that enforce execution order between adjacent chunks.
+
+    For each row of *schedule*, consecutive non-``None`` chunk pairs ``(c1,
+    c2)`` receive a temporal edge from the last critical-path task of *c1* to
+    the first critical-path task of *c2*.
+
+    The **critical-path chain** for a chunk is the sub-DAG of tasks associated
+    with that chunk whose type is in :data:`_CRITICAL_PATH_TYPES` (i.e.
+    compute and A2A tasks; SEND, RECV, and ALL_REDUCE are excluded).  Head and
+    tail are found by following both data-dependency *and* within-chunk
+    temporal edges.
+
+    A :data:`~TaskType.UPD` node is also synthesised for each pipeline rank
+    and appended to ``dag.nodes`` as the terminal temporal task for that rank.
+
+    Args:
+        dag: :class:`TaskDAG` produced by :func:`expand_chunks_to_dags`.
+            Must contain only data edges and within-chain temporal edges —
+            no between-chunk temporal edges should exist yet.
+        schedule: The :class:`PipelineSchedule` whose grid determines
+            adjacency and row membership.
+    """
+    # Group all tasks by id(source_chunk) for fast lookup.
+    sc_to_tasks: dict = defaultdict(list)
+    for task in dag.nodes:
+        if task.source_chunk is not None:
+            sc_to_tasks[id(task.source_chunk)].append(task)
+
+    def _cp_endpoints(chunk_id: int):
+        """Return (head, tail) of the critical-path sub-DAG for *chunk_id*.
+
+        Uses both data and temporal edges within the filtered task set so
+        that FWD_BWD cells (where FWD and BWD sub-chains are joined only by
+        a temporal edge) are handled correctly.
+        """
+        tasks = [t for t in sc_to_tasks.get(chunk_id, [])
+                 if t.chunk.type in _CRITICAL_PATH_TYPES]
+        if not tasks:
+            return None, None
+        task_ids = {id(t) for t in tasks}
+        head = next(
+            t for t in tasks
+            if not any(id(p) in task_ids
+                       for p in list(t.data_preds) + list(t.temporal_preds))
+        )
+        tail = next(
+            t for t in tasks
+            if not any(id(s) in task_ids
+                       for s in list(t.data_succs) + list(t.temporal_succs))
+        )
+        return head, tail
+
+    new_nodes: list = []
+
+    for pp_rank, row in enumerate(schedule.grid):
+        non_none = list(enumerate(row))
+        if not non_none:
+            continue
+
+        # Between-chunk temporal edges for consecutive pairs
+        for i in range(len(non_none) - 1):
+            _, c1 = non_none[i]
+            _, c2 = non_none[i + 1]
+            _, tail_c1 = _cp_endpoints(id(c1))
+            head_c2, _ = _cp_endpoints(id(c2))
+            if tail_c1 is not None and head_c2 is not None:
+                tail_c1.temporal_succs.append(head_c2)
+                head_c2.temporal_preds.append(tail_c1)
+
+        # UPD node: temporal successor of the last chunk's critical-path tail
+        _, last_chunk = non_none[-1]
+        _, last_tail = _cp_endpoints(id(last_chunk))
+        if last_tail is not None:
+            upd_node = Task(
+                chunk=Chunk(
+                    pp_rank=last_tail.pp_rank,
+                    batches=list(last_tail.chunk.batches),
+                    type=TaskType.UPD,
+                ),
+                pp_rank=last_tail.pp_rank,
+                time_step=0,
+                source_chunk=last_chunk,
+            )
+            last_tail.temporal_succs.append(upd_node)
+            upd_node.temporal_preds.append(last_tail)
+            new_nodes.append(upd_node)
+
+    dag.nodes.extend(new_nodes)
+
+
+# ---------------------------------------------------------------------------
+# split_dag_by_rank: partition unified DAG into per-rank DAGs
+# ---------------------------------------------------------------------------
+
+def split_dag_by_rank(dag: "TaskDAG") -> list:
+    """Split a unified :class:`TaskDAG` into one :class:`TaskDAG` per PP rank.
+
+    Asserts that no cross-rank data or temporal edges remain (they should
+    have been replaced by SEND/RECV nodes in :func:`expand_chunks_to_dags`).
+
+    Returns:
+        List of :class:`TaskDAG` objects ordered by ascending PP rank.
+    """
+    for node in dag.nodes:
         for succ in node.data_succs:
             assert node.pp_rank == succ.pp_rank, (
                 f"Cross-rank data edge still present: "
@@ -1749,77 +1968,25 @@ def insert_p2p_ops(dag: TaskDAG) -> list[TaskDAG]:
                 f"{ts.node_id()} (rank {ts.pp_rank})"
             )
 
-    rank_nodes: dict[int, list[TaskNode]] = defaultdict(list)
-    for node in all_nodes:
+    rank_nodes: dict = defaultdict(list)
+    for node in dag.nodes:
         rank_nodes[node.pp_rank].append(node)
 
     return [TaskDAG(nodes=rank_nodes[r]) for r in sorted(rank_nodes)]
 
 
-def insert_ar_ops(per_rank_dags: list, trainable_bucket_keys: set | None = None) -> list:
-    """Insert ALL_REDUCE nodes into each per-rank DAG for DP gradient sync.
-
-    For each (stage_id, bucket_id) group of BWD/BWD_I nodes, add one ALL_REDUCE
-    after the final microbatch's node.  The actor all-reduces the pre-allocated
-    flat_grads tensor for that (stage, bucket) pair.
-
-    The ALL_REDUCE node has exactly one data edge: from the final microbatch
-    BWD/BWD_I node.  Synchronisation with UPD is handled at the CUDA level via
-    ar_events in _update_impl.
-
-    Args:
-        per_rank_dags: Per-rank TaskDAG list to mutate in-place.
-        trainable_bucket_keys: If provided, only insert ALL_REDUCE for
-            (stage_id, bucket_id) pairs present in this set.  Parameterless
-            buckets (e.g. A2A dispatch/combine segments in MoE models) must be
-            excluded or the actor will crash with a None flat_grads tensor.
-    """
-    for rank_dag in per_rank_dags:
-        new_nodes = []
-
-        # Group BWD/BWD_I nodes by (stage_id, bucket_id).  One ALL_REDUCE is
-        # inserted per group, triggered by the final microbatch's node in that group.
-        bwd_groups: dict = defaultdict(list)
-        for node in rank_dag.nodes:
-            if node.task.type in (TaskType.BWD, TaskType.BWD_I):
-                s = node.task.batches[0].stage_id
-                key = (s, node.bucket_id)
-                if trainable_bucket_keys is not None and key not in trainable_bucket_keys:
-                    continue
-                bwd_groups[key].append(node)
-
-        for (stage_id, bucket_id), group in bwd_groups.items():
-            trigger_node = max(group, key=lambda n: n.time_step)
-            ar_task = Task(
-                pp_rank=trigger_node.pp_rank,
-                batches=list(trigger_node.task.batches),
-                type=TaskType.ALL_REDUCE,
-            )
-            ar_node = TaskNode(
-                task=ar_task,
-                pp_rank=trigger_node.pp_rank,
-                time_step=trigger_node.time_step + 1,
-                bucket_id=bucket_id,
-            )
-            trigger_node.data_succs.append(ar_node)
-            ar_node.data_preds.append(trigger_node)
-            new_nodes.append(ar_node)
-
-        rank_dag.nodes.extend(new_nodes)
-
-    return per_rank_dags
 
 
 # ---------------------------------------------------------------------------
 # Graphviz visualisation
 # ---------------------------------------------------------------------------
 
-def _task_node_label(node: TaskNode) -> str:
-    """Short human-readable label for a TaskNode."""
-    task = node.task
+def _task_node_label(node: Task) -> str:
+    """Short human-readable label for a Task."""
+    chunk = node.chunk
 
-    if task.type in (TaskType.SEND, TaskType.RECV):
-        op = "SEND" if task.type == TaskType.SEND else "RECV"
+    if chunk.type in (TaskType.SEND, TaskType.RECV):
+        op = "SEND" if chunk.type == TaskType.SEND else "RECV"
         return op
 
     type_abbrev = {
@@ -1832,26 +1999,75 @@ def _task_node_label(node: TaskNode) -> str:
         TaskType.ALL_REDUCE: "AR",
         TaskType.FWD_A2A: "F_A2A",
         TaskType.BWD_A2A: "B_A2A",
-    }.get(task.type, "?")
+    }.get(chunk.type, "?")
 
-    if task.type == TaskType.UPD:
+    if chunk.type == TaskType.UPD:
         return type_abbrev
 
-    if task.type == TaskType.ALL_REDUCE:
-        stage_id = task.batches[0].stage_id
+    if chunk.type == TaskType.ALL_REDUCE:
+        stage_id = chunk.batches[0].stage_id
         return "AR"
-    
-    if task.type == TaskType.FWD_A2A or task.type == TaskType.BWD_A2A:
-        return "A2A"
 
-    parts = " + ".join(f"S{b.stage_id} M{b.mb_idx}" for b in task.batches)
+    if chunk.type in (TaskType.FWD_A2A, TaskType.BWD_A2A):
+        return type_abbrev
+
+    parts = " + ".join(f"S{b.stage_id} M{b.mb_idx}" for b in chunk.batches)
     return f"{type_abbrev} {parts}"
+
+
+def compute_critical_path(dag: TaskDAG) -> set:
+    """Return the set of UIDs of nodes on the critical path of *dag*.
+
+    Uses both data-dependency and temporal edges.  Nodes whose ``runtime``
+    field is ``None`` are treated as having zero duration (so they appear on
+    the critical path only when they sit between two critical nodes).
+
+    Returns:
+        A ``set[int]`` of ``node.uid`` values for every critical node.
+    """
+    from collections import deque as _deque2
+
+    # Topological sort (Kahn's algorithm over both edge kinds).
+    in_deg = {n.uid: len(n.data_preds) + len(n.temporal_preds) for n in dag.nodes}
+    queue = _deque2(n for n in dag.nodes if in_deg[n.uid] == 0)
+    topo: list = []
+    while queue:
+        node = queue.popleft()
+        topo.append(node)
+        for s in list(node.data_succs) + list(node.temporal_succs):
+            in_deg[s.uid] -= 1
+            if in_deg[s.uid] == 0:
+                queue.append(s)
+
+    # Forward pass: EST[uid] = earliest start time.
+    est: dict = {}
+    for node in topo:
+        preds = list(node.data_preds) + list(node.temporal_preds)
+        est[node.uid] = max(
+            (est[p.uid] + (p.runtime or 0.0) for p in preds),
+            default=0.0,
+        )
+
+    makespan = max(est[n.uid] + (n.runtime or 0.0) for n in dag.nodes)
+
+    # Backward pass: LST[uid] = latest start time that doesn't extend makespan.
+    lst: dict = {}
+    for node in reversed(topo):
+        w = node.runtime or 0.0
+        succs = list(node.data_succs) + list(node.temporal_succs)
+        lst[node.uid] = (
+            min(lst[s.uid] for s in succs) - w if succs else makespan - w
+        )
+
+    _EPS = 1e-6
+    return {n.uid for n in dag.nodes if abs(lst[n.uid] - est[n.uid]) < _EPS}
 
 
 def visualize_dag(
     dag: TaskDAG,
     output_path: str = "dag",
     fmt: str = "png",
+    critical_path_nodes: "set | None" = None,
 ) -> None:
     """Render a :class:`TaskDAG` as a labelled image using *graphviz*.
 
@@ -1859,6 +2075,14 @@ def visualize_dag(
 
     * **Dashed grey** – temporal edges (serialisation within one actor).
     * **Solid black** – data-dependency edges.
+
+    Args:
+        dag: The task DAG to render.
+        output_path: Path prefix for the output file (no extension).
+        fmt: Output format passed to graphviz (``"png"``, ``"svg"``, …).
+        critical_path_nodes: Optional set of ``node.uid`` integers.  Nodes
+            whose uid is in this set are outlined in red with a thick border.
+            If ``None`` no critical-path highlighting is applied.
 
     The image is saved to ``{output_path}.{fmt}``.
     If *graphviz* is not installed the function logs a warning and returns.
@@ -1876,9 +2100,9 @@ def visualize_dag(
     # Build a mapping from pp_rank -> sorted list of stage_ids on that rank.
     pp_rank_stages: dict[int, list[int]] = {}
     for n in dag.nodes:
-        if n.task.batches:
-            rank = n.task.pp_rank
-            sid = n.task.batches[0].stage_id
+        if n.chunk.batches:
+            rank = n.chunk.pp_rank
+            sid = n.chunk.batches[0].stage_id
             if rank not in pp_rank_stages:
                 pp_rank_stages[rank] = []
             if sid not in pp_rank_stages[rank]:
@@ -1890,8 +2114,8 @@ def visualize_dag(
         TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W, TaskType.FWD_BWD,
     )
 
-    def _node_fill(node: TaskNode) -> str:
-        t = node.task.type
+    def _node_fill(node: Task) -> str:
+        t = node.chunk.type
         if t in (TaskType.SEND, TaskType.RECV, TaskType.FWD_A2A, TaskType.BWD_A2A, TaskType.ALL_REDUCE):
             return "#FFFFFF"
         if t == TaskType.FWD:
@@ -1902,15 +2126,15 @@ def visualize_dag(
             return "#2E86C1"  # blue
         return "#D5D8DC"
 
-    def _node_fontcolor(node: TaskNode) -> str:
-        t = node.task.type
-        if t not in _COMPUTE_TYPES or not node.task.batches:
+    def _node_fontcolor(node: Task) -> str:
+        t = node.chunk.type
+        if t not in _COMPUTE_TYPES or not node.chunk.batches:
             return "black"
-        rank = node.task.pp_rank
+        rank = node.chunk.pp_rank
         stages = pp_rank_stages.get(rank, [])
         if len(stages) < 2:
             return "black"
-        sid = node.task.batches[0].stage_id
+        sid = node.chunk.batches[0].stage_id
         # First stage -> black text, second (and beyond) stage -> white text
         return "black" if sid == stages[0] else "white"
 
@@ -1932,44 +2156,31 @@ def visualize_dag(
             if _in_degree[_s.node_id()] == 0:
                 _queue.append(_s)
 
-    dot = graphviz.Digraph("PiperDAG", comment="Piper Task DAG")
+    dot = graphviz.Digraph("PiperDAG", comment="Piper Chunk DAG")
     dot.attr(rankdir="LR", splines="ortho", nodesep="0.4", ranksep="0.6", fontname="Helvetica")
     dot.attr("node", shape="box", style="filled", fontsize="9", fontname="Helvetica")
     dot.attr("edge", fontsize="8", fontname="Helvetica")
 
     for node in dag.nodes:
         label = f"{node.time_step}\n{_task_node_label(node)}"
+        if node.runtime is not None:
+            label += f"\n{node.runtime:.1f}ms"
+        on_critical = critical_path_nodes is not None and node.uid in critical_path_nodes
         dot.node(
             node.node_id(),
             label=label,
             fillcolor=_node_fill(node),
             fontcolor=_node_fontcolor(node),
-            tooltip=repr(node.task),
+            tooltip=repr(node.chunk),
+            color="red" if on_critical else "black",
+            penwidth="3.0" if on_critical else "1.0",
         )
 
-    # Assign column positions so that every temporal edge spans exactly one column.
-    # Assign column positions via BFS from temporal roots.
-    # When the temporal graph has forks/joins (after overlap_a2a_tasks), use
-    # max-predecessor depth to place join nodes correctly.
-    # SEND/RECV/AR nodes have no temporal edges and are left unranked.
-    _tdepth: dict[str, int] = {}
-    _tq: _deque = _deque()
-    for _n in dag.nodes:
-        if not _n.temporal_preds and _n.temporal_succs:
-            _tdepth[_n.node_id()] = 0
-            _tq.append(_n)
-    while _tq:
-        _n = _tq.popleft()
-        for _s in _n.temporal_succs:
-            new_d = _tdepth[_n.node_id()] + 1
-            if _s.node_id() not in _tdepth or _tdepth[_s.node_id()] < new_d:
-                _tdepth[_s.node_id()] = new_d
-                _tq.append(_s)
-
-    depth_to_nodes: dict[int, list[TaskNode]] = defaultdict(list)
+    # Group nodes by time_step so that tasks scheduled at the same step share
+    # a column (graphviz rank="same").
+    depth_to_nodes: dict[int, list[Task]] = defaultdict(list)
     for node in dag.nodes:
-        if node.node_id() in _tdepth:
-            depth_to_nodes[_tdepth[node.node_id()]].append(node)
+        depth_to_nodes[node.time_step].append(node)
 
     for col_nodes in depth_to_nodes.values():
         with dot.subgraph() as sub:
@@ -2005,19 +2216,6 @@ def visualize_dag(
     logger.info(f"DAG visualisation saved to {out}")
 
 
-def visualize_schedule(
-    schedule: Schedule2D,
-    output_path: str = "schedule",
-    fmt: str = "png",
-) -> None:
-    """Render a :class:`Schedule2D` as a labelled DAG image using *graphviz*.
-
-    Converts the schedule to a :class:`TaskDAG` via :func:`schedule_to_dag`
-    then delegates to :func:`visualize_dag`.
-    """
-    dag = schedule_to_dag(schedule)
-    visualize_dag(dag, output_path=output_path, fmt=fmt)
-
 
 def print_dag_order(dag: TaskDAG, label: str = "") -> None:
     """Print the topological execution order of nodes in a :class:`TaskDAG`.
@@ -2038,11 +2236,11 @@ def print_dag_order(dag: TaskDAG, label: str = "") -> None:
     step = 0
     while queue:
         node = queue.popleft()
-        task = node.task
-        ttype = task.type.value if task.type is not None else "?"
+        chunk = node.chunk
+        ttype = chunk.type.value if chunk.type is not None else "?"
         batches_str = ", ".join(
-            f"s{b.stage_id} mb{b.mb_idx}" for b in task.batches
-        ) if task.batches else ""
+            f"s{b.stage_id} mb{b.mb_idx}" for b in chunk.batches
+        ) if chunk.batches else ""
         bkt = f" bkt={node.bucket_id}" if node.bucket_id else ""
         print(f"  {step:3d}  rank={node.pp_rank}  {ttype:<14s}  {batches_str}{bkt}")
         step += 1
@@ -2915,181 +3113,132 @@ def split_by_a2a(
 
 
 # ---------------------------------------------------------------------------
-# expand_a2a_tasks: insert FWD_A2A / BWD_A2A nodes into the task DAG
+# find_overlappable_tasks: identify adjacent task pairs safe to overlap
 # ---------------------------------------------------------------------------
 
-def expand_a2a_tasks(dag: TaskDAG, a2a_info: dict) -> TaskDAG:
-    """Insert FWD_A2A / BWD_A2A task nodes into the DAG between adjacent bucket
-    nodes at all-to-all boundaries.
+def find_overlappable_tasks(schedule: PipelineSchedule) -> list[tuple[Chunk, Chunk]]:
+    """Find pairs of adjacent tasks in the schedule that can be safely overlapped.
 
-    Must be called *after* :func:`expand_bucket_tasks`.
+    A pair ``(t1, t2)`` where t1 precedes t2 on the same pp_rank is overlappable
+    iff all three conditions hold:
 
-    For the forward pass, between FWD(bucket_id=i) and
-    FWD(bucket_id=i+1) a FWD_A2A node is inserted.
+    1. **No data dependency**: t1 and t2 process entirely different microbatches.
+    2. **Upstream deps satisfied before overlap start**: the upstream tasks of *both*
+       t1 and t2 complete by ``min(start(t1), start(t2))``.
+    3. **Downstream deps deferred past overlap end**: the downstream tasks of *both*
+       t1 and t2 start no earlier than ``max(end(t1), end(t2))``.
 
-    For the backward pass (which runs in reverse bucket order), between
-    BWD(bucket_id=i+1) and BWD(bucket_id=i) a BWD_A2A node is
-    inserted.
+    Conditions 2 (for t1) and 3 (for t2) are trivially satisfied by any valid
+    schedule, so the effective non-trivial checks are:
+
+    * ``upstream_end(t2) <= min(start(t1), start(t2))``
+    * ``downstream_start(t1) >= max(end(t1), end(t2))``
 
     Args:
-        dag: TaskDAG produced by :func:`expand_bucket_tasks`.
-        a2a_info: Mapping ``stage_id -> {boundary_bucket_id -> tensor_idx}``.
-            Only stages present here are modified.
+        schedule: The pipeline schedule (``list[list[Chunk]]``, no Nones).
 
     Returns:
-        A new TaskDAG with inserted FWD_A2A / BWD_A2A nodes.
+        A list of ``(t1, t2)`` :class:`Chunk` pairs suitable for passing to
+        :func:`overlap_a2a_tasks`.
     """
-    if not a2a_info:
-        return dag
+    start_times_per_rank = schedule._compute_start_times()
 
-    # Index FWD/BWD/BWD_I nodes by (stage_id, mb_idx, type, bucket_id)
-    bucket_node_map: dict = {}
-    for node in dag.nodes:
-        t = node.task
-        if t.type in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I):
-            sid = t.batches[0].stage_id
-            mid = t.batches[0].mb_idx
-            bucket_node_map[(sid, mid, t.type, node.bucket_id)] = node
+    # chunk_id -> (logical_start, logical_end)
+    chunk_times: dict[int, tuple[int, int]] = {}
+    for row, starts in zip(schedule.grid, start_times_per_rank):
+        for chunk, start in zip(row, starts):
+            chunk_times[id(chunk)] = (start, start + logical_time(chunk))
 
-    new_nodes: list[TaskNode] = []
+    # mb_idx -> sorted list of (start, end) for every chunk across all ranks that
+    # touches that microbatch.
+    mb_timeline: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for row in schedule.grid:
+        for chunk in row:
+            start, end = chunk_times[id(chunk)]
+            for batch in chunk.batches:
+                mb_timeline[batch.mb_idx].append((start, end))
+    for mb_idx in mb_timeline:
+        mb_timeline[mb_idx].sort()
 
-    for node in dag.nodes:
-        t = node.task
-        if t.type not in (TaskType.FWD, TaskType.BWD, TaskType.BWD_I):
-            continue
-        sid = t.batches[0].stage_id
-        if sid not in a2a_info:
-            continue
-        boundaries = a2a_info[sid]
+    def _upstream_end(chunk: Chunk, chunk_start: int) -> int | None:
+        """Latest end time of any chunk that starts before *chunk_start* and shares
+        a microbatch with *chunk*, or ``None`` if no such chunk exists."""
+        best: int | None = None
+        for batch in chunk.batches:
+            for s, e in mb_timeline.get(batch.mb_idx, []):
+                if s < chunk_start:
+                    best = e if best is None else max(best, e)
+        return best
 
-        if t.type == TaskType.FWD:
-            # Insert FWD_A2A after FWD(bucket_id) if it's a boundary
-            bkt_id = node.bucket_id
-            if bkt_id not in boundaries:
+    def _downstream_start(chunk: Chunk, chunk_start: int) -> int | None:
+        """Earliest start time of any chunk that starts after *chunk_start* and
+        shares a microbatch with *chunk*, or ``None`` if no such chunk exists."""
+        best: int | None = None
+        for batch in chunk.batches:
+            for s, e in mb_timeline.get(batch.mb_idx, []):
+                if s > chunk_start:
+                    best = s if best is None else min(best, s)
+        return best
+
+    result: list[tuple[Chunk, Chunk]] = []
+
+    for row, starts in zip(schedule.grid, start_times_per_rank):
+        for i in range(len(row) - 1):
+            t1, t2 = row[i], row[i + 1]
+            start1, end1 = chunk_times[id(t1)]
+            start2, end2 = chunk_times[id(t2)]
+
+            overlap_start = min(start1, start2)
+            overlap_end = max(end1, end2)
+
+            # Condition 1: no shared microbatch.
+            mb1 = {b.mb_idx for b in t1.batches}
+            mb2 = {b.mb_idx for b in t2.batches}
+            if mb1 & mb2:
                 continue
-            tensor_idx = boundaries[bkt_id]
-            mb_idx = t.batches[0].mb_idx
 
-            # Find the successor FWD(bucket_id+1)
-            next_bkt_key = (sid, mb_idx, TaskType.FWD, bkt_id + 1)
-            if next_bkt_key not in bucket_node_map:
+            # Condition 2 (non-trivial part): t2's upstream must finish by overlap_start.
+            up2 = _upstream_end(t2, start2)
+            if up2 is not None and up2 > overlap_start:
                 continue
-            next_node = bucket_node_map[next_bkt_key]
 
-            a2a_node = TaskNode(
-                task=Task(
-                    pp_rank=node.pp_rank,
-                    batches=list(t.batches),
-                    type=TaskType.FWD_A2A,
-                ),
-                pp_rank=node.pp_rank,
-                time_step=0,  # assigned later by assign_time_steps
-                bucket_id=bkt_id,
-                a2a_tensor_idx=tensor_idx,
-            )
-
-            # Rewire data: node -> a2a_node -> next_node  (replacing node -> next_node)
-            if next_node in node.data_succs:
-                node.data_succs.remove(next_node)
-            if node in next_node.data_preds:
-                next_node.data_preds.remove(node)
-
-            node.data_succs.append(a2a_node)
-            a2a_node.data_preds.append(node)
-            a2a_node.data_succs.append(next_node)
-            next_node.data_preds.append(a2a_node)
-
-            # Splice into temporal chain: node → a2a_node → next_node
-            node.temporal_succs.remove(next_node)
-            next_node.temporal_preds.remove(node)
-            node.temporal_succs.append(a2a_node)
-            a2a_node.temporal_preds.append(node)
-            a2a_node.temporal_succs.append(next_node)
-            next_node.temporal_preds.append(a2a_node)
-
-            new_nodes.append(a2a_node)
-
-        else:  # BWD / BWD_I with bucket_id
-            # Insert BWD_A2A after BWD/BWD_I(bucket_id+1) if there's a boundary there
-            # (i.e. between bkt_id+1 and bkt_id in backward execution order)
-            bkt_id = node.bucket_id
-            if bkt_id not in boundaries:
+            # Condition 3 (non-trivial part): t1's downstream must not start until overlap_end.
+            down1 = _downstream_start(t1, start1)
+            if down1 is not None and down1 < overlap_end:
                 continue
-            # This BWD/BWD_I(bkt_id) is the later node in the backward chain.
-            # We need to insert BWD_A2A between BWD/BWD_I(bkt_id+1) and BWD/BWD_I(bkt_id).
-            # The predecessor in the data chain is BWD/BWD_I(bkt_id+1).
-            tensor_idx = boundaries[bkt_id]
-            mb_idx = t.batches[0].mb_idx
 
-            prev_bkt_key = (sid, mb_idx, t.type, bkt_id + 1)
-            if prev_bkt_key not in bucket_node_map:
-                continue
-            prev_node = bucket_node_map[prev_bkt_key]
+            result.append((t1, t2))
 
-            a2a_node = TaskNode(
-                task=Task(
-                    pp_rank=node.pp_rank,
-                    batches=list(t.batches),
-                    type=TaskType.BWD_A2A,
-                ),
-                pp_rank=node.pp_rank,
-                time_step=0,  # assigned later by assign_time_steps
-                bucket_id=bkt_id,
-                a2a_tensor_idx=tensor_idx,
-            )
-
-            # Rewire data: prev_node -> a2a_node -> node  (replacing prev_node -> node)
-            if node in prev_node.data_succs:
-                prev_node.data_succs.remove(node)
-            if prev_node in node.data_preds:
-                node.data_preds.remove(prev_node)
-
-            prev_node.data_succs.append(a2a_node)
-            a2a_node.data_preds.append(prev_node)
-            a2a_node.data_succs.append(node)
-            node.data_preds.append(a2a_node)
-
-            # Splice into temporal chain: prev_node → a2a_node → node
-            prev_node.temporal_succs.remove(node)
-            node.temporal_preds.remove(prev_node)
-            prev_node.temporal_succs.append(a2a_node)
-            a2a_node.temporal_preds.append(prev_node)
-            a2a_node.temporal_succs.append(node)
-            node.temporal_preds.append(a2a_node)
-
-            new_nodes.append(a2a_node)
-
-    all_nodes = list(dag.nodes) + new_nodes
-    return TaskDAG(nodes=all_nodes)
+    return result
 
 # ---------------------------------------------------------------------------
 # Overlap compute and A2A tasks across consecutive task pairs
 # ---------------------------------------------------------------------------
 
-def _find_task_chain_endpoints(dag: TaskDAG, task: Task) -> tuple[TaskNode, TaskNode]:
-    """Return (first_node, last_node) in the temporal chain for the given task.
+def _find_task_chain_endpoints(dag: TaskDAG, chunk: Chunk) -> tuple[Task, Task]:
+    """Return (first_node, last_node) in the temporal chain for the given chunk.
 
     "First" is the node in the group none of whose temporal_preds are also in
     the group; "last" is the node none of whose temporal_succs are in the group.
 
-    The "group" for a task is all DAG nodes sharing the same pp_rank,
-    stage_id, mb_idx, and either the task's compute type or its paired A2A type.
+    The "group" for a chunk is all DAG nodes sharing the same pp_rank,
+    stage_id, mb_idx, and either the chunk's compute type or its paired A2A type.
     """
-    stage_id = task.batches[0].stage_id
-    mb_idx   = task.batches[0].mb_idx
-    compute_type = task.type
+    stage_id = chunk.batches[0].stage_id
+    mb_idx   = chunk.batches[0].mb_idx
+    compute_type = chunk.type
     a2a_type = TaskType.FWD_A2A if compute_type == TaskType.FWD else TaskType.BWD_A2A
 
     group = [
         n for n in dag.nodes
-        if n.pp_rank == task.pp_rank
-        and n.task.batches
-        and n.task.batches[0].stage_id == stage_id
-        and n.task.batches[0].mb_idx   == mb_idx
-        and n.task.type in (compute_type, a2a_type)
+        if n.pp_rank == chunk.pp_rank
+        and n.chunk.batches
+        and n.chunk.batches[0].stage_id == stage_id
+        and n.chunk.batches[0].mb_idx   == mb_idx
+        and n.chunk.type in (compute_type, a2a_type)
     ]
     assert group, (
-        f"No DAG nodes found for task pp_rank={task.pp_rank} "
+        f"No DAG nodes found for chunk pp_rank={chunk.pp_rank} "
         f"stage={stage_id} mb={mb_idx} type={compute_type}"
     )
 
@@ -3105,30 +3254,35 @@ def _find_task_chain_endpoints(dag: TaskDAG, task: Task) -> tuple[TaskNode, Task
     return first, last
 
 
-def overlap_a2a_tasks(dag: TaskDAG, task_pairs: list[tuple[Task, Task]]) -> TaskDAG:
+def overlap_a2a_tasks(dag: TaskDAG, task_pairs: list[tuple[Chunk, Chunk]]) -> TaskDAG:
     """Overlap compute and A2A tasks across each consecutive task pair.
 
     For each pair ``(t1, t2)`` the pre-transform temporal chain contains:
 
         T1_first → … → T1_last → T2_first → … → T2_last
 
-    This function rewires the temporal dependencies so that T2 starts as soon
-    as T1 starts (not after T1 finishes), while still requiring T2_last to
-    complete after T1_last:
+    where each chain has the structure ``C_0 → A2A_0 → C_1 → A2A_1 → … → C_n``
+    with ``C_i`` compute nodes and ``A2A_i`` communication nodes.
 
-      1. Remove  T1_last  → T2_first  (from temporal_succs / temporal_preds)
-      2. Add     T1_first → T2_first  (appended to temporal_succs / temporal_preds)
-      3. Add     T1_last  → T2_last   (appended to temporal_succs / temporal_preds)
+    This function rewires the temporal dependencies to interleave the two chains
+    at each A2A boundary:
 
-    After :func:`assign_time_steps` (which now does a topological sort), nodes
-    in T1 and T2 that have no other dependency between them receive the *same*
-    ``time_step``, allowing the actor to dispatch them to their respective CUDA
-    streams concurrently — e.g. T1's A2A overlaps with T2's compute and vice
-    versa.
+      1. Remove  T1_last → T2_first.
+      2. Traverse T1 and T2 alternately.  On each T1 turn, advance T1_current
+         through non-communication nodes until the predecessor of the next A2A
+         (or until the chain is exhausted).  If an A2A was found, add a temporal
+         edge T1_current → T2_current and advance T1_current past the A2A.  Then
+         do the symmetric operation on T2, adding T2_current → T1_current and
+         advancing past T2's A2A.  Repeat until both chains are exhausted (no
+         remaining A2A on either side).
+
+    The resulting structure allows the actor to overlap A2A communication in one
+    chain with compute in the other chain by dispatching them to separate CUDA
+    streams.
 
     Args:
-        dag: TaskDAG produced by :func:`expand_a2a_tasks`.
-        task_pairs: List of ``(t1, t2)`` pairs where each ``Task`` identifies
+        dag: TaskDAG produced by :func:`expand_chunks_to_dags`.
+        task_pairs: List of ``(t1, t2)`` pairs where each ``Chunk`` identifies
             a compute-task group in the DAG by its pp_rank, stage_id, mb_idx,
             and type.  The two tasks in each pair must be on the same pp_rank
             and T2 must immediately follow T1 in the temporal chain.
@@ -3136,6 +3290,34 @@ def overlap_a2a_tasks(dag: TaskDAG, task_pairs: list[tuple[Task, Task]]) -> Task
     Returns:
         The same ``dag`` object with temporal edges mutated in-place.
     """
+
+    def _is_comm(node: Task) -> bool:
+        return node.chunk.type in (TaskType.FWD_A2A, TaskType.BWD_A2A)
+
+    def _chain_next(node: Task, group_ids: set[int]) -> Task | None:
+        """Return the unique in-group temporal successor of *node*, or None."""
+        succs = [s for s in node.temporal_succs if id(s) in group_ids]
+        assert len(succs) <= 1, (
+            f"overlap_a2a_tasks: expected at most one in-group temporal successor "
+            f"for {node.node_id()}, got {len(succs)}: "
+            f"{[s.node_id() for s in succs]}"
+        )
+        return succs[0] if succs else None
+
+    def _get_group_ids(chunk: Chunk) -> set[int]:
+        compute_type = chunk.type
+        a2a_type = TaskType.FWD_A2A if compute_type == TaskType.FWD else TaskType.BWD_A2A
+        stage_id = chunk.batches[0].stage_id
+        mb_idx = chunk.batches[0].mb_idx
+        return {
+            id(n) for n in dag.nodes
+            if n.pp_rank == chunk.pp_rank
+            and n.chunk.batches
+            and n.chunk.batches[0].stage_id == stage_id
+            and n.chunk.batches[0].mb_idx == mb_idx
+            and n.chunk.type in (compute_type, a2a_type)
+        }
+
     for t1, t2 in task_pairs:
         t1_first, t1_last = _find_task_chain_endpoints(dag, t1)
         t2_first, t2_last = _find_task_chain_endpoints(dag, t2)
@@ -3154,13 +3336,103 @@ def overlap_a2a_tasks(dag: TaskDAG, task_pairs: list[tuple[Task, Task]]) -> Task
         t1_last.temporal_succs.remove(t2_first)
         t2_first.temporal_preds.remove(t1_last)
 
-        # 2. Add T1_first → T2_first
-        t1_first.temporal_succs.append(t2_first)
-        t2_first.temporal_preds.append(t1_first)
+        t1_group_ids = _get_group_ids(t1)
+        t2_group_ids = _get_group_ids(t2)
 
-        # 3. Add T1_last → T2_last (merged join point)
-        t1_last.temporal_succs.append(t2_last)
-        t2_last.temporal_preds.append(t1_last)
+        t1_current = t1_first
+        t2_current = t2_first
+        seen_t1_last = False
+        seen_t2_last = False
+
+        while not (seen_t1_last and seen_t2_last):
+            # --- T1 phase ---
+            if not seen_t1_last:
+                # Advance t1_current to the compute node just before the next A2A.
+                nxt = _chain_next(t1_current, t1_group_ids)
+                while nxt is not None and not _is_comm(nxt):
+                    t1_current = nxt
+                    nxt = _chain_next(t1_current, t1_group_ids)
+
+                if nxt is None:
+                    # No A2A remaining in T1; t1_current is at T1_last.
+                    # Create the dep only if T2 has not yet finished: if T2 is
+                    # already done, an earlier T1 node already has a dep to
+                    # T2_last so adding T1_last → T2_last would be redundant.
+                    if not seen_t2_last:
+                        # Capture pre-existing succs before mutating.
+                        t1_pre_succs = list(t1_current.temporal_succs)
+                        t1_current.temporal_succs.append(t2_current)
+                        t2_current.temporal_preds.append(t1_current)
+                        # Propagate T1_last's pre-existing outgoing deps to
+                        # T2_last so that whatever follows T1 in the sequential
+                        # schedule also waits for T2_last (the longer chain).
+                        # Remove the original dep from T1_last since T2_last
+                        # now takes over responsibility for that ordering.
+                        for succ in t1_pre_succs:
+                            t1_current.temporal_succs.remove(succ)
+                            succ.temporal_preds.remove(t1_current)
+                            if succ not in t2_last.temporal_succs:
+                                t2_last.temporal_succs.append(succ)
+                                succ.temporal_preds.append(t2_last)
+                    seen_t1_last = True
+                else:
+                    # t1_current is the compute predecessor of comm node nxt.
+                    # Only create T1_current → T2_current if T2 has not already
+                    # reached its end; otherwise the dep would form a cycle
+                    # (T2's final dep points back into T1's chain).
+                    if not seen_t2_last:
+                        t1_current.temporal_succs.append(t2_current)
+                        t2_current.temporal_preds.append(t1_current)
+                    # Advance T1_current past the A2A node.
+                    after_comm = _chain_next(nxt, t1_group_ids)
+                    assert after_comm is not None and not _is_comm(after_comm), (
+                        f"overlap_a2a_tasks: expected a compute node after T1 A2A "
+                        f"{nxt.node_id()}, got "
+                        f"{after_comm.node_id() if after_comm else None}"
+                    )
+                    t1_current = after_comm
+
+            # --- T2 phase ---
+            if not seen_t2_last:
+                # Advance t2_current to the compute node just before the next A2A.
+                nxt = _chain_next(t2_current, t2_group_ids)
+                while nxt is not None and not _is_comm(nxt):
+                    t2_current = nxt
+                    nxt = _chain_next(t2_current, t2_group_ids)
+
+                if nxt is None:
+                    # No A2A remaining in T2; t2_current is at T2_last.
+                    # Only act if T1 is still running (seen_t1_last=False),
+                    # meaning T2 has fewer A2As than T1.  If seen_t1_last is
+                    # already True the chains had equal A2A counts and T1's
+                    # end-of-chain already established the ordering; creating
+                    # a dep here would form a cycle.
+                    if not seen_t1_last:
+                        t2_pre_succs = list(t2_current.temporal_succs)
+                        t2_current.temporal_succs.append(t1_current)
+                        t1_current.temporal_preds.append(t2_current)
+                        for succ in t2_pre_succs:
+                            t2_current.temporal_succs.remove(succ)
+                            succ.temporal_preds.remove(t2_current)
+                            if succ not in t1_last.temporal_succs:
+                                t1_last.temporal_succs.append(succ)
+                                succ.temporal_preds.append(t1_last)
+                    seen_t2_last = True
+                else:
+                    # Only create T2_current → T1_current if T1 has not already
+                    # reached its end; otherwise the dep would form a cycle
+                    # (T1's end-of-chain dep already points into T2's chain).
+                    if not seen_t1_last:
+                        t2_current.temporal_succs.append(t1_current)
+                        t1_current.temporal_preds.append(t2_current)
+                    # Advance T2_current past the A2A node.
+                    after_comm = _chain_next(nxt, t2_group_ids)
+                    assert after_comm is not None and not _is_comm(after_comm), (
+                        f"overlap_a2a_tasks: expected a compute node after T2 A2A "
+                        f"{nxt.node_id()}, got "
+                        f"{after_comm.node_id() if after_comm else None}"
+                    )
+                    t2_current = after_comm
 
     return dag
 
@@ -3173,8 +3445,8 @@ def assign_time_steps(dag: TaskDAG) -> None:
     """Assign ``time_step`` to every node based on its position in the temporal
     dependency graph.
 
-    Must be called after :func:`expand_a2a_tasks` (and
-    :func:`overlap_a2a_tasks` if used) and before :func:`insert_p2p_ops`.
+    Must be called after :func:`add_temporal_dependencies` (and
+    :func:`overlap_a2a_tasks` if used) and before :func:`split_dag_by_rank`.
 
     Each node's ``time_step`` is ``max(pred.time_step for all temporal preds) + 1``,
     with roots (no temporal predecessors) receiving ``time_step = 0``.  When the
@@ -3183,9 +3455,9 @@ def assign_time_steps(dag: TaskDAG) -> None:
     topological sort correctly assigns shared time steps to concurrent nodes
     and deferred time steps to join points.
 
-    SEND / RECV / ALL_REDUCE nodes are added later by :func:`insert_p2p_ops`
-    and :func:`insert_ar_ops`; they receive ``time_step = adjacent_node ± 1``
-    at insertion time.
+    SEND / RECV nodes have no temporal edges and are assigned after the toposort:
+    ``SEND.time_step = data_pred.time_step + 1`` and
+    ``RECV.time_step = data_succ.time_step - 1``.
     """
     # Kahn's toposort over the temporal graph (temporal_preds / temporal_succs).
     # time_step = max(pred.time_step for all temporal preds) + 1.
@@ -3193,7 +3465,7 @@ def assign_time_steps(dag: TaskDAG) -> None:
     # assignment; forks and joins from overlap_a2a_tasks are handled correctly.
     in_degree: dict[int, int] = {id(n): len(n.temporal_preds) for n in dag.nodes}
     ts_map: dict[int, int] = {}
-    queue: deque[TaskNode] = deque()
+    queue: deque[Task] = deque()
     for node in dag.nodes:
         if in_degree[id(node)] == 0:
             ts_map[id(node)] = 0
@@ -3207,3 +3479,21 @@ def assign_time_steps(dag: TaskDAG) -> None:
             ts_map[id(succ)] = max(ts_map.get(id(succ), 0), node.time_step + 1)
             if in_degree[id(succ)] == 0:
                 queue.append(succ)
+
+    # SEND/RECV/ALL_REDUCE nodes have no temporal edges and are skipped by the toposort.
+    # Assign their time_step relative to their data-edge neighbour.
+
+    # Pass 1: SEND and ALL_REDUCE (depend only on their data predecessor).
+    for node in dag.nodes:
+        if node.chunk.type == TaskType.SEND:
+            assert len(node.data_preds) == 1
+            node.time_step = node.data_preds[0].time_step + 1
+        elif node.chunk.type == TaskType.ALL_REDUCE:
+            assert len(node.data_preds) == 1
+            node.time_step = node.data_preds[0].time_step + 1
+
+    # Pass 2: RECV (depend only on their data successor).
+    for node in dag.nodes:
+        if node.chunk.type == TaskType.RECV:
+            assert len(node.data_succs) == 1
+            node.time_step = node.data_succs[0].time_step - 1

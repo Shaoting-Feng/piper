@@ -14,8 +14,9 @@ from torch._dynamo.backends.debugging import eager
 
 from .piper_actor import _create_actors
 from .piper_utils import piper_metadata, create_logger, LOG_LEVEL
-from .piper_exec import DAGEdge, Schedule2D, CompType, Task, BatchMeta
-from .piper import piper
+from .piper_exec import DAGEdge, PipelineSchedule, CompType, Chunk, BatchMeta, _validate_schedule
+from .piper import piper, piper_exec_dag
+from .piper_graph_transform import compute_critical_path, visualize_dag
 
 logger = create_logger("piper_compile", LOG_LEVEL)
 
@@ -56,158 +57,8 @@ class _CompiledDataStore:
 
 
 
-def _validate_schedule(schedule: list[list[Task | None]], dag_edges: list[DAGEdge], num_mbs: int) -> None:
-    """
-    Validate that the schedule respects well-formedness rules and DAG dependencies.
-    
-    Args:
-        schedule: 2D array with one row per device and one column per time step
-        dag_edges: List of DAG edges defining stage dependencies
-        num_mbs: Number of microbatches in the schedule
-        
-    Raises:
-        ValueError: If the schedule violates any validation rules
-    """
-    num_devices, num_steps = len(schedule), len(schedule[0]) if schedule else 0
-    
-    for row in schedule:
-        assert len(row) == num_steps, "Each row must have the same number of time steps"
-    
-    # Check well-formedness: no duplicates, pp_rank matches row, and all stages present
-    all_tasks = set()
-    microbatch_tasks = {}  # mb_idx -> set of (stage_id, type)
-    
-    for pp_rank in range(num_devices):
-        for time_step in range(num_steps):
-            task = schedule[pp_rank][time_step]
-            if task is not None:
-                # Check pp_rank matches row
-                if task.pp_rank != pp_rank:
-                    raise ValueError(
-                        f"Task pp_rank {task.pp_rank} does not match row {pp_rank} "
-                        f"at time step {time_step}"
-                    )
-                
-                # Check for duplicates and track by (stage_id, mb_idx, type) per batch
-                for batch in task.batches:
-                    comp_type = (
-                        task.type
-                        if task.type != CompType.FWD_BWD
-                        else (CompType.FWD if batch is task.batches[0] else CompType.BWD)
-                    )
-                    task_key = (batch.stage_id, batch.mb_idx, comp_type)
-                    if task_key in all_tasks:
-                        raise ValueError(
-                            f"Duplicate task found: stage_id={batch.stage_id}, "
-                            f"mb_idx={batch.mb_idx}, type={comp_type}"
-                        )
-                    all_tasks.add(task_key)
-                    if batch.mb_idx not in microbatch_tasks:
-                        microbatch_tasks[batch.mb_idx] = set()
-                    microbatch_tasks[batch.mb_idx].add((batch.stage_id, comp_type))
-    
-    # Get all required stages from DAG edges
-    all_required_stages = set()
-    for edge in dag_edges:
-        all_required_stages.add(edge.from_stage)
-        all_required_stages.add(edge.to_stage)
-    
-    # Check that each microbatch has all required forward and backward stages
-    for mb_idx, tasks in microbatch_tasks.items():
-        # Find all stages that have forward/backward tasks for this microbatch
-        fwd_stages = {stage_id for stage_id, task_type in tasks if task_type == CompType.FWD}
-        bwd_stages = {
-            stage_id
-            for stage_id, task_type in tasks
-            if task_type in (CompType.BWD, CompType.BWD_I)
-        }
-        
-        # Check that all required stages have forward tasks
-        missing_fwd = all_required_stages - fwd_stages
-        if missing_fwd:
-            raise ValueError(f"Microbatch {mb_idx} missing forward stages: {missing_fwd}")
 
-        # Check that all required stages have backward tasks (BWD or BWD_I)
-        missing_bwd = all_required_stages - bwd_stages
-        if missing_bwd:
-            raise ValueError(
-                f"Microbatch {mb_idx} missing backward stages: {missing_bwd} "
-                f"(need BWD, BWD_I, or FWD_BWD backward for each stage)"
-            )
-    
-    # Check pipeline stage dependencies
-    for mb_idx in range(num_mbs):
-        # Find all tasks for this microbatch
-        fwd_times: dict[int, int] = {}  # stage_id -> time_step
-        bwd_times: dict[int, int] = {}  # stage_id -> time_step (BWD or BWD_I)
-        bwd_w_times: dict[int, int] = {}  # stage_id -> time_step (BWD_W)
-        
-        for pp_rank in range(num_devices):
-            for time_step in range(num_steps):
-                task = schedule[pp_rank][time_step]
-                if task is None:
-                    continue
-                for batch in task.batches:
-                    if batch.mb_idx != mb_idx:
-                        continue
-                    comp_type = (
-                        task.type
-                        if task.type != CompType.FWD_BWD
-                        else (CompType.FWD if batch is task.batches[0] else CompType.BWD)
-                    )
-                    if comp_type == CompType.FWD:
-                        fwd_times[batch.stage_id] = time_step
-                    elif comp_type in (CompType.BWD, CompType.BWD_I):
-                        bwd_times[batch.stage_id] = time_step
-                    elif comp_type == CompType.BWD_W:
-                        bwd_w_times[batch.stage_id] = time_step
-        
-        # Check forward stage ordering: if A -> B, then fwd(A) < fwd(B)
-        for edge in dag_edges:
-            from_stage, to_stage = edge.from_stage, edge.to_stage
-            if from_stage in fwd_times and to_stage in fwd_times:
-                if fwd_times[from_stage] >= fwd_times[to_stage]:
-                    raise ValueError(
-                        f"Forward stage ordering violation for microbatch {mb_idx}: "
-                        f"forward stage {from_stage} (time {fwd_times[from_stage]}) must come "
-                        f"before forward stage {to_stage} (time {fwd_times[to_stage]})"
-                    )
-        
-        # Check forward-backward ordering: fwd(A) < bwd(A)
-        for stage_id in fwd_times:
-            if stage_id in bwd_times:
-                if fwd_times[stage_id] >= bwd_times[stage_id]:
-                    raise ValueError(
-                        f"Forward-backward ordering violation for microbatch {mb_idx}, "
-                        f"stage {stage_id}: forward (time {fwd_times[stage_id]}) must come "
-                        f"before backward (time {bwd_times[stage_id]})"
-                    )
-        
-        # Check backward stage ordering: if A -> B, then bwd(B) < bwd(A)
-        for edge in dag_edges:
-            from_stage, to_stage = edge.from_stage, edge.to_stage
-            if from_stage in bwd_times and to_stage in bwd_times:
-                if bwd_times[to_stage] >= bwd_times[from_stage]:
-                    raise ValueError(
-                        f"Backward stage ordering violation for microbatch {mb_idx}: "
-                        f"backward stage {to_stage} (time {bwd_times[to_stage]}) must come "
-                        f"before backward stage {from_stage} (time {bwd_times[from_stage]})"
-                    )
-        
-        # Check BWD_W must come after BWD_I for same (stage_id, mb_idx)
-        for stage_id in bwd_w_times:
-            if stage_id not in bwd_times:
-                raise ValueError(
-                    f"BWD_W for microbatch {mb_idx} stage {stage_id} has no corresponding "
-                    f"BWD_I or BWD task"
-                )
-            if bwd_w_times[stage_id] <= bwd_times[stage_id]:
-                raise ValueError(
-                    f"BWD_W ordering violation for microbatch {mb_idx}, stage {stage_id}: "
-                    f"BWD_W (time {bwd_w_times[stage_id]}) must come after "
-                    f"BWD_I/BWD (time {bwd_times[stage_id]})"
-                )
-            
+
 
 
 def piper_setup(
@@ -218,12 +69,16 @@ def piper_setup(
     optim_fn=None,
     example_inputs=None,
     example_outputs=None,
-    schedule: Schedule2D=None,
+    loss_fn=None,
+    schedule: PipelineSchedule=None,
     naive_gradient_sync=False,
     activation_checkpointing=False,
     bucketing=False,
     pg=None,
     nsight=False,
+    model_flops_per_token: float = None,
+    visualize_dag: bool = True,
+    const_attrs: dict = None,
 ):
     """
     Compile a model with the piper backend.
@@ -238,34 +93,55 @@ def piper_setup(
             pipelined per-param hooks.
     """
 
+    # Clear Dynamo's global compilation cache so that a previous piper_setup
+    # call (e.g. with a different model size or schedule) in the same Python
+    # worker process cannot contaminate this compilation via a stale cache hit.
+    torch._dynamo.reset()
+
     stage_to_device = schedule.stage_to_device()
     assert len(stage_to_device) > 0
     piper_metadata.stage_to_device = stage_to_device
     piper_metadata.use_activation_checkpointing = activation_checkpointing
     piper_metadata.bucketing = bucketing
     piper_metadata.schedule = schedule
+    piper_metadata.visualize_dag = visualize_dag
+
+    # Reset DAG/compile fields so stale data from a prior run never leaks into
+    # this run if the piper backend is somehow not re-invoked.
+    piper_metadata.per_rank_dags = None
+    piper_metadata.full_dag_no_overlap = None
+    piper_metadata.stage_bucket_counts = {}
+    piper_metadata.trainable_bucket_keys = set()
+    piper_metadata.compiled_stage_data = None
+
+    # MFU tracking
+    piper_metadata.model_flops_per_token = model_flops_per_token
+    if model_flops_per_token is not None and example_inputs is not None:
+        dp_degree = int(os.environ.get("PIPER_DP_DEGREE", "1"))
+        # example_inputs[0] is the token index tensor of shape (batch_size, seq_len)
+        piper_metadata.tokens_per_step = example_inputs[0].numel() * dp_degree
 
     dag_edges = []
     # TODO: build dag by analyzing stage dependencies rather than assuming a linear chain
     for stage_id in piper_metadata.stage_to_device.keys():
         if stage_id < len(piper_metadata.stage_to_device.keys()) - 1:
             dag_edges.append(DAGEdge(stage_id, stage_id+1))
-    _validate_schedule(schedule.grid, dag_edges=dag_edges, num_mbs=schedule.num_mbs())
+    _validate_schedule(schedule, dag_edges=dag_edges, num_mbs=schedule.num_mbs())
 
     num_mbs = schedule.num_mbs()
     num_stages = schedule.num_stages()
     num_devices = schedule.num_ranks()
-    
-    _create_actors(
-        num_devices, optim_fn, num_mbs, num_stages,
-        naive_gradient_sync, profile=nsight, stage_to_device=stage_to_device, pg=pg,
-    )
 
     # All dp_ranks must agree on a single master_addr: the IP of the actor with
     # global_rank=0 (pp_rank=0, dp_rank=0).  dp_rank=0 publishes it via a named
     # Ray actor; other dp_ranks wait until it's available.
     import time
     dp_rank = int(os.environ["PIPER_DP_RANK"])
+    _create_actors(
+        num_devices, optim_fn, num_mbs, num_stages,
+        naive_gradient_sync, profile=nsight, stage_to_device=stage_to_device, pg=pg,
+    )
+
     if dp_rank == 0:
         # Create the compiled-data store early so dp_rank>0 can poll for it.
         _CompiledDataStore.options(
@@ -275,7 +151,7 @@ def piper_setup(
         # Get IP and a free port from actor 0's node — it will be the TCPStore server.
         master_addr, master_port = ray.get(piper_metadata.actors[0].get_node_ip_and_free_port.remote())
         _Rank0AddrStore.options(
-            name=_RANK0_ADDR_ACTOR, lifetime="detached", get_if_exists=True
+            name=_RANK0_ADDR_ACTOR, lifetime="detached"
         ).remote(master_addr, master_port)
     else:
         master_addr = master_port = None
@@ -297,6 +173,20 @@ def piper_setup(
             ray.kill(ray.get_actor(_RANK0_ADDR_ACTOR))
         except Exception:
             pass
+
+    # Push non-trainable constant tensor attributes (e.g. freqs_cis, rope_cache, mask)
+    # to all actors so _load_stage can initialize them correctly instead of zero-filling.
+    # Must happen on every dp_rank since each dp_rank owns its own actors.
+    _const_attrs = {
+        k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+        for k, v in (const_attrs or {}).items()
+    }
+    if _const_attrs:
+        ray.get([
+            actor.load_const_attrs.remote(_const_attrs)
+            for actor in piper_metadata.actors.values()
+        ])
+        logger.debug(f"Pushed {len(_const_attrs)} const attrs to actors: {list(_const_attrs.keys())}")
 
     if dp_rank == 0:
         # --- dp_rank=0: run torch.compile, build DAGs, publish compiled data ---
@@ -358,6 +248,7 @@ def piper_setup(
         piper_metadata.stage_bucket_counts = compiled_data["stage_bucket_counts"]
         piper_metadata.trainable_bucket_keys = compiled_data["trainable_bucket_keys"]
         piper_metadata.per_rank_dags = compiled_data["per_rank_dags"]
+        piper_metadata.full_dag_no_overlap = compiled_data.get("full_dag_no_overlap")
 
         # Load the same per-rank DAGs onto this dp_rank's actors.
         ray.get([
@@ -370,6 +261,48 @@ def piper_setup(
     ray.get(piper_metadata.actors[0].load_input.remote(example_inputs))
     ray.get(piper_metadata.actors[last_stage_rank].load_labels.remote(example_outputs))
     logger.info(f"DP rank {dp_rank} real inputs/labels loaded onto actors.")
+
+    # if loss_fn is not None:
+    #     _NUM_WARMUP = 3
+    #     _NUM_PROFILE = 5
+
+    #     logger.info(f"DP rank {dp_rank}: running {_NUM_WARMUP} warmup iterations before profiling.")
+    #     for _ in range(_NUM_WARMUP):
+    #         piper_exec_dag(loss_fn)
+
+    #     logger.info(f"DP rank {dp_rank}: running {_NUM_PROFILE} profiling iterations.")
+    #     for _ in range(_NUM_PROFILE):
+    #         piper_exec_dag(loss_fn, profiling=True)
+
+    #     # Only dp_rank=0 aggregates timing data and renders the critical-path DAG.
+    #     if dp_rank == 0:
+    #         uid_to_measurements: dict = {}
+    #         for pp_rank in range(len(piper_metadata.per_rank_dags)):
+    #             actor = piper_metadata.actors[pp_rank]
+    #             node_runtimes = ray.get(actor.get_node_runtimes.remote())
+    #             uid_to_measurements.update(node_runtimes)
+
+    #         full_dag = piper_metadata.full_dag_no_overlap
+    #         if full_dag is not None:
+    #             for node in full_dag.nodes:
+    #                 measurements = uid_to_measurements.get(node.uid, [])
+    #                 if measurements:
+    #                     node.profiling_measurements = measurements
+    #                     node.runtime = sum(measurements) / len(measurements)
+
+    #             critical_nodes = compute_critical_path(full_dag)
+    #             logger.info(
+    #                 f"Critical path has {len(critical_nodes)} nodes "
+    #                 f"(of {len(full_dag.nodes)} total)."
+    #             )
+    #             try:
+    #                 visualize_dag(
+    #                     full_dag,
+    #                     output_path="figs/profiled_full_dag",
+    #                     critical_path_nodes=critical_nodes,
+    #                 )
+    #             except Exception as e:
+    #                 logger.warning(f"Profiled DAG visualisation failed: {e}")
 
     logger.info(f"DP rank {dp_rank} done.")
     

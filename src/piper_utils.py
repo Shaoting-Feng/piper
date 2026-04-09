@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from typing import Any, Optional
 
-LOG_LEVEL = "DEBUG"
+LOG_LEVEL = "INFO"
 
 """ 
 Print the backward graph of a tensor
@@ -337,8 +337,9 @@ class PiperMetadata:
     naive_gradient_sync = False
     use_activation_checkpointing = False
     bucketing = False  # Whether to split stages into per-param-bucket sub-modules
-    schedule = None   # Schedule2D set by piper_setup; used by the piper backend
+    schedule = None   # PipelineSchedule set by piper_setup; used by the piper backend
     task_dag = None   # TaskDAG built from schedule by the piper backend
+    full_dag_no_overlap = None  # Deep copy of the full DAG (pre-P2P-split, no overlap_a2a_tasks); used for profiling and critical-path analysis
     per_rank_dags = None  # Per-rank TaskDAGs built by the piper backend
     stage_bucket_counts: dict = {}   # stage_id -> number of buckets (set by piper backend)
     trainable_bucket_keys: set = set()  # (stage_id, bucket_id) pairs with trainable params
@@ -346,8 +347,81 @@ class PiperMetadata:
     # so they can skip torch.compile entirely.  Contains serialized graph + param metadata
     # (no actual weight values) for all stages, plus the built per-rank TaskDAGs.
     compiled_stage_data: dict = None
+    # MFU tracking: set by piper_setup when model_flops_per_token is provided
+    model_flops_per_token: Optional[float] = None  # FLOPs per token for forward+backward pass
+    tokens_per_step: Optional[int] = None           # Global batch tokens per training step
+    visualize_dag: bool = True  # Whether to render per-rank DAG PNGs after compilation
 
 piper_metadata = PiperMetadata()
+
+
+# ---------------------------------------------------------------------------
+# GPU peak FLOPs lookup for MFU computation
+# ---------------------------------------------------------------------------
+
+# Theoretical peak BF16 tensor-core FLOPs/s for common GPUs.
+# Values are from official NVIDIA spec sheets.
+_GPU_PEAK_FLOPS_BF16: list[tuple[str, float]] = [
+    ("nvidia h200",      1979e12),
+    ("h100 sxm",   989e12),
+    ("h100 pcie",  756e12),
+    ("h100",       989e12),
+    ("a100",       312e12),
+    ("a6000 ada",  362e12),
+    ("rtx 4090",   165e12),
+    ("rtx 3090",   142e12),
+]
+
+
+def get_gpu_peak_flops_bf16() -> Optional[float]:
+    """Return theoretical peak BF16 FLOPs/s for the current CUDA device, or None if unknown."""
+    if not torch.cuda.is_available():
+        return None
+    name = torch.cuda.get_device_properties(torch.cuda.current_device()).name.lower()
+    for key, flops in _GPU_PEAK_FLOPS_BF16:
+        if key in name:
+            return flops
+    return 1979e12  # Default to H200-level FLOPs for unknown devices, since it's better to slightly overestimate than underestimate
+
+
+def compute_transformer_flops_per_token(
+    hidden_dim: int,
+    n_layers: int,
+    ffn_dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    activation_checkpointing: bool = False,
+    moe_top_k: int = 1,
+) -> float:
+    """Estimate FLOPs per token for a forward+backward pass of a transformer.
+
+    Uses the standard approximation (sequence-length-independent terms only):
+    - Attention: Q/K/V projections + output projection per layer
+    - FFN (SwiGLU): gate + up + down projections × moe_top_k active experts
+    - Multiply by 3× for fwd+bwd (or 4× with full activation-checkpointing recompute)
+
+    Args:
+        hidden_dim: Model hidden dimension (H).
+        n_layers: Number of transformer layers.
+        ffn_dim: FFN intermediate dimension (per expert for MoE).
+        n_heads: Number of attention heads.
+        n_kv_heads: Number of key/value heads (GQA).
+        head_dim: Dimension per attention head.
+        activation_checkpointing: If True, use 4× multiplier (full recompute).
+        moe_top_k: Number of active experts per token (1 for dense).
+
+    Returns:
+        Estimated FLOPs per token (float).
+    """
+    kv_hidden = n_kv_heads * head_dim
+    # Q proj (H→H) + K proj (H→kv_hidden) + V proj (H→kv_hidden) + out proj (H→H)
+    attn_flops = 2 * hidden_dim * (2 * hidden_dim + 2 * kv_hidden)
+    # SwiGLU FFN: gate_proj + up_proj + down_proj (each H×ffn_dim), scaled by active experts
+    ffn_flops = 6 * hidden_dim * ffn_dim * moe_top_k
+    fwd_total = n_layers * (attn_flops + ffn_flops)
+    multiplier = 4 if activation_checkpointing else 3
+    return fwd_total * multiplier
 
 
 """

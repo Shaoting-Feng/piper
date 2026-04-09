@@ -16,21 +16,18 @@ from ray.util.placement_group import (
 from src.piper_coordinator import PiperProgramCoordinator
 from src.piper_compile import piper_setup
 from src.piper import piper_exec_dag
-from src.piper_utils import piper_metadata
+from src.piper_utils import piper_metadata, compute_transformer_flops_per_token
 
-from .models.llama import Transformer, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B, LLAMA_70B
+from .models.llama import Transformer, precompute_freqs_cis, LLAMA_DEBUG, LLAMA_1B, LLAMA_3B, LLAMA_8B, LLAMA_70B
 from .schedule_helpers import (
+    visualize_pipeline_schedule,
     build_1f1b_schedule,
     build_gpipe_schedule,
-    print_schedule,
-    INTERLEAVED_1F1B_PP2_MB4_SCHEDULE,
-    INTERLEAVED_1F1B_PP2_MB6_SCHEDULE,
-    INTERLEAVED_1F1B_PP4_MB8_SCHEDULE,
-    INTERLEAVED_GPIPE_PP2_MB4_SCHEDULE,
+    build_interleaved_1f1b_schedule,
+    build_zerobubble_schedule,
+    build_interleaved_zero_bubble,
+    build_dualpipev_schedule,
     NO_PP_SCHEDULE,
-    DUALPIPEV_MB6_SCHEDULE,
-    DUALPIPEV_NOZB_MB6_SCHEDULE,
-    ZEROBUBBLE_MB4_SCHEDULE,
 )
 
 
@@ -57,35 +54,48 @@ def main(args, pg):
         case "no-pp":
             schedule = NO_PP_SCHEDULE
         case "interleaved-1f1b":
-            if args.pp == 2:
-                if args.mbs == 6:
-                    schedule = INTERLEAVED_1F1B_PP2_MB6_SCHEDULE
-                elif args.mbs == 4:
-                    schedule = INTERLEAVED_1F1B_PP2_MB4_SCHEDULE
-                else:
-                    raise ValueError(f"Unsupported number of microbatches for interleaved-1f1b with PP={args.pp}: {args.mbs}")
-            elif args.pp == 4:
-                assert args.mbs == 8
-                schedule = INTERLEAVED_1F1B_PP4_MB8_SCHEDULE
+            schedule = build_interleaved_1f1b_schedule(args.mbs, args.pp, v=2)
         case "1f1b":
             schedule = build_1f1b_schedule(args.mbs, args.pp)
         case "gpipe":
             schedule = build_gpipe_schedule(args.mbs, args.pp)
         case "interleaved-gpipe":
-            assert args.pp == 2 and args.mbs == 4
-            schedule = INTERLEAVED_GPIPE_PP2_MB4_SCHEDULE
+            assert False
         case "dualpipev":
-            assert args.pp == 2 and args.mbs == 6
-            schedule = DUALPIPEV_MB6_SCHEDULE
+            schedule = build_dualpipev_schedule(args.mbs, args.pp)
         case "dualpipev-nozb":
-            assert args.pp == 2 and args.mbs == 6
-            schedule = DUALPIPEV_NOZB_MB6_SCHEDULE
+            assert False
         case "zerobubble":
-            assert args.pp == 2 and args.mbs == 4
-            schedule = ZEROBUBBLE_MB4_SCHEDULE
+            schedule = build_zerobubble_schedule(args.mbs, args.pp)
+        case "interleaved-zerobubble":
+            schedule = build_interleaved_zero_bubble(args.mbs, args.pp, v=2)
+    
+    visualize_pipeline_schedule(schedule, f"out/{args.schedule}-pp{args.pp}-mb{args.mbs}")
 
-    print("Schedule:")
-    print_schedule(schedule)
+    # Llama FFN hidden dim (SwiGLU): 2/3 * 4 * dim, rounded up to multiple_of
+    _ffn_base = int(2 * 4 * llama_config.dim / 3)
+    if llama_config.ffn_dim_multiplier is not None:
+        _ffn_base = int(llama_config.ffn_dim_multiplier * _ffn_base)
+    _ffn_dim = llama_config.multiple_of * ((_ffn_base + llama_config.multiple_of - 1) // llama_config.multiple_of)
+    n_kv_heads = llama_config.n_kv_heads if llama_config.n_kv_heads is not None else llama_config.n_heads
+    flops_per_token = compute_transformer_flops_per_token(
+        hidden_dim=llama_config.dim,
+        n_layers=llama_config.n_layers,
+        ffn_dim=_ffn_dim,
+        n_heads=llama_config.n_heads,
+        n_kv_heads=n_kv_heads,
+        head_dim=llama_config.dim // llama_config.n_heads,
+        activation_checkpointing=args.activation_checkpointing,
+    )
+
+    freqs_cis = precompute_freqs_cis(
+        llama_config.dim // llama_config.n_heads,
+        args.seq_len,
+        llama_config.rope_theta,
+    )
+    _mask = torch.full((args.seq_len, args.seq_len), float("-inf"))
+    _mask = torch.triu(_mask, diagonal=1)
+    mask = torch.hstack([torch.zeros((args.seq_len, 0)), _mask])
 
     piper_setup(
         Transformer,
@@ -100,11 +110,14 @@ def main(args, pg):
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
+        model_flops_per_token=flops_per_token,
+        visualize_dag=not args.no_viz,
+        const_attrs={"freqs_cis": freqs_cis, "mask": mask},
     )
 
     print(f"Running {args.warmup} warmup iterations...")
     for _ in range(args.warmup):
-        piper_exec_dag(loss_fn)
+        piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
         time.sleep(1)
 
     actors = piper_metadata.actors
@@ -113,7 +126,7 @@ def main(args, pg):
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
-        piper_exec_dag(loss_fn)
+        piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
         end = time.perf_counter()
         iter_times.append(end - start)
         time.sleep(1)
@@ -154,7 +167,7 @@ def parse_args():
     parser.add_argument(
         '--schedule',
         choices=['gpipe', '1f1b', 'interleaved-1f1b', 'interleaved-gpipe',
-                 'dualpipev-nozb', 'dualpipev', 'zerobubble', 'no-pp'],
+                 'dualpipev-nozb', 'dualpipev', 'zerobubble', 'interleaved-zerobubble', 'no-pp'],
         default='1f1b',
     )
     parser.add_argument('--dp', type=int, default=1)
@@ -172,15 +185,26 @@ def parse_args():
                         help='Split stages into per-param-bucket sub-modules for overlapped all-reduce')
     parser.add_argument('--nsight', action='store_true', default=False,
                         help='Whether to use Nsight Systems for tracing')
+    parser.add_argument('--profiling', action='store_true', default=False,
+                        help='Profile each DAG task: log time and memory delta per task')
+    parser.add_argument('--no-viz', action='store_true', default=False,
+                        help='Skip per-rank DAG visualization (speeds up startup for large models)')
     return parser.parse_args()
 
-
+"""
+/m-coriander/coriander/mfris/miniconda3/envs/piper/bin/python \
+    /m-coriander/coriander/mfris/miniconda3/envs/piper/lib/python3.10/site-packages/ray/scripts/scripts.py \
+        start --head \
+        --port 3456 \
+        --temp-dir=/m-coriander/coriander/mfris/piper/ray_tmp \
+        --include-dashboard=false
+"""
 if __name__ == "__main__":
     args = parse_args()
     print(args)
     ray.init(
+        address="10.158.48.71:3456",
         namespace="llama",
-        log_to_driver=True,
         include_dashboard=False,
         _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
     )
@@ -188,6 +212,6 @@ if __name__ == "__main__":
     ray.get(pg.ready(), timeout=600)
     print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
-    handles = piper_coordinator.run_program.remote(main, args, pg)
+    handles = piper_coordinator.run_program.remote(main, pg, args, pg)
     ray.get(handles)
     ray.shutdown()

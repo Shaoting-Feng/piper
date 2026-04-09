@@ -333,12 +333,24 @@ class PiperQwen3Model(Qwen3Model):
     #     attention_masks: Optional[AttentionMasksType] = None,
     #     positions: Optional[torch.Tensor] = None,
     # ) -> torch.Tensor:
+
+    #     assert len(self.layers) == 5
         
-    #     h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-    #     for layer in self.layers.values():
-    #         h = layer(h, self.rope_cache, attention_masks, positions)
-    #     h = self.norm(h) if self.norm is not None else h
-    #     output = self.output(h) if self.output is not None else h
+    #     with torch.fx.traceback.annotate({"stage": 0}):
+    #         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+    #         h = self.layers["0"](h, self.rope_cache, attention_masks, positions)
+    #         h = self.layers["1"](h, self.rope_cache, attention_masks, positions)
+
+    #     with torch.fx.traceback.annotate({"stage": 1}):
+    #         h = self.layers["2"](h, self.rope_cache, attention_masks, positions)
+
+    #     with torch.fx.traceback.annotate({"stage": 2}):
+    #         h = self.layers["3"](h, self.rope_cache, attention_masks, positions)
+
+    #     with torch.fx.traceback.annotate({"stage": 3}):
+    #         h = self.layers["4"](h, self.rope_cache, attention_masks, positions)
+    #         h = self.norm(h) if self.norm is not None else h
+    #         output = self.output(h) if self.output is not None else h
 
     #     return output
     

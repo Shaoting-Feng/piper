@@ -27,18 +27,19 @@ from ray.util.placement_group import (
 from src.piper_coordinator import PiperProgramCoordinator
 from src.piper_compile import piper_setup
 from src.piper import piper_exec_dag
-from src.piper_utils import piper_metadata
+from src.piper_utils import piper_metadata, compute_transformer_flops_per_token
 
 from .models.qwen3 import PiperQwen3Model, create_qwen3_config
+from torchtitan.models.qwen3.model.model import precompute_rope_cache
 from .schedule_helpers import (
     build_1f1b_schedule,
     build_gpipe_schedule,
-    print_schedule,
+    build_interleaved_1f1b_schedule,
+    build_zerobubble_schedule,
+    build_interleaved_zero_bubble,
+    build_dualpipev_schedule,
+    visualize_pipeline_schedule,
     NO_PP_SCHEDULE,
-    INTERLEAVED_1F1B_PP2_MB4_SCHEDULE,
-    DUALPIPEV_MB6_SCHEDULE,
-    DUALPIPEV_SEQUENTIAL_MB6_SCHEDULE,
-    ZEROBUBBLE_MB4_SCHEDULE,
 )
 
 
@@ -50,36 +51,54 @@ def main(args, pg):
 
     config = create_qwen3_config(args.model)
 
+    num_stages = args.pp
+    v = 2
     match args.schedule:
         case "no-pp":
             schedule = NO_PP_SCHEDULE
-            num_stages = 1
+        case "interleaved-1f1b":
+            schedule = build_interleaved_1f1b_schedule(args.mbs, args.pp, v=v)
+            num_stages *= v
         case "1f1b":
             schedule = build_1f1b_schedule(args.mbs, args.pp)
-            num_stages = args.pp
         case "gpipe":
             schedule = build_gpipe_schedule(args.mbs, args.pp)
-            num_stages = args.pp
-        case "interleaved-1f1b":
-            schedule = INTERLEAVED_1F1B_PP2_MB4_SCHEDULE
-            num_stages = args.pp * 2
+        case "interleaved-gpipe":
+            assert False
         case "dualpipev":
-            schedule = DUALPIPEV_MB6_SCHEDULE
-            num_stages = args.pp * 2
-        case "dualpipev-seq":
-            schedule = DUALPIPEV_SEQUENTIAL_MB6_SCHEDULE
-            num_stages = args.pp * 2    
+            schedule = build_dualpipev_schedule(args.mbs, args.pp)
+            num_stages *= v
+        case "dualpipev-nozb":
+            assert False
         case "zerobubble":
-            schedule = ZEROBUBBLE_MB4_SCHEDULE
-            num_stages = args.pp
+            schedule = build_zerobubble_schedule(args.mbs, args.pp)
+        case "interleaved-zerobubble":
+            schedule = build_interleaved_zero_bubble(args.mbs, args.pp, v=v)
+            num_stages *= v
 
-    print("Schedule:")
-    print_schedule(schedule)
+    visualize_pipeline_schedule(schedule, f"out/{args.schedule}-pp{args.pp}-mb{args.mbs}")
 
     x = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
     y = torch.randn(batch_size, args.seq_len, config.vocab_size)
 
     loss_fn = torch.nn.CrossEntropyLoss()
+
+    flops_per_token = compute_transformer_flops_per_token(
+        hidden_dim=config.dim,
+        n_layers=config.n_layers,
+        ffn_dim=config.moe_inter_dim if config.moe_enabled else config.hidden_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        head_dim=config.head_dim,
+        activation_checkpointing=False,
+        moe_top_k=config.moe_args.top_k if config.moe_enabled else 1,
+    )
+
+    rope_cache = precompute_rope_cache(
+        config.head_dim,
+        config.max_seq_len,
+        config.rope_theta,
+    )
 
     piper_setup(
         PiperQwen3Model,
@@ -87,6 +106,7 @@ def main(args, pg):
         optim_fn=torch.optim.Adam,
         example_inputs=[x],
         example_outputs=y,
+        loss_fn=loss_fn,
         schedule=schedule,
         naive_gradient_sync=args.naive_grad_sync,
         activation_checkpointing=False,
@@ -94,6 +114,9 @@ def main(args, pg):
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
+        model_flops_per_token=flops_per_token,
+        visualize_dag=not args.no_viz,
+        const_attrs={"rope_cache": rope_cache},
     )
 
     print(f"Running {args.warmup} warmup iterations")
@@ -107,7 +130,7 @@ def main(args, pg):
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
-        losses = piper_exec_dag(loss_fn)
+        losses = piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
         end = time.perf_counter()
         iter_times.append(end - start)
         time.sleep(1)
@@ -161,15 +184,28 @@ def parse_args():
     parser.add_argument("--naive-grad-sync", action="store_true", default=False)
     parser.add_argument("--bucketing", action="store_true", default=False,
                         help="Split stages into per-param-bucket sub-modules for overlapped all-reduce")
+    parser.add_argument("--profiling", action="store_true", default=False,
+                        help="Profile each DAG task: log time and memory delta per task")
     parser.add_argument("--nsight", action="store_true", default=False,
                         help="Whether to use Nsight Systems for tracing")
+    parser.add_argument("--no-viz", action="store_true", default=False,
+                        help="Skip per-rank DAG visualization (speeds up startup for large models)")
     return parser.parse_args()
 
 
+"""
+CUDA_VISIBLE_DEVICES=4,5,6,7 /m-coriander/coriander/mfris/miniconda3/envs/piper/bin/python \
+    /m-coriander/coriander/mfris/miniconda3/envs/piper/lib/python3.10/site-packages/ray/scripts/scripts.py \
+        start --head \
+        --port 4567 \
+        --temp-dir=/m-coriander/coriander/mfris/piper/ray_tmp \
+        --include-dashboard=false
+"""
 if __name__ == "__main__":
     args = parse_args()
     print(args)
     ray.init(
+        address="10.158.48.71:4567",
         namespace="qwen",
         log_to_driver=True,
         include_dashboard=False,
@@ -179,6 +215,6 @@ if __name__ == "__main__":
     ray.get(pg.ready(), timeout=600)
     print(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
-    handles = piper_coordinator.run_program.remote(main, args, pg)
+    handles = piper_coordinator.run_program.remote(main, pg, args, pg)
     ray.get(handles)
     ray.shutdown()
