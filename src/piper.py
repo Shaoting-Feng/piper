@@ -45,6 +45,7 @@ from .piper_graph_transform import (
     compute_critical_path,
     print_dag_order,
     bucket_stage,
+    apply_activation_checkpointing,
     split_by_a2a,
 )
 from .piper_exec import Chunk, TaskType, BatchMeta
@@ -102,7 +103,7 @@ def piper(gm, example_inputs, **kwargs):
         actor_stages.append((actor, stage_id))
 
         # Split at A2A annotation boundaries (expert-parallel only, requires dp_degree > 1).
-        if dp_degree > 1:
+        if dp_degree > 1 or True:
             a2a_segments, boundary_infos = split_by_a2a(stage_gm, graphargs, input_idxs, param_idxs)
             if boundary_infos:
                 logger.debug(
@@ -127,7 +128,29 @@ def piper(gm, example_inputs, **kwargs):
             else:
                 buckets = [(seg_gm, seg_in, seg_param, seg_args)]
 
-            all_modules.extend(buckets)
+            for bucket_gm, bucket_in, bucket_param, bucket_args in buckets:
+                original_bucket_gm = bucket_gm
+                requested_ac_subgraphs = 1
+                if piper_metadata.use_activation_checkpointing:
+                    requested_ac_subgraphs = piper_metadata.activation_num_checkpoints
+                    ac_gms = apply_activation_checkpointing(
+                        bucket_gm,
+                        bucket_args,
+                        bucket_in,
+                        bucket_param,
+                        piper_metadata.activation_num_checkpoints,
+                    )
+                    if len(ac_gms) > 1:
+                        bucket_gm = ac_gms
+                actual_ac_subgraphs = len(bucket_gm) if isinstance(bucket_gm, list) else 1
+                if piper_metadata.use_activation_checkpointing:
+                    logger.info(
+                        f"[ac_compile_bucket] stage={stage_id} segment={seg_idx} "
+                        f"requested_subgraphs={requested_ac_subgraphs} "
+                        f"actual_subgraphs={actual_ac_subgraphs} "
+                        f"inputs={len(bucket_in)} params={len(bucket_param)}"
+                    )
+                all_modules.append((bucket_gm, bucket_in, bucket_param, bucket_args, original_bucket_gm))
             seg_end_bucket = len(all_modules) - 1  # inclusive index of last bucket in this segment
 
             if seg_idx < len(boundary_infos):
@@ -138,7 +161,7 @@ def piper(gm, example_inputs, **kwargs):
             stage_a2a_boundaries[stage_id] = a2a_boundaries
 
         stage_bucket_counts[stage_id] = len(all_modules)
-        for b_idx, (bgm, b_in, b_param, bargs) in enumerate(all_modules):
+        for b_idx, (bgm, b_in, b_param, bargs, _original_gm) in enumerate(all_modules):
             has_trainable = any(
                 bargs[i] is not None and getattr(bargs[i], "requires_grad", False)
                 for i in b_param
@@ -150,16 +173,43 @@ def piper(gm, example_inputs, **kwargs):
                     f"Stage {stage_id} bucket {b_idx} has no trainable parameters."
                 )
 
-        modules_data = [
-            {
-                "gm_data": _serialize_graphmodule(bgm),
-                "graphargs": bargs,
-                "input_idxs": b_in,
-                "param_idxs": b_param,
-                "triton_constant_args": _collect_triton_constant_args(bgm),
-            }
-            for bgm, b_in, b_param, bargs in all_modules
-        ]
+        modules_data = []
+        for bgm, b_in, b_param, bargs, original_gm in all_modules:
+            placeholder_names = [
+                n.name for n in original_gm.graph.nodes if n.op == "placeholder"
+            ]
+            if isinstance(bgm, list):
+                modules_data.append(
+                    {
+                        "gm_data_list": [_serialize_graphmodule(sgm) for sgm in bgm],
+                        "ac_num_subgraphs": len(bgm),
+                        "ac_requested_subgraphs": piper_metadata.activation_num_checkpoints,
+                        "graphargs": bargs,
+                        "input_idxs": b_in,
+                        "param_idxs": b_param,
+                        "placeholder_names": placeholder_names,
+                        "triton_constant_args_list": [
+                            _collect_triton_constant_args(sgm) for sgm in bgm
+                        ],
+                    }
+                )
+            else:
+                modules_data.append(
+                    {
+                        "gm_data": _serialize_graphmodule(bgm),
+                        "ac_num_subgraphs": 1,
+                        "ac_requested_subgraphs": (
+                            piper_metadata.activation_num_checkpoints
+                            if piper_metadata.use_activation_checkpointing
+                            else 1
+                        ),
+                        "graphargs": bargs,
+                        "input_idxs": b_in,
+                        "param_idxs": b_param,
+                        "placeholder_names": placeholder_names,
+                        "triton_constant_args": _collect_triton_constant_args(bgm),
+                    }
+                )
 
         all_stage_compiled[stage_id] = (modules_data, a2a_boundaries, actor)
 
@@ -206,6 +256,7 @@ def piper(gm, example_inputs, **kwargs):
             piper_metadata.stage_bucket_counts,
             stage_a2a_boundaries,
             dp_degree,
+            a2a_ar_no_overlap=piper_metadata.a2a_ar_no_overlap,
         )
         logger.debug(
             f"Built task DAG: {len(dag.nodes)} nodes, "
@@ -248,8 +299,8 @@ def piper(gm, example_inputs, **kwargs):
                     visualize_dag(per_rank_dag, output_path=f"out/rank{pp_rank}_dag")
                 except Exception as e:
                     logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
-            # uncomment for debugging DAG construction:
-            # print_dag_order(per_rank_dag, label=f"rank {pp_rank}")
+                print_dag_order(per_rank_dag, label=f"rank {pp_rank}", rank=pp_rank)
+        
         ray.get([
             actors[pp_rank].load_dag.remote(per_rank_dag)
             for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags)
@@ -257,7 +308,6 @@ def piper(gm, example_inputs, **kwargs):
         logger.debug(
             f"Loaded per-rank DAGs onto {len(piper_metadata.per_rank_dags)} actors"
         )
-
         # Publish compiled data so dp_rank > 0 can skip torch.compile.
         piper_metadata.compiled_stage_data = {
             "stages": all_stage_compiled,           # {stage_id: (modules_data, a2a_boundaries)}
@@ -267,12 +317,9 @@ def piper(gm, example_inputs, **kwargs):
             "full_dag_no_overlap": piper_metadata.full_dag_no_overlap,
         }
 
-    example_outputs = original_gm(*example_inputs)
-
-    def callback(*args):
-        # assert False
+    def callback(*args, _gm=gm):
         logger.warning("Should not directly call compiled module, running non-distributed execution")
-        return example_outputs
+        return _gm(*args)
 
     del original_gm
     del example_inputs

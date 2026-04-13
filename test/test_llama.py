@@ -43,12 +43,13 @@ def main(args, pg):
             llama_config = LLAMA_8B
         case '70b':
             llama_config = LLAMA_70B
-    print(args)
+    logger.info(args)
 
-    loss_fn = torch.nn.CrossEntropyLoss()
+    _ce = torch.nn.CrossEntropyLoss()
+    loss_fn = lambda output, labels: _ce(output.view(-1, output.size(-1)), labels.view(-1))
 
     x = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len))
-    y = torch.randn((args.batch_size, args.seq_len, llama_config.vocab_size))
+    y = torch.randint(0, llama_config.vocab_size, (args.batch_size, args.seq_len))
 
     match args.schedule:
         case "no-pp":
@@ -106,6 +107,7 @@ def main(args, pg):
         schedule=schedule,
         naive_gradient_sync=args.naive_grad_sync,
         activation_checkpointing=args.activation_checkpointing,
+        num_checkpoints=args.num_checkpoints,
         bucketing=args.bucketing,
         model_dtype=torch.bfloat16,
         pg=pg,
@@ -115,14 +117,14 @@ def main(args, pg):
         const_attrs={"freqs_cis": freqs_cis, "mask": mask},
     )
 
-    print(f"Running {args.warmup} warmup iterations...")
+    logger.info(f"Running {args.warmup} warmup iterations...")
     for _ in range(args.warmup):
         piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
         time.sleep(1)
 
     actors = piper_metadata.actors
 
-    print(f"Running {args.iters} timed iterations...")
+    logger.info(f"Running {args.iters} timed iterations...")
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
@@ -132,7 +134,7 @@ def main(args, pg):
         time.sleep(1)
 
     dp_rank = int(os.environ['PIPER_DP_RANK'])
-    print(
+    logger.info(
         f"rank {dp_rank} iter time= {np.mean(iter_times):.5f} ± {np.std(iter_times):.5f} s "
         f"({len(iter_times)} samples)\n"
         f"rank {dp_rank} throughput= "
@@ -141,7 +143,7 @@ def main(args, pg):
 
     if args.tracing:
         ray.get([actor.set_tracing.remote(True) for actor in actors.values()])
-        print(f"Running {args.trace_iters} tracing iterations...")
+        logger.info(f"Running {args.trace_iters} tracing iterations...")
         for _ in range(args.trace_iters):
             piper_exec_dag(loss_fn)
             ray.get([actor.flush_timing_events.remote() for actor in actors.values()])
@@ -150,7 +152,7 @@ def main(args, pg):
         for rank, trace_data in trace_data_ret:
             for key in trace_data:
                 all_times = trace_data[key]
-                print(
+                logger.info(
                     f"rank {rank} {key} time= {np.mean(all_times):.3f} ± "
                     f"{np.std(all_times):.3f} ms ({len(all_times)} samples)"
                 )
@@ -158,7 +160,7 @@ def main(args, pg):
     os.makedirs("out", exist_ok=True)
     timeline_filename = f"out/llama-dag-pp{args.pp}-dp{args.dp}-{args.schedule}"
     ray.timeline(timeline_filename)
-    print(f"Ray timeline saved to: {timeline_filename}")
+    logger.info(f"Ray timeline saved to: {timeline_filename}")
 
 
 def parse_args():
@@ -181,6 +183,8 @@ def parse_args():
     parser.add_argument('--tracing', action='store_true', default=False)
     parser.add_argument('--naive-grad-sync', action='store_true', default=False)
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
+    parser.add_argument('--num-checkpoints', type=int, default=1,
+                        help='Number of sequential activation-checkpoint regions per Piper bucket')
     parser.add_argument('--bucketing', action='store_true', default=False,
                         help='Split stages into per-param-bucket sub-modules for overlapped all-reduce')
     parser.add_argument('--nsight', action='store_true', default=False,
@@ -200,17 +204,18 @@ def parse_args():
         --include-dashboard=false
 """
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     args = parse_args()
-    print(args)
+    logger.info(args)
     ray.init(
-        address="10.158.48.71:3456",
+        address="10.158.48.71:4567",
         namespace="llama",
         include_dashboard=False,
         _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
     )
     pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="PACK")
     ray.get(pg.ready(), timeout=600)
-    print(placement_group_table(pg))
+    logger.info(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
     handles = piper_coordinator.run_program.remote(main, pg, args, pg)
     ray.get(handles)

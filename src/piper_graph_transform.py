@@ -1604,6 +1604,7 @@ def expand_chunks_to_dags(
     bucket_counts: dict,
     a2a_info: dict,
     dp_degree: int,
+    a2a_ar_no_overlap: bool = False,
 ) -> "TaskDAG":
     """Build a :class:`TaskDAG` by expanding every schedule chunk in-place.
 
@@ -1633,6 +1634,9 @@ def expand_chunks_to_dags(
             ALL_REDUCE nodes are inserted for every BWD/BWD_W bucket.
             Whether a bucket actually has trainable parameters is checked
             at runtime in run_dag, keeping the schedule model-agnostic.
+        a2a_ar_no_overlap: When true, adds same-rank temporal dependencies
+            from the last backward compute task to ALL_REDUCE nodes so
+            gradient all-reduces run after backward compute on that actor.
 
     Returns:
         A new :class:`TaskDAG` containing all compute, A2A, SEND/RECV, and
@@ -1836,6 +1840,28 @@ def expand_chunks_to_dags(
             trigger.data_succs.append(ar_node)
             ar_node.data_preds.append(trigger)
             all_tasks.append(ar_node)
+
+    # ------------------------------------------------------------------
+    # Pass 6: Optional backward-compute / ALL_REDUCE no-overlap ordering
+    # ------------------------------------------------------------------
+    if a2a_ar_no_overlap:
+        last_bwd_compute_by_rank: dict = {}
+        ar_by_rank: dict = defaultdict(list)
+        for task in all_tasks:
+            if task.chunk.type in (TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W):
+                last_bwd_compute_by_rank[task.pp_rank] = task
+            elif task.chunk.type == TaskType.ALL_REDUCE:
+                ar_by_rank[task.pp_rank].append(task)
+
+        for pp_rank, ar_tasks in ar_by_rank.items():
+            last_bwd_compute = last_bwd_compute_by_rank.get(pp_rank)
+            if last_bwd_compute is None:
+                continue
+            for ar_task in ar_tasks:
+                if ar_task not in last_bwd_compute.temporal_succs:
+                    last_bwd_compute.temporal_succs.append(ar_task)
+                if last_bwd_compute not in ar_task.temporal_preds:
+                    ar_task.temporal_preds.append(last_bwd_compute)
 
     return TaskDAG(nodes=all_tasks)
 
@@ -2217,12 +2243,15 @@ def visualize_dag(
 
 
 
-def print_dag_order(dag: TaskDAG, label: str = "") -> None:
-    """Print the topological execution order of nodes in a :class:`TaskDAG`.
+def print_dag_order(dag: TaskDAG, label: str = "", rank: int = 0) -> None:
+    """Write the topological execution order of nodes in a :class:`TaskDAG` to a file.
 
     Uses Kahn's algorithm (same order as ``run_dag``) so the output reflects
     exactly what the actor will execute.  Useful for debugging schedule issues.
+
+    Output is written to ``out/dag_order_rank{rank}``.
     """
+    import os
     from collections import deque as _deque
 
     in_degree = {
@@ -2232,7 +2261,7 @@ def print_dag_order(dag: TaskDAG, label: str = "") -> None:
     queue: _deque = _deque(n for n in dag.nodes if in_degree[id(n)] == 0)
 
     header = f"--- DAG execution order{': ' + label if label else ''} ---"
-    print(header)
+    lines = [header]
     step = 0
     while queue:
         node = queue.popleft()
@@ -2242,13 +2271,18 @@ def print_dag_order(dag: TaskDAG, label: str = "") -> None:
             f"s{b.stage_id} mb{b.mb_idx}" for b in chunk.batches
         ) if chunk.batches else ""
         bkt = f" bkt={node.bucket_id}" if node.bucket_id else ""
-        print(f"  {step:3d}  rank={node.pp_rank}  {ttype:<14s}  {batches_str}{bkt}")
+        lines.append(f"  {step:3d}  rank={node.pp_rank}  {ttype:<14s}  {batches_str}{bkt}")
         step += 1
         for succ in list(node.data_succs) + list(node.temporal_succs):
             in_degree[id(succ)] -= 1
             if in_degree[id(succ)] == 0:
                 queue.append(succ)
-    print("-" * len(header))
+    lines.append("-" * len(header))
+
+    os.makedirs("out", exist_ok=True)
+    out_path = f"out/dag_order_rank{rank}"
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2786,6 +2820,231 @@ def bucket_stage(
         sub_g.lint()
         results.append((fx.GraphModule(stage_gm, sub_g), new_input_idxs, new_param_idxs, new_graphargs))
 
+    return results
+
+
+def apply_activation_checkpointing(
+    stage_gm: fx.GraphModule,
+    graphargs: list,
+    input_idxs: list[int],
+    param_idxs: list[int],
+    num_checkpoints: int,
+) -> list[fx.GraphModule]:
+    """Split a bucket into sequential activation-checkpoint regions.
+
+    The regions are chosen to be roughly balanced by parameter bytes. Live
+    intermediate tensors can flow between adjacent regions as needed, so a
+    later region may receive and forward multiple carried tensors.
+    """
+    num_checkpoints = max(1, int(num_checkpoints))
+    if num_checkpoints <= 1:
+        return [stage_gm]
+    gm_name = getattr(stage_gm, "_get_name", lambda: type(stage_gm).__name__)()
+
+    nodes = list(stage_gm.graph.nodes)
+    node_idx: dict[fx.Node, int] = {nd: i for i, nd in enumerate(nodes)}
+    ph_nodes = [nd for nd in nodes if nd.op == "placeholder"]
+    param_ph_set = {ph_nodes[i] for i in param_idxs if i < len(ph_nodes)}
+    param_ph_list = [ph_nodes[i] for i in param_idxs if i < len(ph_nodes)]
+    input_ph_set = {ph_nodes[i] for i in input_idxs if i < len(ph_nodes)}
+    compute_nodes = [nd for nd in nodes if nd.op not in ("placeholder", "get_attr", "output")]
+
+    if not param_ph_list or len(compute_nodes) < 2:
+        logger.info(
+            f"[ac_split_skip] gm={gm_name} requested_subgraphs={num_checkpoints} "
+            f"params={len(param_ph_list)} compute_nodes={len(compute_nodes)} "
+            "reason=insufficient_params_or_compute"
+        )
+        return [stage_gm]
+
+    compute_set: frozenset[int] = frozenset(node_idx[nd] for nd in compute_nodes)
+
+    def _tensor_meta(nd: fx.Node):
+        ev = nd.meta.get("example_value")
+        if ev is None:
+            ev = nd.meta.get("val")
+        if isinstance(ev, torch.Tensor):
+            return ev
+        return None
+
+    def _param_size(pnd: fx.Node) -> int:
+        i = ph_nodes.index(pnd)
+        if i < len(graphargs) and graphargs[i] is not None and hasattr(graphargs[i], "numel"):
+            return int(graphargs[i].numel() * graphargs[i].element_size())
+        ev = _tensor_meta(pnd)
+        if ev is not None:
+            return int(ev.numel() * ev.element_size())
+        return 0
+
+    def _use_indices(pnd: fx.Node) -> list[int]:
+        return [node_idx[u] for u in pnd.users if node_idx[u] in compute_set]
+
+    param_first_use: dict[fx.Node, int] = {}
+    for pn in param_ph_list:
+        uses = _use_indices(pn)
+        param_first_use[pn] = min(uses) if uses else node_idx[pn]
+
+    param_sizes = {pn: _param_size(pn) for pn in param_ph_list}
+    total_param_bytes = sum(param_sizes.values())
+    if total_param_bytes <= 0:
+        logger.info(
+            f"[ac_split_skip] gm={gm_name} requested_subgraphs={num_checkpoints} "
+            f"params={len(param_ph_list)} compute_nodes={len(compute_nodes)} "
+            "reason=nonpositive_param_bytes"
+        )
+        return [stage_gm]
+
+    sorted_params = sorted(param_ph_list, key=lambda pn: param_first_use[pn])
+    running_bytes = 0
+    next_param = 0
+
+    candidate_cuts: list[tuple[int, int]] = []
+    for cut_node in compute_nodes[:-1]:
+        cut_idx = node_idx[cut_node]
+        while next_param < len(sorted_params) and param_first_use[sorted_params[next_param]] <= cut_idx:
+            running_bytes += param_sizes[sorted_params[next_param]]
+            next_param += 1
+        candidate_cuts.append((cut_idx, running_bytes))
+
+    if len(candidate_cuts) < num_checkpoints - 1:
+        logger.warning(
+            f"[ac_split_reject] gm={gm_name} requested_subgraphs={num_checkpoints} "
+            f"params={len(param_ph_list)} compute_nodes={len(compute_nodes)} "
+            f"candidate_cuts={len(candidate_cuts)} required_cuts={num_checkpoints - 1} "
+            "reason=insufficient_compute_cuts"
+        )
+        return [stage_gm]
+
+    selected_cuts: list[int] = []
+    start = 0
+    for split_idx in range(1, num_checkpoints):
+        target = total_param_bytes * split_idx / num_checkpoints
+        remaining = (num_checkpoints - 1) - split_idx
+        eligible = candidate_cuts[start: len(candidate_cuts) - remaining]
+        if not eligible:
+            logger.warning(
+                f"[ac_split_reject] gm={gm_name} requested_subgraphs={num_checkpoints} "
+                f"candidate_cuts={len(candidate_cuts)} chosen_cuts={len(selected_cuts)} "
+                f"failed_pick={split_idx}/{num_checkpoints - 1} reason=no_eligible_cut"
+            )
+            return [stage_gm]
+        best_rel = min(
+            range(len(eligible)),
+            key=lambda rel: abs(eligible[rel][1] - target),
+        )
+        chosen = eligible[best_rel]
+        selected_cuts.append(chosen[0])
+        start += best_rel + 1
+
+    n_segs = num_checkpoints
+
+    def _seg_of(idx: int) -> int:
+        return sum(1 for cut in selected_cuts if cut < idx)
+
+    node_seg: dict[fx.Node, int] = {}
+    for nd in nodes:
+        if nd.op == "output":
+            node_seg[nd] = n_segs - 1
+        elif nd.op == "placeholder":
+            if nd in param_ph_set:
+                uses = _use_indices(nd)
+                node_seg[nd] = _seg_of(min(uses)) if uses else 0
+            else:
+                user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+                node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
+        elif nd.op == "get_attr":
+            user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+            node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
+        else:
+            node_seg[nd] = _seg_of(node_idx[nd])
+
+    def _consumer_seg(user: fx.Node) -> int:
+        if user.op == "output":
+            return n_segs - 1
+        return node_seg[user]
+
+    seg_live_inputs: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for seg in range(1, n_segs):
+        live_nodes: list[fx.Node] = []
+        seen: set[fx.Node] = set()
+        for nd in compute_nodes:
+            if node_seg[nd] >= seg:
+                continue
+            if any(_consumer_seg(user) >= seg for user in nd.users):
+                if nd not in seen:
+                    seen.add(nd)
+                    live_nodes.append(nd)
+        seg_live_inputs[seg] = live_nodes
+
+    seg_placeholder_inputs: list[list[fx.Node]] = [[] for _ in range(n_segs)]
+    for nd in nodes:
+        if nd.op != "placeholder" or nd in param_ph_set:
+            continue
+        for seg in range(n_segs):
+            if any(node_seg[u] == seg for u in nd.users):
+                seg_placeholder_inputs[seg].append(nd)
+
+    results: list[fx.GraphModule] = []
+    for seg in range(n_segs):
+        sub_g = fx.Graph()
+        remap: dict[fx.Node, fx.Node] = {}
+
+        if seg > 0:
+            for live_idx, boundary_nd in enumerate(seg_live_inputs[seg]):
+                new_ph = sub_g.placeholder(f"_ac_in_{live_idx}")
+                new_ph.type = boundary_nd.type
+                remap[boundary_nd] = new_ph
+
+        for nd in seg_placeholder_inputs[seg]:
+            new_ph = sub_g.placeholder(nd.name)
+            new_ph.type = nd.type
+            remap[nd] = new_ph
+
+        for nd in nodes:
+            if nd.op == "placeholder" and nd in param_ph_set and node_seg[nd] == seg:
+                new_ph = sub_g.placeholder(nd.name)
+                new_ph.type = nd.type
+                remap[nd] = new_ph
+
+        for nd in nodes:
+            if nd.op == "get_attr" and node_seg[nd] == seg:
+                new_ga = sub_g.get_attr(nd.target)
+                new_ga.type = nd.type
+                remap[nd] = new_ga
+
+        try:
+            for nd in nodes:
+                if nd.op in ("placeholder", "get_attr", "output"):
+                    continue
+                if node_seg[nd] != seg:
+                    continue
+                remap[nd] = sub_g.node_copy(nd, arg_transform=lambda x, r=remap: r[x])
+        except KeyError as exc:
+            logger.warning(
+                f"[ac_split_reject] gm={gm_name} requested_subgraphs={num_checkpoints} "
+                f"segment={seg} missing_node={exc} reason=non_local_tensor_during_lowering"
+            )
+            return [stage_gm]
+
+        if seg == n_segs - 1:
+            orig_out = next(nd for nd in nodes if nd.op == "output")
+            sub_g.output(fx.map_arg(orig_out.args[0], lambda x: remap[x]))
+        else:
+            live_outputs = [remap[nd] for nd in seg_live_inputs[seg + 1]]
+            if len(live_outputs) == 1:
+                sub_g.output(live_outputs[0])
+            else:
+                sub_g.output(tuple(live_outputs))
+
+        sub_g.lint()
+        results.append(fx.GraphModule(stage_gm, sub_g))
+
+    logger.info(
+        f"[ac_split_accept] gm={gm_name} requested_subgraphs={num_checkpoints} "
+        f"actual_subgraphs={len(results)} candidate_cuts={len(candidate_cuts)} "
+        f"selected_cuts={selected_cuts} "
+        f"live_counts={[len(seg_live_inputs[i]) for i in range(1, n_segs)]}"
+    )
     return results
 
 
@@ -3457,7 +3716,9 @@ def assign_time_steps(dag: TaskDAG) -> None:
 
     SEND / RECV nodes have no temporal edges and are assigned after the toposort:
     ``SEND.time_step = data_pred.time_step + 1`` and
-    ``RECV.time_step = data_succ.time_step - 1``.
+    ``RECV.time_step = data_succ.time_step - 1``. ALL_REDUCE nodes are
+    also constrained by their data predecessor, while preserving any
+    temporal barrier inserted by ``a2a_ar_no_overlap``.
     """
     # Kahn's toposort over the temporal graph (temporal_preds / temporal_succs).
     # time_step = max(pred.time_step for all temporal preds) + 1.
@@ -3480,17 +3741,22 @@ def assign_time_steps(dag: TaskDAG) -> None:
             if in_degree[id(succ)] == 0:
                 queue.append(succ)
 
-    # SEND/RECV/ALL_REDUCE nodes have no temporal edges and are skipped by the toposort.
-    # Assign their time_step relative to their data-edge neighbour.
+    # Assign stream-only communication nodes relative to their data-edge neighbour.
+    # ALL_REDUCE may also have temporal predecessors from a2a_ar_no_overlap;
+    # keep whichever constraint places it later.
 
-    # Pass 1: SEND and ALL_REDUCE (depend only on their data predecessor).
+    # Pass 1: SEND and ALL_REDUCE.
     for node in dag.nodes:
         if node.chunk.type == TaskType.SEND:
             assert len(node.data_preds) == 1
             node.time_step = node.data_preds[0].time_step + 1
         elif node.chunk.type == TaskType.ALL_REDUCE:
             assert len(node.data_preds) == 1
-            node.time_step = node.data_preds[0].time_step + 1
+            data_ready_time = node.data_preds[0].time_step + 1
+            if node.temporal_preds:
+                node.time_step = max(node.time_step, data_ready_time)
+            else:
+                node.time_step = data_ready_time
 
     # Pass 2: RECV (depend only on their data successor).
     for node in dag.nodes:

@@ -73,7 +73,9 @@ def piper_setup(
     schedule: PipelineSchedule=None,
     naive_gradient_sync=False,
     activation_checkpointing=False,
+    num_checkpoints=1,
     bucketing=False,
+    a2a_ar_no_overlap=False,
     pg=None,
     nsight=False,
     model_flops_per_token: float = None,
@@ -91,6 +93,8 @@ def piper_setup(
         schedule: 2D schedule grid (rank x time_step).
         naive_gradient_sync: Use a simple blocking all-reduce instead of
             pipelined per-param hooks.
+        a2a_ar_no_overlap: When true, schedule gradient all-reduces after
+            same-rank A2A operations to avoid NCCL interference.
     """
 
     # Clear Dynamo's global compilation cache so that a previous piper_setup
@@ -102,7 +106,9 @@ def piper_setup(
     assert len(stage_to_device) > 0
     piper_metadata.stage_to_device = stage_to_device
     piper_metadata.use_activation_checkpointing = activation_checkpointing
+    piper_metadata.activation_num_checkpoints = max(1, int(num_checkpoints))
     piper_metadata.bucketing = bucketing
+    piper_metadata.a2a_ar_no_overlap = a2a_ar_no_overlap
     piper_metadata.schedule = schedule
     piper_metadata.visualize_dag = visualize_dag
 

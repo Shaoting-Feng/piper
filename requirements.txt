@@ -1,6 +1,8 @@
+torchtitan
 numpy
-ray[default]==2.44.1
 torch==2.10.0
+click<8.1
 cupy-cuda12x
 bitsandbytes
 graphviz
+matplotlib

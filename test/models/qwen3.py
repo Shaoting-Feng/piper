@@ -159,7 +159,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
                 moe_enabled=True,
                 moe_inter_dim=768,
                 moe_args=MoEArgs(
-                    num_experts=64,
+                    num_experts=128,
                     num_shared_experts=0,
                     top_k=8,
                     score_func="softmax",

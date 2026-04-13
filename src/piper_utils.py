@@ -1,3 +1,4 @@
+import sys
 import queue
 import ray
 import torch
@@ -57,7 +58,7 @@ def create_logger(name: str, log_level: str):
     logger.setLevel(log_level)
     
     if not logger.handlers:
-        handler = logging.StreamHandler()
+        handler = logging.StreamHandler(sys.stdout)
         fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
         handler.setFormatter(logging.Formatter(fmt))
         logger.addHandler(handler)
@@ -336,7 +337,9 @@ class PiperMetadata:
     stage_to_device = dict()
     naive_gradient_sync = False
     use_activation_checkpointing = False
+    activation_num_checkpoints = 1
     bucketing = False  # Whether to split stages into per-param-bucket sub-modules
+    a2a_ar_no_overlap = False  # Whether ALL_REDUCE tasks must wait for all same-rank A2A tasks
     schedule = None   # PipelineSchedule set by piper_setup; used by the piper backend
     task_dag = None   # TaskDAG built from schedule by the piper backend
     full_dag_no_overlap = None  # Deep copy of the full DAG (pre-P2P-split, no overlap_a2a_tasks); used for profiling and critical-path analysis
