@@ -40,6 +40,7 @@ from .piper_graph_transform import (
     split_dag_by_rank,
     assign_time_steps,
     find_overlappable_tasks,
+    insert_zero_ops,
     overlap_a2a_tasks,
     visualize_dag,
     compute_critical_path,
@@ -120,7 +121,13 @@ def piper(gm, example_inputs, **kwargs):
 
         for seg_idx, (seg_gm, seg_in, seg_param, seg_args) in enumerate(a2a_segments):
             if piper_metadata.bucketing and seg_idx % 2 == 0:
-                buckets = bucket_stage(seg_gm, seg_args, seg_in, seg_param)
+                buckets = bucket_stage(
+                    seg_gm,
+                    seg_args,
+                    seg_in,
+                    seg_param,
+                    bucket_size_bytes=piper_metadata.bucket_size,
+                )
                 if len(buckets) > 1:
                     logger.debug(
                         f"Stage {stage_id} segment {seg_idx} bucketed into {len(buckets)} buckets"
@@ -229,25 +236,32 @@ def piper(gm, example_inputs, **kwargs):
         _ubid += stage_bucket_counts[s]
 
     # Now dispatch _load_stage with unique_bucket_ids embedded in modules_data.
-    refs = []
     for stage_id, (modules_data, a2a_boundaries, actor) in all_stage_compiled.items():
-        K = stage_bucket_counts[stage_id]
         ubid_offset = _stage_ubid_offsets[stage_id]
         for b_idx, md in enumerate(modules_data):
             md["unique_bucket_id"] = ubid_offset + b_idx
-        refs.append(actor._load_stage.remote(
+        actor._load_stage.remote(
             stage_id,
             modules_data,
             a2a_boundaries,
             use_activation_checkpointing=piper_metadata.use_activation_checkpointing,
-        ))
+        )
         # Remove actor from stored compiled data (not needed downstream)
         all_stage_compiled[stage_id] = (modules_data, a2a_boundaries)
 
-    ray.get(refs)
+    logger.debug("Sent stages to actors for loading")
 
     piper_metadata.stage_bucket_counts = stage_bucket_counts
     piper_metadata.trainable_bucket_keys = trainable_bucket_keys
+    stage_data = {
+        "stages": all_stage_compiled,
+        "stage_bucket_counts": stage_bucket_counts,
+        "trainable_bucket_keys": trainable_bucket_keys,
+    }
+    compiled_store = getattr(piper_metadata, "compiled_data_store", None)
+    if compiled_store is not None:
+        ray.get(compiled_store.publish_stage_data.remote(stage_data))
+        logger.debug("Published compiled stage data")
 
     # Build task DAG from the schedule stored by piper_setup.
     if piper_metadata.schedule is not None:
@@ -255,34 +269,11 @@ def piper(gm, example_inputs, **kwargs):
             piper_metadata.schedule,
             piper_metadata.stage_bucket_counts,
             stage_a2a_boundaries,
-            dp_degree,
-            a2a_ar_no_overlap=piper_metadata.a2a_ar_no_overlap,
         )
-        logger.debug(
-            f"Built task DAG: {len(dag.nodes)} nodes, "
-            f"{sum(len(n.data_succs) for n in dag.nodes)} data edges"
-        )
+        logger.debug(f"Built task DAG: {len(dag.nodes)} nodes")
 
         add_temporal_dependencies(dag, piper_metadata.schedule)
-        logger.debug(
-            f"Added temporal dependencies: "
-            f"{sum(len(n.temporal_succs) for n in dag.nodes)} temporal edges"
-        )
-
-        if dp_degree > 1 and stage_a2a_boundaries:
-            overlappable = find_overlappable_tasks(piper_metadata.schedule)
-            for t1, t2 in overlappable:
-                logger.info(
-                    f"Found adjacent task pair for A2A/compute overlap: "
-                    f"{t1} -> {t2}"
-                )
-            # if overlappable:
-            #     dag = overlap_a2a_tasks(dag, overlappable)
-            #     logger.debug(
-            #         f"Overlapped {len(overlappable)} adjacent task pair(s) for A2A/compute overlap"
-            #     )
-
-        assign_time_steps(dag)
+        logger.debug(f"Added temporal dependencies")
 
         # Save a deep copy of the full DAG before split_dag_by_rank removes
         # cross-rank data edges.  Used later for profiling and critical-path analysis.
@@ -291,7 +282,31 @@ def piper(gm, example_inputs, **kwargs):
         # Split into per-rank DAGs.
         per_rank_dags = split_dag_by_rank(dag)
 
+        # Insert ZeRO/DP communicatino tasks
+        if dp_degree > 1:
+            per_rank_dags = insert_zero_ops(
+                per_rank_dags,
+                piper_metadata.zero_stage,
+                trainable_bucket_keys=piper_metadata.trainable_bucket_keys,
+            )
+            logger.debug(f"Inserted ZeRO-{piper_metadata.zero_stage} collective nodes")
+
+            overlappable = find_overlappable_tasks(piper_metadata.schedule)
+            for t1, t2 in overlappable:
+                logger.debug(
+                    f"Found adjacent task pair for A2A/compute overlap: "
+                    f"{t1} -> {t2}"
+                )
+                # TODO: overlap a2a tasks
+
+        # Assign time steps
+        for rank_dag in per_rank_dags:
+            assign_time_steps(rank_dag)
+        logger.debug("Assigned time steps")
+
         piper_metadata.per_rank_dags = per_rank_dags
+
+        # Visualize DAG
         actors = piper_metadata.actors
         if piper_metadata.visualize_dag:
             for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags):
@@ -300,14 +315,22 @@ def piper(gm, example_inputs, **kwargs):
                 except Exception as e:
                     logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
                 print_dag_order(per_rank_dag, label=f"rank {pp_rank}", rank=pp_rank)
-        
-        ray.get([
-            actors[pp_rank].load_dag.remote(per_rank_dag)
-            for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags)
-        ])
+
+        # Send DAG to actors
+        refs = [actors[pp_rank].load_dag.remote(per_rank_dag)
+            for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags)]
+
         logger.debug(
-            f"Loaded per-rank DAGs onto {len(piper_metadata.per_rank_dags)} actors"
+            f"Sent per-rank DAGs onto {len(piper_metadata.per_rank_dags)} actors"
         )
+        dag_data = {
+            "per_rank_dags": per_rank_dags,
+            "full_dag_no_overlap": piper_metadata.full_dag_no_overlap,
+        }
+        if compiled_store is not None:
+            ray.get(compiled_store.publish_dag_data.remote(dag_data))
+            logger.debug("Published compiled DAG data")
+
         # Publish compiled data so dp_rank > 0 can skip torch.compile.
         piper_metadata.compiled_stage_data = {
             "stages": all_stage_compiled,           # {stage_id: (modules_data, a2a_boundaries)}

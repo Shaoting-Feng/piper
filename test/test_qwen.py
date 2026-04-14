@@ -172,11 +172,12 @@ def main(args, pg):
         activation_checkpointing=args.activation_checkpointing,
         a2a_ar_no_overlap=True,
         bucketing=args.bucketing,
+        zero_stage=args.zero_stage,
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
         model_flops_per_token=flops_per_token,
-        visualize_dag=not args.no_viz,
+        visualize_dag=args.save_viz,
         const_attrs={"rope_cache": rope_cache},
     )
 
@@ -273,14 +274,16 @@ def parse_args():
     parser.add_argument("--tracing", action="store_true", default=False)
     parser.add_argument("--naive-grad-sync", action="store_true", default=False)
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
+    parser.add_argument("--zero-stage", type=int, default=0, choices=[0, 1, 2, 3],
+                        help="Apply ZeRO memory optimizations")
     parser.add_argument("--bucketing", action="store_true", default=False,
                         help="Split stages into per-param-bucket sub-modules for overlapped all-reduce")
     parser.add_argument("--profiling", action="store_true", default=False,
                         help="Profile each DAG task: log time and memory delta per task")
     parser.add_argument("--nsight", action="store_true", default=False,
                         help="Whether to use Nsight Systems for tracing")
-    parser.add_argument("--no-viz", action="store_true", default=False,
-                        help="Skip per-rank DAG visualization (speeds up startup for large models)")
+    parser.add_argument("--save-viz", action="store_true", default=False,
+                        help="Save per-rank DAG visualization (slow for models > 1B)")
     parser.add_argument("--address", default="",
                         help="Ray head address to connect to")
     parser.add_argument("--port", type=int, default=4567,

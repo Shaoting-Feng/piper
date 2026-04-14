@@ -113,7 +113,7 @@ def main(args, pg):
         pg=pg,
         nsight=args.nsight,
         model_flops_per_token=flops_per_token,
-        visualize_dag=not args.no_viz,
+        visualize_dag=args.save_viz,
         const_attrs={"freqs_cis": freqs_cis, "mask": mask},
     )
 
@@ -191,8 +191,8 @@ def parse_args():
                         help='Whether to use Nsight Systems for tracing')
     parser.add_argument('--profiling', action='store_true', default=False,
                         help='Profile each DAG task: log time and memory delta per task')
-    parser.add_argument('--no-viz', action='store_true', default=False,
-                        help='Skip per-rank DAG visualization (speeds up startup for large models)')
+    parser.add_argument('--save-viz', action='store_true', default=False,
+                        help='Save per-rank DAG visualization (slow for models > 1B)')
     return parser.parse_args()
 
 """

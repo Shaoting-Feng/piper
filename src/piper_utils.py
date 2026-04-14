@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from typing import Any, Optional
 
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "DEBUG"
 
 """ 
 Print the backward graph of a tensor
@@ -43,6 +43,7 @@ def print_backward_graph(printer, tensor, prefix=""):
 Logger utility
 """
 
+VERBOSE = 5
 def create_logger(name: str, log_level: str):
     match log_level:
         case "DEBUG":
@@ -53,6 +54,8 @@ def create_logger(name: str, log_level: str):
             log_level = logging.WARNING
         case "ERROR":
             log_level = logging.ERROR
+        case "VERBOSE":
+            log_level = VERBOSE
     
     logger = logging.getLogger(name)
     logger.setLevel(log_level)
@@ -339,11 +342,15 @@ class PiperMetadata:
     use_activation_checkpointing = False
     activation_num_checkpoints = 1
     bucketing = False  # Whether to split stages into per-param-bucket sub-modules
+    bucket_size: int = 25 * 1024 * 1024  # Target bucket size in bytes
     a2a_ar_no_overlap = False  # Whether ALL_REDUCE tasks must wait for all same-rank A2A tasks
     schedule = None   # PipelineSchedule set by piper_setup; used by the piper backend
     task_dag = None   # TaskDAG built from schedule by the piper backend
     full_dag_no_overlap = None  # Deep copy of the full DAG (pre-P2P-split, no overlap_a2a_tasks); used for profiling and critical-path analysis
     per_rank_dags = None  # Per-rank TaskDAGs built by the piper backend
+    zero_stage: int = 0  # ZeRO stage: 0=disabled, 1=optim states, 2=+gradients, 3=+parameters
+    schedule_name: str = ""  # Human-readable schedule name for debug artifacts
+    visualize_dag_render: bool = True  # If False, save Graphviz source only
     stage_bucket_counts: dict = {}   # stage_id -> number of buckets (set by piper backend)
     trainable_bucket_keys: set = set()  # (stage_id, bucket_id) pairs with trainable params
     # Populated by the piper backend on dp_rank=0; broadcast to dp_rank>0 by piper_setup
