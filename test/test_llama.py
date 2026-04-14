@@ -3,6 +3,7 @@ import ray
 import torch
 import time
 import argparse
+import json
 import os
 import numpy as np
 
@@ -29,6 +30,64 @@ from .schedule_helpers import (
     build_dualpipev_schedule,
     NO_PP_SCHEDULE,
 )
+
+
+def _metrics_output_path(args):
+    return os.path.join(
+        args.output_dir,
+        f"llama{args.model}-pp{args.pp}-dp{args.dp}-{args.schedule}",
+    )
+
+
+def _build_benchmark_metrics(args, dp_rank, iter_times):
+    mean_iter_time = float(np.mean(iter_times))
+    std_iter_time = float(np.std(iter_times))
+    throughput = float((args.batch_size * args.mbs * args.seq_len) / mean_iter_time)
+
+    return {
+        "dp_rank": dp_rank,
+        "model": args.model,
+        "schedule": args.schedule,
+        "pp": args.pp,
+        "dp": args.dp,
+        "batch_size": args.batch_size,
+        "mbs": args.mbs,
+        "seq_len": args.seq_len,
+        "samples": len(iter_times),
+        "iter_time_mean_s": mean_iter_time,
+        "iter_time_std_s": std_iter_time,
+        "throughput_tokens_per_s": throughput,
+        "iter_times_s": [float(iter_time) for iter_time in iter_times],
+    }
+
+
+def _format_benchmark_log_lines(metrics):
+    rank = metrics["dp_rank"]
+    lines = [
+        (
+            f"rank {rank} iter time= {metrics['iter_time_mean_s']:.5f} +/- "
+            f"{metrics['iter_time_std_s']:.5f} s ({metrics['samples']} samples)"
+        ),
+        f"rank {rank} throughput= {metrics['throughput_tokens_per_s']:.3f} tokens/s",
+    ]
+    for trace in metrics.get("trace_times", []):
+        lines.append(
+            f"rank {trace['rank']} {trace['key']} time= {trace['mean_ms']:.3f} +/- "
+            f"{trace['std_ms']:.3f} ms ({trace['samples']} samples)"
+        )
+    lines.append(f"rank {rank} metrics_json= {json.dumps(metrics, sort_keys=True)}")
+    return lines
+
+
+def _write_benchmark_metrics(args, metrics):
+    metrics_path = _metrics_output_path(args)
+    os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
+    with open(metrics_path, "a", encoding="utf-8") as output_file:
+        for line in _format_benchmark_log_lines(metrics):
+            output_file.write(line + "\n")
+        output_file.write("\n")
+
+    return metrics_path
 
 
 def main(args, pg):
@@ -109,6 +168,7 @@ def main(args, pg):
         activation_checkpointing=args.activation_checkpointing,
         num_checkpoints=args.num_checkpoints,
         bucketing=args.bucketing,
+        bucket_size=int(args.bucket_size * 1024 * 1024),
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
@@ -134,12 +194,15 @@ def main(args, pg):
         time.sleep(1)
 
     dp_rank = int(os.environ['PIPER_DP_RANK'])
-    logger.info(
-        f"rank {dp_rank} iter time= {np.mean(iter_times):.5f} ± {np.std(iter_times):.5f} s "
-        f"({len(iter_times)} samples)\n"
-        f"rank {dp_rank} throughput= "
-        f"{(args.batch_size * args.mbs * args.seq_len) / np.mean(iter_times):.3f} tokens/s"
-    )
+    metrics = _build_benchmark_metrics(args, dp_rank, iter_times)
+    iter_time_msg, throughput_msg, _ = _format_benchmark_log_lines(metrics)
+    metrics_msg = f"rank {dp_rank} benchmark metrics will be saved by the driver to {_metrics_output_path(args)}"
+    logger.info(iter_time_msg)
+    logger.info(throughput_msg)
+    logger.info(metrics_msg)
+    print(iter_time_msg, flush=True)
+    print(throughput_msg, flush=True)
+    print(metrics_msg, flush=True)
 
     if args.tracing:
         ray.get([actor.set_tracing.remote(True) for actor in actors.values()])
@@ -149,18 +212,34 @@ def main(args, pg):
             ray.get([actor.flush_timing_events.remote() for actor in actors.values()])
             time.sleep(1)
         trace_data_ret = ray.get([actor.get_trace_data.remote() for actor in actors.values()])
+        trace_times = []
         for rank, trace_data in trace_data_ret:
             for key in trace_data:
                 all_times = trace_data[key]
-                logger.info(
-                    f"rank {rank} {key} time= {np.mean(all_times):.3f} ± "
-                    f"{np.std(all_times):.3f} ms ({len(all_times)} samples)"
+                trace = {
+                    "rank": rank,
+                    "key": key,
+                    "mean_ms": float(np.mean(all_times)),
+                    "std_ms": float(np.std(all_times)),
+                    "samples": len(all_times),
+                    "times_ms": [float(trace_time) for trace_time in all_times],
+                }
+                trace_times.append(trace)
+                trace_msg = (
+                    f"rank {trace['rank']} {trace['key']} time= {trace['mean_ms']:.3f} +/- "
+                    f"{trace['std_ms']:.3f} ms ({trace['samples']} samples)"
                 )
+                logger.info(trace_msg)
+                print(trace_msg, flush=True)
+        metrics["trace_times"] = trace_times
 
-    os.makedirs("out", exist_ok=True)
-    timeline_filename = f"out/llama-dag-pp{args.pp}-dp{args.dp}-{args.schedule}"
-    ray.timeline(timeline_filename)
-    logger.info(f"Ray timeline saved to: {timeline_filename}")
+    if args.nsight:
+        logger.info("Stopping Piper actors so Nsight Systems reports are flushed")
+        try:
+            ray.get([actor.__ray_terminate__.remote() for actor in actors.values()])
+        except ray.exceptions.ActorDiedError as exc:
+            logger.info(f"Piper actors stopped for Nsight flush: {exc}")
+    return metrics
 
 
 def parse_args():
@@ -187,12 +266,22 @@ def parse_args():
                         help='Number of sequential activation-checkpoint regions per Piper bucket')
     parser.add_argument('--bucketing', action='store_true', default=False,
                         help='Split stages into per-param-bucket sub-modules for overlapped all-reduce')
+    parser.add_argument('--bucket-size', type=float, default=25,
+                        help='Bucket size in MB (default: 25)')
     parser.add_argument('--nsight', action='store_true', default=False,
                         help='Whether to use Nsight Systems for tracing')
     parser.add_argument('--profiling', action='store_true', default=False,
                         help='Profile each DAG task: log time and memory delta per task')
     parser.add_argument('--save-viz', action='store_true', default=False,
                         help='Save per-rank DAG visualization (slow for models > 1B)')
+    parser.add_argument('--address', default='',
+                        help='Ray head address to connect to')
+    parser.add_argument('--port', type=int, default=4567,
+                        help='Ray head port to connect to (default: 4567)')
+    parser.add_argument('--temp-dir', default='/tmp/piper/ray_tmp',
+                        help='Ray temp directory (default: /tmp/piper/ray_tmp)')
+    parser.add_argument('--output-dir', default='out',
+                        help='Directory for benchmark metrics output (default: out)')
     return parser.parse_args()
 
 """
@@ -206,17 +295,33 @@ def parse_args():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     args = parse_args()
+    metrics_path = _metrics_output_path(args)
+    os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
+    open(metrics_path, "w", encoding="utf-8").close()
     logger.info(args)
-    ray.init(
-        address="10.158.48.71:4567",
-        namespace="llama",
-        include_dashboard=False,
-        _temp_dir="/m-coriander/coriander/mfris/piper/ray_tmp",
-    )
-    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="PACK")
+    if args.address != "":
+        ray.init(
+            address=f"{args.address}:{args.port}",
+            namespace="llama",
+            log_to_driver=True,
+            include_dashboard=False,
+            _temp_dir=args.temp_dir,
+        )
+    else:
+        ray.init(
+            namespace="llama",
+            log_to_driver=True,
+            include_dashboard=False,
+            _temp_dir=args.temp_dir,
+        )
+    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="SPREAD")
     ray.get(pg.ready(), timeout=600)
     logger.info(placement_group_table(pg))
     piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
     handles = piper_coordinator.run_program.remote(main, pg, args, pg)
-    ray.get(handles)
+    dp_metrics = ray.get(handles)
+    open(metrics_path, "w", encoding="utf-8").close()
+    for metrics in sorted(dp_metrics, key=lambda item: item["dp_rank"]):
+        _write_benchmark_metrics(args, metrics)
+    logger.info(f"Benchmark metrics saved to {metrics_path}")
     ray.shutdown()

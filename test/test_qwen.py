@@ -172,6 +172,7 @@ def main(args, pg):
         activation_checkpointing=args.activation_checkpointing,
         a2a_ar_no_overlap=True,
         bucketing=args.bucketing,
+        bucket_size=int(args.bucket_size * 1024 * 1024),
         zero_stage=args.zero_stage,
         model_dtype=torch.bfloat16,
         pg=pg,
@@ -278,6 +279,8 @@ def parse_args():
                         help="Apply ZeRO memory optimizations")
     parser.add_argument("--bucketing", action="store_true", default=False,
                         help="Split stages into per-param-bucket sub-modules for overlapped all-reduce")
+    parser.add_argument("--bucket-size", type=float, default=25,
+                        help="Bucket size in MB (default: 25)")
     parser.add_argument("--profiling", action="store_true", default=False,
                         help="Profile each DAG task: log time and memory delta per task")
     parser.add_argument("--nsight", action="store_true", default=False,

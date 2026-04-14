@@ -1926,13 +1926,19 @@ def _insert_zero_grad_ops(
     rank_dag: TaskDAG,
     *,
     sync_type: TaskType,
+    use_grad_lifetime: bool = False,
     trainable_bucket_keys: set | None = None,
 ) -> None:
-    """Per-compute-node full-gradient lifecycle: G+ → compute → sync → G-.
+    """Per-compute-node gradient sync.
 
-    Every BWD / BWD_W node gets its own alloc-sync-free triple.  There is
-    no gradient accumulation: each node independently all-reduces or
-    reduce-scatters its gradients immediately after it finishes.
+    Every BWD / BWD_W node gets its own sync immediately after it finishes.
+    There is no gradient accumulation.
+
+    When ``use_grad_lifetime=True`` (ZeRO-2/3 where gradients are sharded),
+    a G+ → compute → sync → G- lifecycle is inserted so that the full
+    gradient buffer is explicitly allocated and freed around each sync.
+    When ``use_grad_lifetime=False`` (ZeRO-0/1 where each rank keeps a full
+    copy of gradients), only compute → sync is wired.
     """
     _remove_ar_nodes(rank_dag)
 
@@ -1943,13 +1949,15 @@ def _insert_zero_grad_ops(
         for compute_node in bucket_nodes:
             if compute_node.chunk.type not in grad_sync_types:
                 continue
-            alloc = _zero_task(compute_node, compute_node.bucket_id, TaskType.ALLOC_FULL_GRADS, ubid=ubid)
             sync = _zero_task(compute_node, compute_node.bucket_id, sync_type, ubid=ubid)
-            free = _zero_task(compute_node, compute_node.bucket_id, TaskType.FREE_FULL_GRADS, ubid=ubid)
-            _add_data_edge(alloc, compute_node)
             _add_data_edge(compute_node, sync)
-            _add_data_edge(sync, free)
-            new_nodes.extend([alloc, sync, free])
+            new_nodes.append(sync)
+            if use_grad_lifetime:
+                alloc = _zero_task(compute_node, compute_node.bucket_id, TaskType.ALLOC_FULL_GRADS, ubid=ubid)
+                free = _zero_task(compute_node, compute_node.bucket_id, TaskType.FREE_FULL_GRADS, ubid=ubid)
+                _add_data_edge(alloc, compute_node)
+                _add_data_edge(sync, free)
+                new_nodes.extend([alloc, free])
 
     rank_dag.nodes.extend(new_nodes)
 
@@ -1975,10 +1983,11 @@ def _insert_zero2_ops(
     rank_dag: TaskDAG,
     trainable_bucket_keys: set | None = None,
 ) -> None:
-    """ZeRO-2: per-compute-node reduce-scatter."""
+    """ZeRO-2: per-compute-node reduce-scatter with full-gradient lifecycle."""
     _insert_zero_grad_ops(
         rank_dag,
         sync_type=TaskType.REDUCE_SCATTER,
+        use_grad_lifetime=True,
         trainable_bucket_keys=trainable_bucket_keys,
     )
 

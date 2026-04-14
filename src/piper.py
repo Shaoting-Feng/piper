@@ -5,6 +5,7 @@ import os
 import gc
 import pickle
 import time
+import threading
 from torch._dynamo.backends.registry import register_backend
 from .piper_utils import _serialize_graphmodule, piper_metadata, create_logger, LOG_LEVEL, get_gpu_peak_flops_bf16
 
@@ -120,18 +121,17 @@ def piper(gm, example_inputs, **kwargs):
         a2a_boundaries: dict = {}  # boundary_bucket_id -> tensor_idx
 
         for seg_idx, (seg_gm, seg_in, seg_param, seg_args) in enumerate(a2a_segments):
-            if piper_metadata.bucketing and seg_idx % 2 == 0:
-                buckets = bucket_stage(
-                    seg_gm,
-                    seg_args,
-                    seg_in,
-                    seg_param,
-                    bucket_size_bytes=piper_metadata.bucket_size,
+            buckets = bucket_stage(
+                seg_gm,
+                seg_args,
+                seg_in,
+                seg_param,
+                bucket_size_bytes=piper_metadata.bucket_size,
+            )
+            if len(buckets) > 1:
+                logger.debug(
+                    f"Stage {stage_id} segment {seg_idx} bucketed into {len(buckets)} buckets of size ~{piper_metadata.bucket_size / (1024 * 1024):.1f}MB"
                 )
-                if len(buckets) > 1:
-                    logger.debug(
-                        f"Stage {stage_id} segment {seg_idx} bucketed into {len(buckets)} buckets"
-                    )
             else:
                 buckets = [(seg_gm, seg_in, seg_param, seg_args)]
 
@@ -309,12 +309,18 @@ def piper(gm, example_inputs, **kwargs):
         # Visualize DAG
         actors = piper_metadata.actors
         if piper_metadata.visualize_dag:
-            for pp_rank, per_rank_dag in enumerate(piper_metadata.per_rank_dags):
-                try:
-                    visualize_dag(per_rank_dag, output_path=f"out/rank{pp_rank}_dag")
-                except Exception as e:
-                    logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
-                print_dag_order(per_rank_dag, label=f"rank {pp_rank}", rank=pp_rank)
+            def _visualize_all(per_rank_dags):
+                for pp_rank, per_rank_dag in enumerate(per_rank_dags):
+                    try:
+                        visualize_dag(per_rank_dag, output_path=f"out/rank{pp_rank}_dag")
+                    except Exception as e:
+                        logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
+                    print_dag_order(per_rank_dag, label=f"rank {pp_rank}", rank=pp_rank)
+            threading.Thread(
+                target=_visualize_all,
+                args=(piper_metadata.per_rank_dags,),
+                daemon=True,
+            ).start()
 
         # Send DAG to actors
         refs = [actors[pp_rank].load_dag.remote(per_rank_dag)

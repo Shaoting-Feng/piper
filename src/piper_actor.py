@@ -271,7 +271,7 @@ class PiperActor:
         the actor's device so ``_load_stage`` can copy them directly.
         """
         self.model_const_attrs = {k: v.to(self.device) for k, v in const_attrs.items()}
-        self.logger.debug(
+        self.logger.log(VERBOSE,
             f"Actor {self.global_rank} loaded {len(self.model_const_attrs)} "
             f"constant attrs: {list(self.model_const_attrs.keys())}"
         )
@@ -601,7 +601,7 @@ class PiperActor:
                 if registered_kernels:
                     max_idx, kernel = max(registered_kernels, key=lambda x: x[0])
                     kernel_side_table.id_to_kernel[0] = kernel
-                    self.logger.log(VERBOSE
+                    self.logger.log(VERBOSE,
                         f"Actor {self.global_rank} registered kernel at id_to_kernel[0] "
                         f"(copied from index {max_idx})"
                     )
@@ -1396,16 +1396,25 @@ class PiperActor:
                             rs_evt = self.rs_events.get(pred.uid)
                             if rs_evt is not None:
                                 self.comp_stream.wait_event(rs_evt)
+                                rs_evt.synchronize()
                         elif pred.chunk.type == TaskType.ALL_REDUCE:
                             ar_evt = self.ar_events.get(pred.uid)
                             if ar_evt is not None:
                                 self.comp_stream.wait_event(ar_evt)
+                                ar_evt.synchronize()
                     self._free_full_grads(node.unique_bucket_id)
 
                 case TaskType.ALLOC_FULL_PARAMS:
                     self._alloc_full_params(node.unique_bucket_id)
 
                 case TaskType.FREE_FULL_PARAMS:
+                    for pred in node.data_preds:
+                        if pred.uid in comp_events:
+                            # _free_full_params resizes CUDA storage from the host.
+                            # Stream waits are not enough here: the CPU must not
+                            # release the full ZeRO-3 buffer while a compute kernel
+                            # launched on comp_stream may still be reading it.
+                            comp_events[pred.uid].synchronize()
                     self._free_full_params(node.unique_bucket_id)
 
                 case TaskType.FWD:
@@ -1465,7 +1474,8 @@ class PiperActor:
 
                     if node.compute_loss:
                         assert loss_fn is not None
-                        outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
+                        with torch.cuda.stream(self.comp_stream):
+                            outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.task_buffer[recv_pred.uid]
@@ -1575,7 +1585,8 @@ class PiperActor:
 
                     if node.compute_loss:
                         assert loss_fn is not None
-                        stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
+                        with torch.cuda.stream(self.comp_stream):
+                            stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
                         output_grads = None
                     elif recv_pred is not None:
                         upstream_raw = self.task_buffer[recv_pred.uid]
@@ -2098,7 +2109,7 @@ class PiperActor:
                 grad_tensors.append((idx, param.grad))
 
         if not grad_tensors:
-            self.logger.log(VERBOSE
+            self.logger.log(VERBOSE,
                 f"[all_reduce_bucket] rank={self.global_rank} ubid={ubid}: "
                 "skipped no materialized grads"
             )
