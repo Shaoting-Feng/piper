@@ -171,12 +171,12 @@ def main(args, pg):
         naive_gradient_sync=args.naive_grad_sync,
         activation_checkpointing=args.activation_checkpointing,
         a2a_ar_no_overlap=True,
-        bucketing=args.bucketing,
-        bucket_size=int(args.bucket_size * 1024 * 1024),
+        bucket_size=int(args.bucket_size * 1024 * 1024) if args.bucket_size is not None else None,
         zero_stage=args.zero_stage,
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
+        temp_dir=args.temp_dir,
         model_flops_per_token=flops_per_token,
         visualize_dag=args.save_viz,
         const_attrs={"rope_cache": rope_cache},
@@ -277,10 +277,7 @@ def parse_args():
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
     parser.add_argument("--zero-stage", type=int, default=0, choices=[0, 1, 2, 3],
                         help="Apply ZeRO memory optimizations")
-    parser.add_argument("--bucketing", action="store_true", default=False,
-                        help="Split stages into per-param-bucket sub-modules for overlapped all-reduce")
-    parser.add_argument("--bucket-size", type=float, default=25,
-                        help="Bucket size in MB (default: 25)")
+    parser.add_argument("--bucket-size", type=float, help="Bucket size in MB")
     parser.add_argument("--profiling", action="store_true", default=False,
                         help="Profile each DAG task: log time and memory delta per task")
     parser.add_argument("--nsight", action="store_true", default=False,

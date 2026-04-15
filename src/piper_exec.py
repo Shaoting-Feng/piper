@@ -268,6 +268,30 @@ class Task:
         return f"r{self.pp_rank}_t{self.time_step}_{ttype}_mb{mb}"
 
 
+def runtime_sort_key(node: Task) -> tuple:
+    """Return the actor dispatch ordering key for a task.
+
+    Runtime dispatch order is driven by ``Task.time_step`` first. For tasks that
+    intentionally share a time step, dispatch uses a fixed priority:
+    SEND, A2A, RS/AR, AG, compute, RECV.
+    """
+    priority = {
+        TaskType.SEND: 0,
+        TaskType.FWD_A2A: 1,
+        TaskType.BWD_A2A: 1,
+        TaskType.REDUCE_SCATTER: 2,
+        TaskType.ALL_REDUCE: 2,
+        TaskType.ALL_GATHER: 3,
+        TaskType.FWD: 4,
+        TaskType.BWD: 4,
+        TaskType.BWD_I: 4,
+        TaskType.BWD_W: 4,
+        TaskType.FWD_BWD: 4,
+        TaskType.RECV: 5,
+    }.get(node.chunk.type, 4)
+    return (node.time_step, priority, node.uid)
+
+
 def _rebuild_task_dag(node_data):
     """Reconstruct a TaskDAG from the flat index-based representation produced
     by TaskDAG.__reduce__.  Must be a module-level function so pickle can find

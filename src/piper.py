@@ -40,6 +40,7 @@ from .piper_graph_transform import (
     add_temporal_dependencies,
     split_dag_by_rank,
     assign_time_steps,
+    overlap_zero_ops,
     find_overlappable_tasks,
     insert_zero_ops,
     overlap_a2a_tasks,
@@ -92,6 +93,7 @@ def piper(gm, example_inputs, **kwargs):
     stage_a2a_boundaries: dict = {}
     stage_bucket_counts: dict = {}
     trainable_bucket_keys: set = set()
+    zero_bucket_keys: set = set()
     # Collected for DP broadcasting: stage_id -> (modules_data, a2a_boundaries)
     all_stage_compiled: dict = {}
     # Running counter for assigning globally unique bucket IDs (same ordering as
@@ -105,7 +107,7 @@ def piper(gm, example_inputs, **kwargs):
         actor_stages.append((actor, stage_id))
 
         # Split at A2A annotation boundaries (expert-parallel only, requires dp_degree > 1).
-        if dp_degree > 1 or True:
+        if dp_degree > 1:
             a2a_segments, boundary_infos = split_by_a2a(stage_gm, graphargs, input_idxs, param_idxs)
             if boundary_infos:
                 logger.debug(
@@ -121,22 +123,45 @@ def piper(gm, example_inputs, **kwargs):
         a2a_boundaries: dict = {}  # boundary_bucket_id -> tensor_idx
 
         for seg_idx, (seg_gm, seg_in, seg_param, seg_args) in enumerate(a2a_segments):
-            buckets = bucket_stage(
-                seg_gm,
-                seg_args,
-                seg_in,
-                seg_param,
-                bucket_size_bytes=piper_metadata.bucket_size,
-            )
-            if len(buckets) > 1:
-                logger.debug(
-                    f"Stage {stage_id} segment {seg_idx} bucketed into {len(buckets)} buckets of size ~{piper_metadata.bucket_size / (1024 * 1024):.1f}MB"
-                )
+            # Hack: only bucket even-indexed segments to avoid bucketing MoE subgraphs
+            if piper_metadata.bucket_size is not None:
+                if seg_idx % 2 == 0:
+                    buckets = bucket_stage(
+                        seg_gm,
+                        seg_args,
+                        seg_in,
+                        seg_param,
+                        bucket_size_bytes=piper_metadata.bucket_size,
+                    )
+                    bucket_zero_flags = [True] * len(buckets)
+                else:
+                    bucket_zero_flags = [False]
             else:
                 buckets = [(seg_gm, seg_in, seg_param, seg_args)]
+                if seg_idx % 2 == 0:
+                    bucket_zero_flags = [True]
+                else:
+                    bucket_zero_flags = [False]
 
-            for bucket_gm, bucket_in, bucket_param, bucket_args in buckets:
+            logger.debug(
+                f"Stage {stage_id} segment {seg_idx} bucketed into {len(buckets)} buckets"
+            )
+            for b_idx, (_, _, bp, ba) in enumerate(buckets):
+                for i in bp:
+                    arg = ba[i] if i < len(ba) else None
+                    if arg is not None and hasattr(arg, "numel"):
+                        mb = arg.numel() * arg.element_size() / (1024 * 1024)
+                        logger.debug(
+                            f"  bucket {b_idx} tensor idx={i} shape={tuple(arg.shape)} size={mb:.3f}MB"
+                        )
+
+            for (bucket_gm, bucket_in, bucket_param, bucket_args), apply_zero in zip(
+                buckets, bucket_zero_flags
+            ):
                 original_bucket_gm = bucket_gm
+                shared_placeholder_names = [
+                    n.name for n in original_bucket_gm.graph.nodes if n.op == "placeholder"
+                ]
                 requested_ac_subgraphs = 1
                 if piper_metadata.use_activation_checkpointing:
                     requested_ac_subgraphs = piper_metadata.activation_num_checkpoints
@@ -151,13 +176,23 @@ def piper(gm, example_inputs, **kwargs):
                         bucket_gm = ac_gms
                 actual_ac_subgraphs = len(bucket_gm) if isinstance(bucket_gm, list) else 1
                 if piper_metadata.use_activation_checkpointing:
-                    logger.info(
+                    logger.log(VERBOSE,
                         f"[ac_compile_bucket] stage={stage_id} segment={seg_idx} "
                         f"requested_subgraphs={requested_ac_subgraphs} "
                         f"actual_subgraphs={actual_ac_subgraphs} "
                         f"inputs={len(bucket_in)} params={len(bucket_param)}"
                     )
-                all_modules.append((bucket_gm, bucket_in, bucket_param, bucket_args, original_bucket_gm))
+                all_modules.append(
+                    (
+                        bucket_gm,
+                        bucket_in,
+                        bucket_param,
+                        bucket_args,
+                        original_bucket_gm,
+                        shared_placeholder_names,
+                        apply_zero,
+                    )
+                )
             seg_end_bucket = len(all_modules) - 1  # inclusive index of last bucket in this segment
 
             if seg_idx < len(boundary_infos):
@@ -168,23 +203,35 @@ def piper(gm, example_inputs, **kwargs):
             stage_a2a_boundaries[stage_id] = a2a_boundaries
 
         stage_bucket_counts[stage_id] = len(all_modules)
-        for b_idx, (bgm, b_in, b_param, bargs, _original_gm) in enumerate(all_modules):
+        for b_idx, (
+            bgm,
+            b_in,
+            b_param,
+            bargs,
+            _original_gm,
+            _shared_placeholder_names,
+            apply_zero,
+        ) in enumerate(all_modules):
             has_trainable = any(
                 bargs[i] is not None and getattr(bargs[i], "requires_grad", False)
                 for i in b_param
             )
+            logger.debug(
+                f"[zero_bucket_classify] stage={stage_id} bucket={b_idx} "
+                f"has_trainable={has_trainable} apply_zero={apply_zero} "
+                f"param_idxs={b_param}"
+            )
             if has_trainable:
                 trainable_bucket_keys.add((stage_id, b_idx))
+                if apply_zero:
+                    zero_bucket_keys.add((stage_id, b_idx))
             else:
                 logger.warning(
                     f"Stage {stage_id} bucket {b_idx} has no trainable parameters."
                 )
 
         modules_data = []
-        for bgm, b_in, b_param, bargs, original_gm in all_modules:
-            placeholder_names = [
-                n.name for n in original_gm.graph.nodes if n.op == "placeholder"
-            ]
+        for bgm, b_in, b_param, bargs, original_gm, shared_placeholder_names, apply_zero in all_modules:
             if isinstance(bgm, list):
                 modules_data.append(
                     {
@@ -194,7 +241,8 @@ def piper(gm, example_inputs, **kwargs):
                         "graphargs": bargs,
                         "input_idxs": b_in,
                         "param_idxs": b_param,
-                        "placeholder_names": placeholder_names,
+                        "shared_placeholder_names": shared_placeholder_names,
+                        "apply_zero": apply_zero,
                         "triton_constant_args_list": [
                             _collect_triton_constant_args(sgm) for sgm in bgm
                         ],
@@ -213,7 +261,8 @@ def piper(gm, example_inputs, **kwargs):
                         "graphargs": bargs,
                         "input_idxs": b_in,
                         "param_idxs": b_param,
-                        "placeholder_names": placeholder_names,
+                        "shared_placeholder_names": shared_placeholder_names,
+                        "apply_zero": apply_zero,
                         "triton_constant_args": _collect_triton_constant_args(bgm),
                     }
                 )
@@ -253,10 +302,12 @@ def piper(gm, example_inputs, **kwargs):
 
     piper_metadata.stage_bucket_counts = stage_bucket_counts
     piper_metadata.trainable_bucket_keys = trainable_bucket_keys
+    piper_metadata.zero_bucket_keys = zero_bucket_keys
     stage_data = {
         "stages": all_stage_compiled,
         "stage_bucket_counts": stage_bucket_counts,
         "trainable_bucket_keys": trainable_bucket_keys,
+        "zero_bucket_keys": zero_bucket_keys,
     }
     compiled_store = getattr(piper_metadata, "compiled_data_store", None)
     if compiled_store is not None:
@@ -284,10 +335,13 @@ def piper(gm, example_inputs, **kwargs):
 
         # Insert ZeRO/DP communicatino tasks
         if dp_degree > 1:
+            logger.debug(
+                f"ZeRO bucket filter: {sorted(piper_metadata.zero_bucket_keys)}"
+            )
             per_rank_dags = insert_zero_ops(
                 per_rank_dags,
                 piper_metadata.zero_stage,
-                trainable_bucket_keys=piper_metadata.trainable_bucket_keys,
+                zero_bucket_keys=piper_metadata.zero_bucket_keys,
             )
             logger.debug(f"Inserted ZeRO-{piper_metadata.zero_stage} collective nodes")
 
@@ -297,30 +351,26 @@ def piper(gm, example_inputs, **kwargs):
                     f"Found adjacent task pair for A2A/compute overlap: "
                     f"{t1} -> {t2}"
                 )
-                # TODO: overlap a2a tasks
 
         # Assign time steps
         for rank_dag in per_rank_dags:
             assign_time_steps(rank_dag)
+            # if dp_degree > 1:
+            #     overlap_zero_ops(rank_dag)
         logger.debug("Assigned time steps")
 
         piper_metadata.per_rank_dags = per_rank_dags
 
         # Visualize DAG
         actors = piper_metadata.actors
-        if piper_metadata.visualize_dag:
-            def _visualize_all(per_rank_dags):
-                for pp_rank, per_rank_dag in enumerate(per_rank_dags):
-                    try:
-                        visualize_dag(per_rank_dag, output_path=f"out/rank{pp_rank}_dag")
-                    except Exception as e:
-                        logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
-                    print_dag_order(per_rank_dag, label=f"rank {pp_rank}", rank=pp_rank)
-            threading.Thread(
-                target=_visualize_all,
-                args=(piper_metadata.per_rank_dags,),
-                daemon=True,
-            ).start()
+        for pp_rank, per_rank_dag in enumerate(per_rank_dags):
+            if piper_metadata.visualize_dag:
+                try:
+                    visualize_dag(per_rank_dag, output_path=f"out/rank{pp_rank}_dag")
+                except Exception as e:
+                    logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
+            print_dag_order(per_rank_dag, label=f"rank {pp_rank}", rank=pp_rank)
+
 
         # Send DAG to actors
         refs = [actors[pp_rank].load_dag.remote(per_rank_dag)
@@ -342,6 +392,7 @@ def piper(gm, example_inputs, **kwargs):
             "stages": all_stage_compiled,           # {stage_id: (modules_data, a2a_boundaries)}
             "stage_bucket_counts": stage_bucket_counts,
             "trainable_bucket_keys": trainable_bucket_keys,
+            "zero_bucket_keys": zero_bucket_keys,
             "per_rank_dags": per_rank_dags,
             "full_dag_no_overlap": piper_metadata.full_dag_no_overlap,
         }
@@ -395,14 +446,50 @@ def piper_exec_dag(loss_fn, profiling: bool = False, log_stats: bool = False) ->
     step_time = time.perf_counter() - t0
 
     if log_stats or piper_metadata.model_flops_per_token is not None:
-        _log_step_stats(step_time, log_stats, actors)
+        _log_step_stats(step_time, log_stats, actors, results)
 
-    return [item for sublist in results if sublist for item in sublist]
+    losses = []
+    for result in results:
+        if isinstance(result, dict):
+            losses.extend(result.get("losses", []))
+        elif result:
+            losses.extend(result)
+    return losses
 
 
-def _log_step_stats(step_time: float, log_memory: bool, actors: dict) -> None:
+def _log_step_stats(step_time: float, log_memory: bool, actors: dict, results: list | None = None) -> None:
     """Log throughput, MFU, and optionally per-rank peak GPU memory."""
     stats = [f"step_time={step_time:.3f}s"]
+
+    if results:
+        schedule_reduced_payload_bytes = 0
+        schedule_all_reduce_payload_bytes = 0
+        schedule_reduce_scatter_payload_bytes = 0
+        runtime_reduced_payload_bytes = 0
+        runtime_all_reduce_payload_bytes = 0
+        runtime_reduce_scatter_payload_bytes = 0
+        runtime_all_reduce_ops = 0
+        runtime_reduce_scatter_ops = 0
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            schedule_reduced_payload_bytes += int(result.get("schedule_reduced_payload_bytes", 0))
+            schedule_all_reduce_payload_bytes += int(result.get("schedule_all_reduce_payload_bytes", 0))
+            schedule_reduce_scatter_payload_bytes += int(result.get("schedule_reduce_scatter_payload_bytes", 0))
+            runtime_reduced_payload_bytes += int(result.get("runtime_reduced_payload_bytes", 0))
+            runtime_all_reduce_payload_bytes += int(result.get("runtime_all_reduce_payload_bytes", 0))
+            runtime_reduce_scatter_payload_bytes += int(result.get("runtime_reduce_scatter_payload_bytes", 0))
+            runtime_all_reduce_ops += int(result.get("runtime_all_reduce_ops", 0))
+            runtime_reduce_scatter_ops += int(result.get("runtime_reduce_scatter_ops", 0))
+        stats.append(f"schedule_reduced_payload_total_gb={schedule_reduced_payload_bytes / (1024 ** 3):.6f}")
+        stats.append(f"schedule_all_reduce_payload_gb={schedule_all_reduce_payload_bytes / (1024 ** 3):.6f}")
+        stats.append(f"schedule_reduce_scatter_payload_gb={schedule_reduce_scatter_payload_bytes / (1024 ** 3):.6f}")
+        stats.append(f"runtime_reduced_payload_total_gb={runtime_reduced_payload_bytes / (1024 ** 3):.6f}")
+        stats.append(f"runtime_all_reduce_payload_gb={runtime_all_reduce_payload_bytes / (1024 ** 3):.6f}")
+        stats.append(f"runtime_reduce_scatter_payload_gb={runtime_reduce_scatter_payload_bytes / (1024 ** 3):.6f}")
+        stats.append(f"runtime_all_reduce_ops={runtime_all_reduce_ops}")
+        stats.append(f"runtime_reduce_scatter_ops={runtime_reduce_scatter_ops}")
+        stats.append(f"runtime_payload_matches_schedule={runtime_reduced_payload_bytes == schedule_reduced_payload_bytes}")
 
     tokens = piper_metadata.tokens_per_step
     if tokens is not None:

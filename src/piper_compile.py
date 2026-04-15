@@ -51,6 +51,7 @@ class _CompiledDataStore:
             "stages": data["stages"],
             "stage_bucket_counts": data["stage_bucket_counts"],
             "trainable_bucket_keys": data["trainable_bucket_keys"],
+            "zero_bucket_keys": data.get("zero_bucket_keys", set()),
         }
         self._dag_data = {
             "per_rank_dags": data["per_rank_dags"],
@@ -117,6 +118,7 @@ def piper_setup(
     a2a_ar_no_overlap=False,
     pg=None,
     nsight=False,
+    temp_dir: str = None,
     model_flops_per_token: float = None,
     visualize_dag: bool = True,
     const_attrs: dict = None,
@@ -148,7 +150,6 @@ def piper_setup(
     piper_metadata.stage_to_device = stage_to_device
     piper_metadata.use_activation_checkpointing = activation_checkpointing
     piper_metadata.activation_num_checkpoints = max(1, int(num_checkpoints))
-    piper_metadata.bucketing = bucketing
     piper_metadata.bucket_size = bucket_size
     piper_metadata.zero_stage = int(zero_stage)
     piper_metadata.schedule_name = schedule_name
@@ -192,7 +193,7 @@ def piper_setup(
     _create_actors(
         num_devices, optim_fn, num_mbs, num_stages,
         naive_gradient_sync, profile=nsight, stage_to_device=stage_to_device,
-        zero_stage=zero_stage, no_nvtx=no_nvtx, pg=pg,
+        zero_stage=zero_stage, no_nvtx=no_nvtx, pg=pg, temp_dir=temp_dir,
     )
 
     if dp_rank == 0:
@@ -299,6 +300,7 @@ def piper_setup(
         # Restore stage metadata that the piper backend sets on dp_rank=0.
         piper_metadata.stage_bucket_counts = stage_data["stage_bucket_counts"]
         piper_metadata.trainable_bucket_keys = stage_data["trainable_bucket_keys"]
+        piper_metadata.zero_bucket_keys = stage_data.get("zero_bucket_keys", set())
 
         logger.debug(f"DP rank {dp_rank} waiting for dp_rank=0 DAG data...")
         dag_data = None

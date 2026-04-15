@@ -56,17 +56,17 @@ def create_logger(name: str, log_level: str):
             log_level = logging.ERROR
         case "VERBOSE":
             log_level = VERBOSE
-    
+
     logger = logging.getLogger(name)
     logger.setLevel(log_level)
-    
+
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
         fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
         handler.setFormatter(logging.Formatter(fmt))
         logger.addHandler(handler)
         logger.propagate = False
-    
+
     return logger
 
 
@@ -353,6 +353,7 @@ class PiperMetadata:
     visualize_dag_render: bool = True  # If False, save Graphviz source only
     stage_bucket_counts: dict = {}   # stage_id -> number of buckets (set by piper backend)
     trainable_bucket_keys: set = set()  # (stage_id, bucket_id) pairs with trainable params
+    zero_bucket_keys: set = set()  # (stage_id, bucket_id) pairs that should receive ZeRO transforms
     # Populated by the piper backend on dp_rank=0; broadcast to dp_rank>0 by piper_setup
     # so they can skip torch.compile entirely.  Contains serialized graph + param metadata
     # (no actual weight values) for all stages, plus the built per-rank TaskDAGs.

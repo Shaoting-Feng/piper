@@ -13,7 +13,7 @@ import time
 from torch.autograd import Function
 
 from .piper_utils import create_logger, LOG_LEVEL, VERBOSE, piper_metadata
-from .piper_exec import TaskType, PipelineSchedule, Chunk, Task, TaskDAG, logical_time
+from .piper_exec import TaskType, PipelineSchedule, Chunk, Task, TaskDAG, logical_time, runtime_sort_key
 
 logger = create_logger("piper_graph_transform", LOG_LEVEL)
 
@@ -1896,18 +1896,18 @@ def _zero_task(
 
 def _bucket_compute_tasks(
     rank_dag: TaskDAG,
-    trainable_bucket_keys: set | None = None,
+    bucket_filter_keys: set | None = None,
 ) -> dict[int, list[Task]]:
     compute_types = {TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W}
     by_ubid: dict[int, list[Task]] = defaultdict(list)
     for node in rank_dag.nodes:
         if node.chunk.type not in compute_types or node.unique_bucket_id is None:
             continue
-        if trainable_bucket_keys is not None:
+        if bucket_filter_keys is not None:
             if not node.chunk.batches:
                 continue
             stage_id = node.chunk.batches[0].stage_id
-            if (stage_id, node.bucket_id) not in trainable_bucket_keys:
+            if (stage_id, node.bucket_id) not in bucket_filter_keys:
                 continue
         by_ubid[node.unique_bucket_id].append(node)
     for nodes in by_ubid.values():
@@ -1927,7 +1927,7 @@ def _insert_zero_grad_ops(
     *,
     sync_type: TaskType,
     use_grad_lifetime: bool = False,
-    trainable_bucket_keys: set | None = None,
+    zero_bucket_keys: set | None = None,
 ) -> None:
     """Per-compute-node gradient sync.
 
@@ -1945,7 +1945,7 @@ def _insert_zero_grad_ops(
     grad_sync_types = {TaskType.BWD, TaskType.BWD_W}
     new_nodes: list[Task] = []
 
-    for ubid, bucket_nodes in _bucket_compute_tasks(rank_dag, trainable_bucket_keys).items():
+    for ubid, bucket_nodes in _bucket_compute_tasks(rank_dag, zero_bucket_keys).items():
         for compute_node in bucket_nodes:
             if compute_node.chunk.type not in grad_sync_types:
                 continue
@@ -1969,34 +1969,34 @@ def _insert_zero0_ops(rank_dag: TaskDAG) -> None:
 
 def _insert_zero1_ops(
     rank_dag: TaskDAG,
-    trainable_bucket_keys: set | None = None,
+    zero_bucket_keys: set | None = None,
 ) -> None:
     """ZeRO-1: per-compute-node all-reduce."""
     _insert_zero_grad_ops(
         rank_dag,
         sync_type=TaskType.ALL_REDUCE,
-        trainable_bucket_keys=trainable_bucket_keys,
+        zero_bucket_keys=zero_bucket_keys,
     )
 
 
 def _insert_zero2_ops(
     rank_dag: TaskDAG,
-    trainable_bucket_keys: set | None = None,
+    zero_bucket_keys: set | None = None,
 ) -> None:
     """ZeRO-2: per-compute-node reduce-scatter with full-gradient lifecycle."""
     _insert_zero_grad_ops(
         rank_dag,
         sync_type=TaskType.REDUCE_SCATTER,
         use_grad_lifetime=True,
-        trainable_bucket_keys=trainable_bucket_keys,
+        zero_bucket_keys=zero_bucket_keys,
     )
 
 
 def _insert_zero3_ops(
     rank_dag: TaskDAG,
-    trainable_bucket_keys: set | None = None,
+    zero_bucket_keys: set | None = None,
 ) -> None:
-    """ZeRO-3: per-compute-node param gather + per-grad-node reduce-scatter.
+    """ZeRO-3: param gather + per-grad-node reduce-scatter lifetimes.
 
     * F / B_I  →  P+ → AG → compute → P-
     * B / B_W  →  (G+ →) and (P+ → AG →) compute (→ RS → G-) and (→ P-)
@@ -2010,13 +2010,12 @@ def _insert_zero3_ops(
 
     new_nodes: list[Task] = []
 
-    for ubid, bucket_nodes in _bucket_compute_tasks(rank_dag, trainable_bucket_keys).items():
+    for ubid, bucket_nodes in _bucket_compute_tasks(rank_dag, zero_bucket_keys).items():
         for compute_node in bucket_nodes:
             t = compute_node.chunk.type
             bid = compute_node.bucket_id
 
             if t in param_only_types:
-                # P+ → AG → compute → P-
                 alloc_p = _zero_task(compute_node, bid, TaskType.ALLOC_FULL_PARAMS, ubid=ubid)
                 ag      = _zero_task(compute_node, bid, TaskType.ALL_GATHER,        ubid=ubid)
                 free_p  = _zero_task(compute_node, bid, TaskType.FREE_FULL_PARAMS,  ubid=ubid)
@@ -2026,23 +2025,227 @@ def _insert_zero3_ops(
                 new_nodes.extend([alloc_p, ag, free_p])
 
             elif t in grad_types:
-                # Pre-compute: both G+ and P+→AG feed into compute.
-                alloc_g = _zero_task(compute_node, bid, TaskType.ALLOC_FULL_GRADS,  ubid=ubid)
                 alloc_p = _zero_task(compute_node, bid, TaskType.ALLOC_FULL_PARAMS, ubid=ubid)
                 ag      = _zero_task(compute_node, bid, TaskType.ALL_GATHER,        ubid=ubid)
-                # Post-compute: RS→G- and P- both follow compute.
+                alloc_g = _zero_task(compute_node, bid, TaskType.ALLOC_FULL_GRADS,  ubid=ubid)
+                free_p  = _zero_task(compute_node, bid, TaskType.FREE_FULL_PARAMS,  ubid=ubid)
                 rs      = _zero_task(compute_node, bid, TaskType.REDUCE_SCATTER,    ubid=ubid)
                 free_g  = _zero_task(compute_node, bid, TaskType.FREE_FULL_GRADS,   ubid=ubid)
-                free_p  = _zero_task(compute_node, bid, TaskType.FREE_FULL_PARAMS,  ubid=ubid)
-                _add_data_edge(alloc_g, compute_node)
                 _add_data_edge(alloc_p, ag)
                 _add_data_edge(ag, compute_node)
+                _add_data_edge(alloc_g, compute_node)
+                _add_data_edge(compute_node, free_p)
                 _add_data_edge(compute_node, rs)
                 _add_data_edge(rs, free_g)
-                _add_data_edge(compute_node, free_p)
-                new_nodes.extend([alloc_g, alloc_p, ag, rs, free_g, free_p])
+                new_nodes.extend([alloc_p, ag, alloc_g, free_p, rs, free_g])
 
     rank_dag.nodes.extend(new_nodes)
+
+
+def _zero_sequence_compute_nodes(rank_dag: TaskDAG, zero_stage: int) -> list[Task]:
+    if zero_stage == 2:
+        compute_types = {TaskType.BWD, TaskType.BWD_W}
+    elif zero_stage == 3:
+        compute_types = {TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W}
+    else:
+        return []
+    return sorted(
+        [node for node in rank_dag.nodes if node.chunk.type in compute_types],
+        key=lambda node: (node.time_step, node.uid),
+    )
+
+
+def _find_zero_neighbor(node: Task, task_type: TaskType, *, preds: bool, ubid: int | None) -> Task | None:
+    neighbors = node.data_preds if preds else node.data_succs
+    for neighbor in neighbors:
+        if neighbor.chunk.type != task_type:
+            continue
+        if ubid is not None and neighbor.unique_bucket_id != ubid:
+            continue
+        return neighbor
+    return None
+
+
+def _collect_zero_sequence_nodes(compute_node: Task, zero_stage: int) -> dict[TaskType, Task]:
+    ubid = compute_node.unique_bucket_id
+    seq: dict[TaskType, Task] = {compute_node.chunk.type: compute_node}
+    if zero_stage == 2:
+        alloc_g = _find_zero_neighbor(compute_node, TaskType.ALLOC_FULL_GRADS, preds=True, ubid=ubid)
+        rs = _find_zero_neighbor(compute_node, TaskType.REDUCE_SCATTER, preds=False, ubid=ubid)
+        free_g = _find_zero_neighbor(rs, TaskType.FREE_FULL_GRADS, preds=False, ubid=ubid) if rs else None
+        if alloc_g is not None:
+            seq[TaskType.ALLOC_FULL_GRADS] = alloc_g
+        if rs is not None:
+            seq[TaskType.REDUCE_SCATTER] = rs
+        if free_g is not None:
+            seq[TaskType.FREE_FULL_GRADS] = free_g
+        return seq
+
+    alloc_p = _find_zero_neighbor(compute_node, TaskType.ALL_GATHER, preds=True, ubid=ubid)
+    if alloc_p is not None:
+        ag = alloc_p
+        alloc_p = _find_zero_neighbor(ag, TaskType.ALLOC_FULL_PARAMS, preds=True, ubid=ubid)
+        if alloc_p is not None:
+            seq[TaskType.ALLOC_FULL_PARAMS] = alloc_p
+        seq[TaskType.ALL_GATHER] = ag
+    free_p = _find_zero_neighbor(compute_node, TaskType.FREE_FULL_PARAMS, preds=False, ubid=ubid)
+    if free_p is not None:
+        seq[TaskType.FREE_FULL_PARAMS] = free_p
+    if compute_node.chunk.type in {TaskType.BWD, TaskType.BWD_W}:
+        alloc_g = _find_zero_neighbor(compute_node, TaskType.ALLOC_FULL_GRADS, preds=True, ubid=ubid)
+        rs = _find_zero_neighbor(compute_node, TaskType.REDUCE_SCATTER, preds=False, ubid=ubid)
+        free_g = _find_zero_neighbor(rs, TaskType.FREE_FULL_GRADS, preds=False, ubid=ubid) if rs else None
+        if alloc_g is not None:
+            seq[TaskType.ALLOC_FULL_GRADS] = alloc_g
+        if rs is not None:
+            seq[TaskType.REDUCE_SCATTER] = rs
+        if free_g is not None:
+            seq[TaskType.FREE_FULL_GRADS] = free_g
+    return seq
+
+
+def _reachable_downstream(node: Task) -> set[int]:
+    seen: set[int] = set()
+    stack = list(node.data_succs) + list(node.temporal_succs)
+    while stack:
+        cur = stack.pop()
+        cur_id = id(cur)
+        if cur_id in seen:
+            continue
+        seen.add(cur_id)
+        stack.extend(cur.data_succs)
+        stack.extend(cur.temporal_succs)
+    return seen
+
+
+def modify_zero_timesteps(rank_dag: TaskDAG, zero_stage: int) -> None:
+    if zero_stage in (0, 1):
+        return
+
+    for compute_node in _zero_sequence_compute_nodes(rank_dag, zero_stage):
+        base_time_step = compute_node.time_step
+        seq_nodes = _collect_zero_sequence_nodes(compute_node, zero_stage)
+        seq_node_ids = {id(node) for node in seq_nodes.values()}
+        downstream_ids = _reachable_downstream(compute_node)
+
+        for node in rank_dag.nodes:
+            if id(node) in downstream_ids and id(node) not in seq_node_ids:
+                node.time_step += 4
+
+        compute_node.time_step = base_time_step + 2
+        if zero_stage == 2:
+            alloc_g = seq_nodes.get(TaskType.ALLOC_FULL_GRADS)
+            rs = seq_nodes.get(TaskType.REDUCE_SCATTER)
+            free_g = seq_nodes.get(TaskType.FREE_FULL_GRADS)
+            if alloc_g is not None:
+                alloc_g.time_step = base_time_step + 1
+            if rs is not None:
+                rs.time_step = base_time_step + 3
+            if free_g is not None:
+                free_g.time_step = base_time_step + 4
+
+
+def overlap_zero_ops(rank_dag: TaskDAG) -> None:
+    compute_types = frozenset({TaskType.FWD, TaskType.BWD, TaskType.BWD_I, TaskType.BWD_W})
+    zero_chain_types = frozenset({
+        TaskType.ALL_GATHER,
+        TaskType.REDUCE_SCATTER,
+        TaskType.ALL_REDUCE,
+        TaskType.ALLOC_FULL_GRADS,
+        TaskType.FREE_FULL_GRADS,
+        TaskType.ALLOC_FULL_PARAMS,
+        TaskType.FREE_FULL_PARAMS,
+    })
+
+    def _nodes_at_time_step(time_step: int) -> list[Task]:
+        return [node for node in rank_dag.nodes if node.time_step == time_step]
+
+    def _has_overlap_with_types(node: Task, types: frozenset[TaskType]) -> bool:
+        return any(
+            other is not node and other.chunk.type in types and other.time_step == node.time_step
+            for other in rank_dag.nodes
+        )
+
+    def _nearest_compute_before(time_step: int) -> Task | None:
+        candidates = [
+            node for node in rank_dag.nodes
+            if node.chunk.type in compute_types and node.time_step < time_step
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda node: (node.time_step, -node.uid))
+
+    def _nearest_compute_after(time_step: int) -> Task | None:
+        candidates = [
+            node for node in rank_dag.nodes
+            if node.chunk.type in compute_types and node.time_step > time_step
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda node: (node.time_step, node.uid))
+
+    def _collect_zero_preds(node: Task) -> list[Task]:
+        result: list[Task] = []
+        seen: set[int] = set()
+        stack = list(node.data_preds)
+        while stack:
+            cur = stack.pop()
+            cur_id = id(cur)
+            if cur_id in seen or cur.chunk.type not in zero_chain_types:
+                continue
+            seen.add(cur_id)
+            result.append(cur)
+            stack.extend(cur.data_preds)
+        return result
+
+    def _collect_zero_succs(node: Task) -> list[Task]:
+        result: list[Task] = []
+        seen: set[int] = set()
+        stack = list(node.data_succs)
+        while stack:
+            cur = stack.pop()
+            cur_id = id(cur)
+            if cur_id in seen or cur.chunk.type not in zero_chain_types:
+                continue
+            seen.add(cur_id)
+            result.append(cur)
+            stack.extend(cur.data_succs)
+        return result
+
+    def _shift_nodes(nodes: list[Task], delta: int) -> None:
+        if delta == 0:
+            return
+        for node in nodes:
+            node.time_step += delta
+
+    ag_nodes = sorted(
+        [node for node in rank_dag.nodes if node.chunk.type == TaskType.ALL_GATHER],
+        key=lambda node: (node.time_step, node.uid),
+    )
+    for ag in ag_nodes:
+        if _has_overlap_with_types(ag, compute_types):
+            continue
+        target = _nearest_compute_before(ag.time_step)
+        if target is None:
+            continue
+        delta = target.time_step - ag.time_step
+        _shift_nodes([ag] + _collect_zero_preds(ag), delta)
+
+    reduce_nodes = sorted(
+        [
+            node for node in rank_dag.nodes
+            if node.chunk.type in (TaskType.REDUCE_SCATTER, TaskType.ALL_REDUCE)
+        ],
+        key=lambda node: (node.time_step, node.uid),
+    )
+    for red in reduce_nodes:
+        if _has_overlap_with_types(red, compute_types):
+            continue
+        target = _nearest_compute_after(red.time_step)
+        if target is None:
+            continue
+        delta = target.time_step - red.time_step
+        _shift_nodes([red] + _collect_zero_succs(red), delta)
 
 
 def _wire_sync_to_upd(rank_dag: TaskDAG) -> None:
@@ -2067,17 +2270,17 @@ def _wire_sync_to_upd(rank_dag: TaskDAG) -> None:
 def insert_zero_ops(
     per_rank_dags: list,
     zero_stage: int,
-    trainable_bucket_keys: set | None = None,
+    zero_bucket_keys: set | None = None,
 ) -> list:
     for rank_dag in per_rank_dags:
         if zero_stage == 0:
             _insert_zero0_ops(rank_dag)
         elif zero_stage == 1:
-            _insert_zero1_ops(rank_dag)
+            _insert_zero1_ops(rank_dag, zero_bucket_keys=zero_bucket_keys)
         elif zero_stage == 2:
-            _insert_zero2_ops(rank_dag, trainable_bucket_keys=trainable_bucket_keys)
+            _insert_zero2_ops(rank_dag, zero_bucket_keys=zero_bucket_keys)
         elif zero_stage == 3:
-            _insert_zero3_ops(rank_dag, trainable_bucket_keys=trainable_bucket_keys)
+            _insert_zero3_ops(rank_dag, zero_bucket_keys=zero_bucket_keys)
         else:
             raise ValueError(f"Unsupported ZeRO stage: {zero_stage}")
         _wire_sync_to_upd(rank_dag)
@@ -2346,40 +2549,35 @@ def visualize_dag(
 
 
 def print_dag_order(dag: TaskDAG, label: str = "", rank: int = 0) -> None:
-    """Write the topological execution order of nodes in a :class:`TaskDAG` to a file.
+    """Write the execution order of nodes in a :class:`TaskDAG` to a file.
 
-    Uses Kahn's algorithm (same order as ``run_dag``) so the output reflects
-    exactly what the actor will execute.  Useful for debugging schedule issues.
+    Nodes are sorted by :func:`runtime_sort_key`, exactly as in ``run_dag``,
+    so the output reflects exactly what the actor will execute.
+    Useful for debugging schedule issues.
 
     Output is written to ``out/dag_order_rank{rank}``.
     """
     import os
-    from collections import deque as _deque
 
-    in_degree = {
-        id(n): len(n.data_preds) + len(n.temporal_preds)
-        for n in dag.nodes
-    }
-    queue: _deque = _deque(n for n in dag.nodes if in_degree[id(n)] == 0)
+    sorted_nodes = sorted(dag.nodes, key=runtime_sort_key)
 
     header = f"--- DAG execution order{': ' + label if label else ''} ---"
     lines = [header]
-    step = 0
-    while queue:
-        node = queue.popleft()
+    for step, node in enumerate(sorted_nodes):
         chunk = node.chunk
         ttype = chunk.type.value if chunk.type is not None else "?"
         batches_str = ", ".join(
             f"s{b.stage_id} mb{b.mb_idx}" for b in chunk.batches
         ) if chunk.batches else ""
         bkt = f" bkt={node.bucket_id}" if node.bucket_id else ""
-        lines.append(f"  {step:3d}  rank={node.pp_rank}  {ttype:<14s}  {batches_str}{bkt}")
-        step += 1
-        for succ in list(node.data_succs) + list(node.temporal_succs):
-            in_degree[id(succ)] -= 1
-            if in_degree[id(succ)] == 0:
-                queue.append(succ)
+        ubid = f" ubid={node.unique_bucket_id}" if node.unique_bucket_id is not None else ""
+        lines.append(
+            f"  {step:3d}  ts={node.time_step:3d}  rank={node.pp_rank}  {ttype:<14s}  {batches_str}{bkt}{ubid}"
+        )
     lines.append("-" * len(header))
+
+    for line in lines:
+        logger.debug(line)
 
     os.makedirs("out", exist_ok=True)
     out_path = f"out/dag_order_rank{rank}"
@@ -2790,54 +2988,82 @@ def bucket_stage(
         else:
             merged.append((f, l, ms))
 
+    def _compute_seg_metadata(
+        seg_ranges: list[tuple[int, int, list[fx.Node]]]
+    ) -> tuple[dict[fx.Node, int], list[list[fx.Node]]]:
+        """Return (node_seg, seg_cross_in) for the given segment ranges."""
+        cut_after = [seg_ranges[i][1] for i in range(len(seg_ranges) - 1)]
+
+        def _seg_of(idx: int) -> int:
+            return sum(1 for c in cut_after if c < idx)
+
+        node_seg: dict[fx.Node, int] = {}
+        for nd in nodes:
+            if nd.op == "output":
+                node_seg[nd] = len(seg_ranges) - 1
+            elif nd.op == "placeholder":
+                if nd in param_ph_set:
+                    user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+                    node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
+                else:
+                    node_seg[nd] = 0
+            elif nd.op == "get_attr":
+                user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
+                node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
+            else:
+                node_seg[nd] = _seg_of(node_idx[nd])
+
+        node_max_user_seg: dict[fx.Node, int] = {}
+        for nd in nodes:
+            if nd.op == "output":
+                continue
+            node_max_user_seg[nd] = (
+                max(node_seg[u] for u in nd.users) if nd.users else node_seg[nd]
+            )
+
+        seg_cross_in: list[list[fx.Node]] = [[] for _ in range(len(seg_ranges))]
+        for nd in nodes:
+            if nd.op in ("get_attr", "output"):
+                continue
+            if nd.op == "placeholder" and nd in param_ph_set:
+                continue
+            s = node_seg[nd]
+            mu = node_max_user_seg[nd]
+            for seg in range(s + 1, mu + 1):
+                seg_cross_in[seg].append(nd)
+
+        return node_seg, seg_cross_in
+
+    # Enforce a single activation-tensor dependency between adjacent buckets.
+    # If a boundary carries multiple values or only stage-input placeholders,
+    # merge the adjacent buckets until each remaining boundary is a single
+    # non-placeholder tensor produced by the previous bucket.
+    while len(merged) > 1:
+        _node_seg_tmp, seg_cross_in_tmp = _compute_seg_metadata(merged)
+        invalid_boundary = None
+        for seg in range(1, len(merged)):
+            cross_inputs = seg_cross_in_tmp[seg]
+            if len(cross_inputs) != 1 or cross_inputs[0].op == "placeholder":
+                invalid_boundary = seg - 1
+                logger.debug(
+                    "bucket_stage: merging adjacent buckets due to invalid boundary "
+                    f"between segments {seg - 1} and {seg}: "
+                    f"cross_inputs={[n.name for n in cross_inputs]}"
+                )
+                break
+        if invalid_boundary is None:
+            break
+        f0, _l0, ms0 = merged[invalid_boundary]
+        _f1, l1, ms1 = merged[invalid_boundary + 1]
+        merged[invalid_boundary:invalid_boundary + 2] = [
+            (f0, l1, ms0 + ms1)
+        ]
+
     n_segs = len(merged)
     if n_segs == 1:
         return [(stage_gm, list(input_idxs), list(param_idxs), list(graphargs))]
 
-    cut_after = [merged[i][1] for i in range(n_segs - 1)]
-
-    def _seg_of(idx: int) -> int:
-        return sum(1 for c in cut_after if c < idx)
-
-    # Assign nodes to segments
-    node_seg: dict[fx.Node, int] = {}
-    for nd in nodes:
-        if nd.op == "output":
-            node_seg[nd] = n_segs - 1
-        elif nd.op == "placeholder":
-            if nd in param_ph_set:
-                user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
-                node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
-            else:
-                node_seg[nd] = 0
-        elif nd.op == "get_attr":
-            user_idxs = [node_idx[u] for u in nd.users if node_idx[u] in compute_set]
-            node_seg[nd] = _seg_of(min(user_idxs)) if user_idxs else 0
-        else:
-            node_seg[nd] = _seg_of(node_idx[nd])
-
-    # Cross-segment inputs: compute outputs needed in later segments, plus
-    # non-param placeholders (e.g. freqs_cis, attention_mask) that live in
-    # segment 0 but are consumed by compute nodes in later segments.
-    node_max_user_seg: dict[fx.Node, int] = {}
-    for nd in nodes:
-        if nd.op == "output":
-            continue
-        node_max_user_seg[nd] = (
-            max(node_seg[u] for u in nd.users) if nd.users else node_seg[nd]
-        )
-
-    seg_cross_in: list[list[fx.Node]] = [[] for _ in range(n_segs)]
-    for nd in nodes:
-        if nd.op in ("get_attr", "output"):
-            continue
-        # Param placeholders are assigned to exactly one segment — not cross-segment.
-        if nd.op == "placeholder" and nd in param_ph_set:
-            continue
-        s = node_seg[nd]
-        mu = node_max_user_seg[nd]
-        for seg in range(s + 1, mu + 1):
-            seg_cross_in[seg].append(nd)
+    node_seg, seg_cross_in = _compute_seg_metadata(merged)
 
     # Build sub-graphs
     results: list[tuple[fx.GraphModule, list[int], list[int], list]] = []

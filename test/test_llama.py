@@ -167,11 +167,11 @@ def main(args, pg):
         naive_gradient_sync=args.naive_grad_sync,
         activation_checkpointing=args.activation_checkpointing,
         num_checkpoints=args.num_checkpoints,
-        bucketing=args.bucketing,
         bucket_size=int(args.bucket_size * 1024 * 1024),
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
+        temp_dir=args.temp_dir,
         model_flops_per_token=flops_per_token,
         visualize_dag=args.save_viz,
         const_attrs={"freqs_cis": freqs_cis, "mask": mask},
@@ -264,8 +264,6 @@ def parse_args():
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
     parser.add_argument('--num-checkpoints', type=int, default=1,
                         help='Number of sequential activation-checkpoint regions per Piper bucket')
-    parser.add_argument('--bucketing', action='store_true', default=False,
-                        help='Split stages into per-param-bucket sub-modules for overlapped all-reduce')
     parser.add_argument('--bucket-size', type=float, default=25,
                         help='Bucket size in MB (default: 25)')
     parser.add_argument('--nsight', action='store_true', default=False,
