@@ -1928,17 +1928,13 @@ def _insert_zero_grad_ops(
     sync_type: TaskType,
     use_grad_lifetime: bool = False,
     zero_bucket_keys: set | None = None,
+    gradient_accumulation: bool = True,
 ) -> None:
-    """Per-compute-node gradient sync.
+    """Insert gradient-sync nodes for ZeRO-0/1/2.
 
-    Every BWD / BWD_W node gets its own sync immediately after it finishes.
-    There is no gradient accumulation.
-
-    When ``use_grad_lifetime=True`` (ZeRO-2/3 where gradients are sharded),
-    a G+ → compute → sync → G- lifecycle is inserted so that the full
-    gradient buffer is explicitly allocated and freed around each sync.
-    When ``use_grad_lifetime=False`` (ZeRO-0/1 where each rank keeps a full
-    copy of gradients), only compute → sync is wired.
+    With ``gradient_accumulation=True``, a bucket's sync is attached only to the
+    last BWD/BWD_W occurrence of that bucket. For ZeRO-2, the full-grad
+    lifetime widens to first occurrence → last occurrence.
     """
     _remove_ar_nodes(rank_dag)
 
@@ -1946,55 +1942,77 @@ def _insert_zero_grad_ops(
     new_nodes: list[Task] = []
 
     for ubid, bucket_nodes in _bucket_compute_tasks(rank_dag, zero_bucket_keys).items():
-        for compute_node in bucket_nodes:
-            if compute_node.chunk.type not in grad_sync_types:
-                continue
+        grad_nodes = [node for node in bucket_nodes if node.chunk.type in grad_sync_types]
+        if not grad_nodes:
+            continue
+        first_compute = min(grad_nodes, key=lambda node: (node.time_step, node.uid))
+        last_compute = max(grad_nodes, key=lambda node: (node.time_step, node.uid))
+
+        if gradient_accumulation:
+            sync_sources = [last_compute]
+        else:
+            sync_sources = grad_nodes
+
+        for compute_node in sync_sources:
             sync = _zero_task(compute_node, compute_node.bucket_id, sync_type, ubid=ubid)
             _add_data_edge(compute_node, sync)
             new_nodes.append(sync)
-            if use_grad_lifetime:
-                alloc = _zero_task(compute_node, compute_node.bucket_id, TaskType.ALLOC_FULL_GRADS, ubid=ubid)
-                free = _zero_task(compute_node, compute_node.bucket_id, TaskType.FREE_FULL_GRADS, ubid=ubid)
-                _add_data_edge(alloc, compute_node)
-                _add_data_edge(sync, free)
+
+        if use_grad_lifetime:
+            if gradient_accumulation:
+                alloc = _zero_task(first_compute, first_compute.bucket_id, TaskType.ALLOC_FULL_GRADS, ubid=ubid)
+                free = _zero_task(last_compute, last_compute.bucket_id, TaskType.FREE_FULL_GRADS, ubid=ubid)
+                _add_data_edge(alloc, first_compute)
+                _add_data_edge(new_nodes[-1], free)
                 new_nodes.extend([alloc, free])
+            else:
+                for compute_node in grad_nodes:
+                    sync = next(
+                        node for node in new_nodes
+                        if node.chunk.type == sync_type and node.unique_bucket_id == ubid and compute_node in node.data_preds
+                    )
+                    alloc = _zero_task(compute_node, compute_node.bucket_id, TaskType.ALLOC_FULL_GRADS, ubid=ubid)
+                    free = _zero_task(compute_node, compute_node.bucket_id, TaskType.FREE_FULL_GRADS, ubid=ubid)
+                    _add_data_edge(alloc, compute_node)
+                    _add_data_edge(sync, free)
+                    new_nodes.extend([alloc, free])
 
     rank_dag.nodes.extend(new_nodes)
-
-
-def _insert_zero0_ops(rank_dag: TaskDAG) -> None:
-    """ZeRO-0 (plain DP): per-compute-node all-reduce, same policy as ZeRO-1."""
-    _insert_zero_grad_ops(rank_dag, sync_type=TaskType.ALL_REDUCE)
 
 
 def _insert_zero1_ops(
     rank_dag: TaskDAG,
     zero_bucket_keys: set | None = None,
+    gradient_accumulation: bool = True,
 ) -> None:
-    """ZeRO-1: per-compute-node all-reduce."""
+    """ZeRO-1: all-reduce after each bucket or after its last occurrence."""
     _insert_zero_grad_ops(
         rank_dag,
         sync_type=TaskType.ALL_REDUCE,
         zero_bucket_keys=zero_bucket_keys,
+        gradient_accumulation=gradient_accumulation,
     )
 
 
 def _insert_zero2_ops(
     rank_dag: TaskDAG,
     zero_bucket_keys: set | None = None,
+    gradient_accumulation: bool = True,
 ) -> None:
-    """ZeRO-2: per-compute-node reduce-scatter with full-gradient lifecycle."""
+    """ZeRO-2: reduce-scatter with widened grad lifetime under accumulation."""
     _insert_zero_grad_ops(
         rank_dag,
         sync_type=TaskType.REDUCE_SCATTER,
         use_grad_lifetime=True,
         zero_bucket_keys=zero_bucket_keys,
+        gradient_accumulation=gradient_accumulation,
     )
 
 
 def _insert_zero3_ops(
     rank_dag: TaskDAG,
     zero_bucket_keys: set | None = None,
+    gradient_accumulation: bool = True,
 ) -> None:
     """ZeRO-3: param gather + per-grad-node reduce-scatter lifetimes.
 
@@ -2027,17 +2045,37 @@ def _insert_zero3_ops(
             elif t in grad_types:
                 alloc_p = _zero_task(compute_node, bid, TaskType.ALLOC_FULL_PARAMS, ubid=ubid)
                 ag      = _zero_task(compute_node, bid, TaskType.ALL_GATHER,        ubid=ubid)
-                alloc_g = _zero_task(compute_node, bid, TaskType.ALLOC_FULL_GRADS,  ubid=ubid)
                 free_p  = _zero_task(compute_node, bid, TaskType.FREE_FULL_PARAMS,  ubid=ubid)
-                rs      = _zero_task(compute_node, bid, TaskType.REDUCE_SCATTER,    ubid=ubid)
-                free_g  = _zero_task(compute_node, bid, TaskType.FREE_FULL_GRADS,   ubid=ubid)
                 _add_data_edge(alloc_p, ag)
                 _add_data_edge(ag, compute_node)
-                _add_data_edge(alloc_g, compute_node)
                 _add_data_edge(compute_node, free_p)
+                new_nodes.extend([alloc_p, ag, free_p])
+
+    # Insert grad alloc/reduce/free for grad-producing ZeRO-3 nodes.
+    for ubid, bucket_nodes in _bucket_compute_tasks(rank_dag, zero_bucket_keys).items():
+        grad_nodes = [node for node in bucket_nodes if node.chunk.type in grad_types]
+        if not grad_nodes:
+            continue
+        first_compute = min(grad_nodes, key=lambda node: (node.time_step, node.uid))
+        last_compute = max(grad_nodes, key=lambda node: (node.time_step, node.uid))
+
+        if gradient_accumulation:
+            alloc_g = _zero_task(first_compute, first_compute.bucket_id, TaskType.ALLOC_FULL_GRADS, ubid=ubid)
+            rs = _zero_task(last_compute, last_compute.bucket_id, TaskType.REDUCE_SCATTER, ubid=ubid)
+            free_g = _zero_task(last_compute, last_compute.bucket_id, TaskType.FREE_FULL_GRADS, ubid=ubid)
+            _add_data_edge(alloc_g, first_compute)
+            _add_data_edge(last_compute, rs)
+            _add_data_edge(rs, free_g)
+            new_nodes.extend([alloc_g, rs, free_g])
+        else:
+            for compute_node in grad_nodes:
+                alloc_g = _zero_task(compute_node, compute_node.bucket_id, TaskType.ALLOC_FULL_GRADS, ubid=ubid)
+                rs = _zero_task(compute_node, compute_node.bucket_id, TaskType.REDUCE_SCATTER, ubid=ubid)
+                free_g = _zero_task(compute_node, compute_node.bucket_id, TaskType.FREE_FULL_GRADS, ubid=ubid)
+                _add_data_edge(alloc_g, compute_node)
                 _add_data_edge(compute_node, rs)
                 _add_data_edge(rs, free_g)
-                new_nodes.extend([alloc_p, ag, alloc_g, free_p, rs, free_g])
+                new_nodes.extend([alloc_g, rs, free_g])
 
     rank_dag.nodes.extend(new_nodes)
 
@@ -2271,16 +2309,33 @@ def insert_zero_ops(
     per_rank_dags: list,
     zero_stage: int,
     zero_bucket_keys: set | None = None,
+    gradient_accumulation: bool = True,
 ) -> list:
     for rank_dag in per_rank_dags:
         if zero_stage == 0:
-            _insert_zero0_ops(rank_dag)
+            _insert_zero1_ops(
+                rank_dag,
+                zero_bucket_keys=zero_bucket_keys,
+                gradient_accumulation=gradient_accumulation,
+            )
         elif zero_stage == 1:
-            _insert_zero1_ops(rank_dag, zero_bucket_keys=zero_bucket_keys)
+            _insert_zero1_ops(
+                rank_dag,
+                zero_bucket_keys=zero_bucket_keys,
+                gradient_accumulation=gradient_accumulation,
+            )
         elif zero_stage == 2:
-            _insert_zero2_ops(rank_dag, zero_bucket_keys=zero_bucket_keys)
+            _insert_zero2_ops(
+                rank_dag,
+                zero_bucket_keys=zero_bucket_keys,
+                gradient_accumulation=gradient_accumulation,
+            )
         elif zero_stage == 3:
-            _insert_zero3_ops(rank_dag, zero_bucket_keys=zero_bucket_keys)
+            _insert_zero3_ops(
+                rank_dag,
+                zero_bucket_keys=zero_bucket_keys,
+                gradient_accumulation=gradient_accumulation,
+            )
         else:
             raise ValueError(f"Unsupported ZeRO stage: {zero_stage}")
         _wire_sync_to_upd(rank_dag)

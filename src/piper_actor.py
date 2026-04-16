@@ -52,6 +52,8 @@ def _create_actors(
     no_nvtx: bool = False,
     pg=None,
     temp_dir: str = None,
+    use_inductor: bool = False,
+    ar_a2a_same_stream: bool = False,
 ):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     world_size = int(os.environ["PIPER_WORLD_SIZE"])
@@ -96,6 +98,8 @@ def _create_actors(
             stage_to_device=stage_to_device,
             zero_stage=zero_stage,
             no_nvtx=no_nvtx,
+            use_inductor=use_inductor,
+            ar_a2a_same_stream=ar_a2a_same_stream,
         )
         piper_metadata.actors[pp_rank] = actor
 
@@ -121,6 +125,8 @@ class PiperActor:
         stage_to_device=None,
         zero_stage: int = 0,
         no_nvtx: bool = False,
+        use_inductor: bool = False,
+        ar_a2a_same_stream: bool = False,
     ):
         self.logger = create_logger("piper_actor", LOG_LEVEL)
 
@@ -134,6 +140,8 @@ class PiperActor:
         self.naive_gradient_sync = naive_gradient_sync
         self.zero_stage = int(zero_stage)
         self.no_nvtx = no_nvtx
+        self.use_inductor = bool(use_inductor)
+        self.ar_a2a_same_stream = bool(ar_a2a_same_stream)
 
         self.dp_rank = dp_rank
         self.dp_degree = dp_degree
@@ -162,7 +170,10 @@ class PiperActor:
 
         self.comp_stream = torch.cuda.Stream()
         self.ar_stream = torch.cuda.Stream()
-        self.a2a_stream = self.ar_stream
+        if self.ar_a2a_same_stream:
+            self.a2a_stream = self.ar_stream
+        else:
+            self.a2a_stream = torch.cuda.Stream()
         self.p2p_send_stream = torch.cuda.Stream()
         self.p2p_recv_stream = torch.cuda.Stream()
 
@@ -179,15 +190,6 @@ class PiperActor:
         self._pending_timing_events: list = []  # (label, start_event, stop_event)
         self.trace_data = defaultdict(list)
         self.memory_tracing_enabled = False
-        self._schedule_reduced_payload_bytes = 0
-        self._schedule_all_reduce_payload_bytes = 0
-        self._schedule_reduce_scatter_payload_bytes = 0
-        self._runtime_reduced_payload_bytes = 0
-        self._runtime_all_reduce_payload_bytes = 0
-        self._runtime_reduce_scatter_payload_bytes = 0
-        self._runtime_all_reduce_ops = 0
-        self._runtime_reduce_scatter_ops = 0
-
         # DAG execution state
         self.dag = None
 
@@ -675,13 +677,33 @@ class PiperActor:
             ubid: int = bd["unique_bucket_id"]
             ac_num_subgraphs = int(bd.get("ac_num_subgraphs", 1))
             ac_requested_subgraphs = int(bd.get("ac_requested_subgraphs", ac_num_subgraphs))
-            if "gm_data_list" in bd:
-                gms = [
-                    self._replace_meta_constants(_deserialize_graphmodule(gm_data), self.device)
-                    for gm_data in bd["gm_data_list"]
-                ]
-            else:
-                gms = [self._replace_meta_constants(_deserialize_graphmodule(bd["gm_data"]), self.device)]
+            gms = [_deserialize_graphmodule(gm_data) for gm_data in bd["gm_data_list"]] if "gm_data_list" in bd else [_deserialize_graphmodule(bd["gm_data"])]
+            gms = [self._replace_meta_constants(gm, self.device) for gm in gms]
+            if self.use_inductor:
+                compiled_gms = []
+                for subgraph_idx, gm in enumerate(gms):
+                    try:
+                        compiled_gm = torch.compile(gm)
+                        compiled_gms.append(compiled_gm)
+                        self.logger.debug(
+                            f"[load_stage_compile] rank={self.global_rank} stage={stage_id} "
+                            f"ubid={ubid} subgraph={subgraph_idx} compiled=True"
+                        )
+                    except Exception as exc:
+                        self.logger.warning(
+                            f"[load_stage_compile] rank={self.global_rank} stage={stage_id} "
+                            f"ubid={ubid} subgraph={subgraph_idx} compiled=False error={exc}"
+                        )
+                        compiled_gms.append(gm)
+                gms = compiled_gms
+            # if "gm_data_list" in bd:
+            #     gms = [
+            #         self._replace_meta_constants(_deserialize_graphmodule(gm_data), self.device)
+            #         for gm_data in bd["gm_data_list"]
+            #     ]
+            # else:
+            #     gms = [self._replace_meta_constants(_deserialize_graphmodule(bd["gm_data"]), self.device)]
+            
             if b_idx == 0:
                 first_gm = gms[0]
 
@@ -1042,48 +1064,19 @@ class PiperActor:
         """Return True when a param carries a materialized gradient."""
         return param is not None and param.grad is not None
 
-    def _record_runtime_reduced_payload(self, op_name: str, num_bytes: int) -> None:
-        if num_bytes <= 0:
-            return
-        self._runtime_reduced_payload_bytes += num_bytes
-        if op_name == "all_reduce":
-            self._runtime_all_reduce_payload_bytes += num_bytes
-            self._runtime_all_reduce_ops += 1
-        elif op_name == "reduce_scatter":
-            self._runtime_reduce_scatter_payload_bytes += num_bytes
-            self._runtime_reduce_scatter_ops += 1
-
-    def _bucket_payload_bytes(self, ubid: int | None, op_name: str) -> int:
-        if ubid is None:
-            return 0
-
-        flat_grads = self.bucket_flat_grads.get(ubid)
-        if flat_grads is not None:
-            return flat_grads.numel() * flat_grads.element_size()
-
-        if op_name == "reduce_scatter":
-            shard_param = self.bucket_shard_params.get(ubid)
-            if shard_param is not None:
-                return shard_param.numel() * shard_param.element_size() * self.dp_degree
-
-        specs = self.bucket_param_view_specs.get(ubid, [])
-        if specs:
-            return sum(param.numel() * param.element_size() for param, *_ in specs)
-
-        args = self.bucket_fwd_args.get(ubid, [])
-        trainable_idxs = self.bucket_trainable_param_idxs.get(ubid, [])
-        return sum(
-            args[idx].numel() * args[idx].element_size()
-            for idx in trainable_idxs
-            if idx < len(args) and args[idx] is not None
-        )
-
     def _sync_payload_ubid(self, node: Task) -> int | None:
         if node.unique_bucket_id is not None:
             return node.unique_bucket_id
         if node.data_preds:
             return node.data_preds[0].unique_bucket_id
         return None
+
+    def _sync_payload_ubids(self, node: Task) -> list[int]:
+        sync_ubids = node.custom_metadata.get("sync_ubids")
+        if sync_ubids:
+            return list(sync_ubids)
+        ubid = self._sync_payload_ubid(node)
+        return [ubid] if ubid is not None else []
 
     def _collect_saved_tensors(
         self,
@@ -1316,15 +1309,6 @@ class PiperActor:
             self.ag_events = {}
         self.bwd_events = {}
         self._clear_param_grads()
-        self._schedule_reduced_payload_bytes = 0
-        self._schedule_all_reduce_payload_bytes = 0
-        self._schedule_reduce_scatter_payload_bytes = 0
-        self._runtime_reduced_payload_bytes = 0
-        self._runtime_all_reduce_payload_bytes = 0
-        self._runtime_reduce_scatter_payload_bytes = 0
-        self._runtime_all_reduce_ops = 0
-        self._runtime_reduce_scatter_ops = 0
-
         if self.zero_stage >= 2:
             with torch.cuda.stream(self.comp_stream):
                 for buf in self.bucket_rs_grads.values():
@@ -1338,19 +1322,6 @@ class PiperActor:
         self._prof_records: list = []
 
         sorted_nodes = sorted(dag.nodes, key=runtime_sort_key)
-        self._schedule_all_reduce_payload_bytes = sum(
-            self._bucket_payload_bytes(self._sync_payload_ubid(node), "all_reduce")
-            for node in sorted_nodes
-            if node.chunk.type == TaskType.ALL_REDUCE
-        )
-        self._schedule_reduce_scatter_payload_bytes = sum(
-            self._bucket_payload_bytes(self._sync_payload_ubid(node), "reduce_scatter")
-            for node in sorted_nodes
-            if node.chunk.type == TaskType.REDUCE_SCATTER
-        )
-        self._schedule_reduced_payload_bytes = (
-            self._schedule_all_reduce_payload_bytes + self._schedule_reduce_scatter_payload_bytes
-        )
         self._init_task_buffer_refcounts(dag)
         ts_to_comp_event: dict[int, torch.cuda.Event] = {}
 
@@ -1475,42 +1446,31 @@ class PiperActor:
 
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
-                    ar_ubid = bwd_node.unique_bucket_id
-                    scheduled_bytes = self._bucket_payload_bytes(ar_ubid, "all_reduce")
-                    self._nvtx_push(f"all_reduce_ubid{bwd_node.unique_bucket_id}")
+                    ar_ubids = self._sync_payload_ubids(node)
+                    ar_ubid = ar_ubids[0] if ar_ubids else bwd_node.unique_bucket_id
+                    self._nvtx_push(f"all_reduce_ubid{ar_ubid}")
                     self.ar_stream.wait_event(comp_events[bwd_node.uid])
                     self._start_timing(self.ar_stream, "all_reduce")
-                    runtime_bytes = self._exec_all_reduce_grads(ar_ubid)
+                    runtime_bytes = sum(self._exec_all_reduce_grads(ubid) for ubid in ar_ubids)
                     self._stop_timing(self.ar_stream, "all_reduce")
                     if runtime_bytes > 0:
                         ar_evt = torch.cuda.Event()
                         ar_evt.record(self.ar_stream)
                         self.ar_events[node.uid] = ar_evt
-                    elif scheduled_bytes > 0:
-                        self.logger.warning(
-                            f"[all_reduce_runtime_miss] rank={self.global_rank} "
-                            f"ubid={ar_ubid} scheduled_bytes={scheduled_bytes}"
-                        )
                     self._nvtx_pop()
                     self._release_task_buffer_uid(bwd_node.uid)
 
                 case TaskType.REDUCE_SCATTER:
                     bwd_node = node.data_preds[0]
                     rs_ubid = node.unique_bucket_id if node.unique_bucket_id is not None else bwd_node.unique_bucket_id
-                    scheduled_bytes = self._bucket_payload_bytes(rs_ubid, "reduce_scatter")
                     self._nvtx_push(f"reduce_scatter_ubid{rs_ubid}")
                     self.ar_stream.wait_event(comp_events[bwd_node.uid])
                     self._start_timing(self.ar_stream, "reduce_scatter")
-                    runtime_bytes = self._exec_reduce_scatter(rs_ubid)
+                    self._exec_reduce_scatter(rs_ubid)
                     self._stop_timing(self.ar_stream, "reduce_scatter")
                     rs_evt = torch.cuda.Event()
                     rs_evt.record(self.ar_stream)
                     self.rs_events[node.uid] = rs_evt
-                    if runtime_bytes <= 0 and scheduled_bytes > 0:
-                        self.logger.warning(
-                            f"[reduce_scatter_runtime_miss] rank={self.global_rank} "
-                            f"ubid={rs_ubid} scheduled_bytes={scheduled_bytes}"
-                        )
                     self._nvtx_pop()
                     self._release_task_buffer_uid(bwd_node.uid)
 
@@ -1793,7 +1753,7 @@ class PiperActor:
                     }
                     pg_summary = self._summarize_param_groups(param_groups)
                     outstanding = self._summarize_outstanding_bwdi()
-                    self.logger.info(
+                    self.logger.log(VERBOSE,
                         f"[bwd_i_retain] rank={self.global_rank} ubid={ubid} mb={mb_idx}: "
                         f"groups={pg_summary['groups']} "
                         f"params={pg_summary['params']} "
@@ -1833,7 +1793,7 @@ class PiperActor:
                     param_groups = self.task_buffer[bwdi_node.uid]["param_groups"]
                     pg_summary = self._summarize_param_groups(param_groups)
                     outstanding = self._summarize_outstanding_bwdi()
-                    self.logger.info(
+                    self.logger.log(VERBOSE,
                         f"[bwd_w_begin] rank={self.global_rank} ubid={ubid} mb={mb_idx}: "
                         f"groups={pg_summary['groups']} "
                         f"params={pg_summary['params']} "
@@ -2249,7 +2209,6 @@ class PiperActor:
             total_bytes = flat_grads.numel() * flat_grads.element_size()
             with torch.cuda.stream(self.ar_stream):
                 dist.all_reduce(flat_grads, group=self.dp_group)
-            self._record_runtime_reduced_payload("all_reduce", total_bytes)
             return total_bytes
 
         args = self.bucket_fwd_args.get(ubid, [])
@@ -2298,7 +2257,6 @@ class PiperActor:
         with torch.cuda.stream(self.ar_stream):
             for _, grad in grad_tensors:
                 dist.all_reduce(grad, group=self.dp_group)
-        self._record_runtime_reduced_payload("all_reduce", total_bytes)
         return total_bytes
 
     def _alloc_full_params(self, ubid: int | None) -> None:
@@ -2396,8 +2354,6 @@ class PiperActor:
             tmp = torch.empty_like(rs_out)
             dist.reduce_scatter_tensor(tmp, flat_grads, group=self.dp_group)
             rs_out.add_(tmp)
-        self._record_runtime_reduced_payload("reduce_scatter", total_bytes)
-        return total_bytes
 
     def _exec_all_gather(
         self,
@@ -2581,17 +2537,6 @@ class PiperActor:
         # Process deferred profiling records now that all GPU work is complete.
         # elapsed_time() is safe to call after synchronize().
         if self._prof_records:
-            self.logger.info(
-                f"[profiling] rank {self.global_rank} "
-                f"schedule_reduced_payload_total_gb={self._schedule_reduced_payload_bytes / (1024 ** 3):.6f} "
-                f"schedule_all_reduce_payload_gb={self._schedule_all_reduce_payload_bytes / (1024 ** 3):.6f} "
-                f"schedule_reduce_scatter_payload_gb={self._schedule_reduce_scatter_payload_bytes / (1024 ** 3):.6f} "
-                f"runtime_reduced_payload_total_gb={self._runtime_reduced_payload_bytes / (1024 ** 3):.6f} "
-                f"runtime_all_reduce_payload_gb={self._runtime_all_reduce_payload_bytes / (1024 ** 3):.6f} "
-                f"runtime_reduce_scatter_payload_gb={self._runtime_reduce_scatter_payload_bytes / (1024 ** 3):.6f} "
-                f"runtime_all_reduce_ops={self._runtime_all_reduce_ops} "
-                f"runtime_reduce_scatter_ops={self._runtime_reduce_scatter_ops}"
-            )
             for node, mb_idx, ubid, start_evt, end_evt, mem_before in self._prof_records:
                 t_ms = start_evt.elapsed_time(end_evt)
                 node.profiling_measurements.append(t_ms)
@@ -2604,12 +2549,4 @@ class PiperActor:
 
         return {
             "losses": losses,
-            "schedule_reduced_payload_bytes": self._schedule_reduced_payload_bytes,
-            "schedule_all_reduce_payload_bytes": self._schedule_all_reduce_payload_bytes,
-            "schedule_reduce_scatter_payload_bytes": self._schedule_reduce_scatter_payload_bytes,
-            "runtime_reduced_payload_bytes": self._runtime_reduced_payload_bytes,
-            "runtime_all_reduce_payload_bytes": self._runtime_all_reduce_payload_bytes,
-            "runtime_reduce_scatter_payload_bytes": self._runtime_reduce_scatter_payload_bytes,
-            "runtime_all_reduce_ops": self._runtime_all_reduce_ops,
-            "runtime_reduce_scatter_ops": self._runtime_reduce_scatter_ops,
         }

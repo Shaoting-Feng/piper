@@ -112,6 +112,10 @@ def piper_setup(
     bucketing=False,
     bucket_size: int = 25 * 1024 * 1024,
     zero_stage: int = 0,
+    gradient_accumulation: bool = True,
+    use_inductor: bool = False,
+    ar_a2a_same_stream: bool = False,
+    overlap_zero_ops: bool = False,
     schedule_name: str = "",
     visualize_dag_render: bool = True,
     no_nvtx: bool = False,
@@ -138,6 +142,14 @@ def piper_setup(
             same-rank A2A operations to avoid NCCL interference.
         zero_stage: ZeRO stage: 0 disabled, 1 optimizer-state sharding,
             2 gradient sharding, 3 parameter and gradient sharding.
+        gradient_accumulation: When true, delay bucket gradient reductions
+            until the last occurrence of each bucket.
+        use_inductor: When true, actors torch.compile stage GraphModules
+            during _load_stage with the default inductor backend.
+        ar_a2a_same_stream: When true, actors run A2A ops on the same CUDA
+            stream as AR ops.
+        overlap_zero_ops: When true, run overlap_zero_ops on per-rank DAGs
+            after ZeRO collective insertion.
     """
 
     # Clear Dynamo's global compilation cache so that a previous piper_setup
@@ -152,6 +164,10 @@ def piper_setup(
     piper_metadata.activation_num_checkpoints = max(1, int(num_checkpoints))
     piper_metadata.bucket_size = bucket_size
     piper_metadata.zero_stage = int(zero_stage)
+    piper_metadata.gradient_accumulation = bool(gradient_accumulation)
+    piper_metadata.use_inductor = bool(use_inductor)
+    piper_metadata.ar_a2a_same_stream = bool(ar_a2a_same_stream)
+    piper_metadata.overlap_zero_ops = bool(overlap_zero_ops)
     piper_metadata.schedule_name = schedule_name
     piper_metadata.visualize_dag_render = visualize_dag_render
     piper_metadata.a2a_ar_no_overlap = a2a_ar_no_overlap
@@ -194,6 +210,7 @@ def piper_setup(
         num_devices, optim_fn, num_mbs, num_stages,
         naive_gradient_sync, profile=nsight, stage_to_device=stage_to_device,
         zero_stage=zero_stage, no_nvtx=no_nvtx, pg=pg, temp_dir=temp_dir,
+        use_inductor=use_inductor, ar_a2a_same_stream=ar_a2a_same_stream,
     )
 
     if dp_rank == 0:

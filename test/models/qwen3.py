@@ -1,5 +1,6 @@
 from typing import Optional
 import torch
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from torchtitan.models.qwen3 import Qwen3Model, Qwen3ModelArgs
 from torchtitan.models.qwen3.model.model import TransformerBlock
@@ -363,17 +364,18 @@ class PiperQwen3Model(Qwen3Model):
         num_layers = len(self.layers)
         layers_per_stage = num_layers // self.num_stages
 
-        for stage_id in range(self.num_stages):
-            with torch.fx.traceback.annotate({"stage": stage_id}):
-                if stage_id == 0:
-                    h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            for stage_id in range(self.num_stages):
+                with torch.fx.traceback.annotate({"stage": stage_id}):
+                    if stage_id == 0:
+                        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
-                for i in range(stage_id * layers_per_stage, (stage_id + 1) * layers_per_stage):
-                    layer = self.layers[str(i)]
-                    h = layer(h, self.rope_cache, attention_masks, positions)
+                    for i in range(stage_id * layers_per_stage, (stage_id + 1) * layers_per_stage):
+                        layer = self.layers[str(i)]
+                        h = layer(h, self.rope_cache, attention_masks, positions)
 
-                if stage_id == self.num_stages - 1:
-                    h = self.norm(h) if self.norm is not None else h
-                    output = self.output(h) if self.output is not None else h
+                    if stage_id == self.num_stages - 1:
+                        h = self.norm(h) if self.norm is not None else h
+                        output = self.output(h) if self.output is not None else h
 
         return output

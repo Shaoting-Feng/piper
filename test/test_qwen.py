@@ -50,16 +50,21 @@ logger = create_logger("test_qwen", LOG_LEVEL)
 def _metrics_output_path(args):
     return os.path.join(
         args.output_dir,
-        f"qwen{args.model}-pp{args.pp}-dp{args.dp}-{args.schedule}",
+        (
+            f"qwen{args.model}-pp{args.pp}-dp{args.dp}-zero{args.zero_stage}-"
+            f"bs{args.batch_size}-sl{args.seq_len}-ga{int(args.gradient_accumulation)}-"
+            f"aras{int(args.ar_a2a_same_stream)}-ozo{int(args.overlap_zero_ops)}-"
+            f"{args.schedule}"
+        ),
     )
 
 
-def _build_benchmark_metrics(args, dp_rank, iter_times):
+def _build_benchmark_metrics(args, dp_rank, iter_times, peak_memory_stats=None):
     mean_iter_time = float(np.mean(iter_times))
     std_iter_time = float(np.std(iter_times))
     throughput = float((args.batch_size * args.mbs * args.seq_len) / mean_iter_time)
 
-    return {
+    metrics = {
         "dp_rank": dp_rank,
         "model": args.model,
         "schedule": args.schedule,
@@ -68,23 +73,49 @@ def _build_benchmark_metrics(args, dp_rank, iter_times):
         "batch_size": args.batch_size,
         "mbs": args.mbs,
         "seq_len": args.seq_len,
+        "gradient_accumulation": bool(args.gradient_accumulation),
+        "ar_a2a_same_stream": bool(args.ar_a2a_same_stream),
+        "overlap_zero_ops": bool(args.overlap_zero_ops),
         "samples": len(iter_times),
         "iter_time_mean_s": mean_iter_time,
         "iter_time_std_s": std_iter_time,
         "throughput_tokens_per_s": throughput,
         "iter_times_s": [float(iter_time) for iter_time in iter_times],
     }
+    if peak_memory_stats is not None:
+        peak_memory_by_rank = {
+            str(rank): {
+                "peak_memory_bytes": int(max_alloc_bytes),
+                "peak_memory_gb": float(max_alloc_bytes / (1024 ** 3)),
+            }
+            for rank, max_alloc_bytes in sorted(peak_memory_stats)
+        }
+        metrics["peak_memory_by_rank"] = peak_memory_by_rank
+    return metrics
 
 
 def _format_benchmark_log_lines(metrics):
     rank = metrics["dp_rank"]
+    peak_memory_summary = "/".join(
+        f"{mem_stats['peak_memory_gb']:.3f}"
+        for mem_rank, mem_stats in metrics.get("peak_memory_by_rank", {}).items()
+    )
     lines = [
+        (
+            f"{metrics['iter_time_mean_s']:.5f},"
+            f"{metrics['iter_time_std_s']:.5f},"
+            f"{peak_memory_summary}"
+        ),
         (
             f"rank {rank} iter time= {metrics['iter_time_mean_s']:.5f} +/- "
             f"{metrics['iter_time_std_s']:.5f} s ({metrics['samples']} samples)"
         ),
         f"rank {rank} throughput= {metrics['throughput_tokens_per_s']:.3f} tokens/s",
     ]
+    for mem_rank, mem_stats in metrics.get("peak_memory_by_rank", {}).items():
+        lines.append(
+            f"rank {mem_rank} peak memory= {mem_stats['peak_memory_gb']:.3f} GB"
+        )
     for trace in metrics.get("trace_times", []):
         lines.append(
             f"rank {trace['rank']} {trace['key']} time= {trace['mean_ms']:.3f} +/- "
@@ -173,6 +204,7 @@ def main(args, pg):
         a2a_ar_no_overlap=True,
         bucket_size=int(args.bucket_size * 1024 * 1024) if args.bucket_size is not None else None,
         zero_stage=args.zero_stage,
+        gradient_accumulation=args.gradient_accumulation,
         model_dtype=torch.bfloat16,
         pg=pg,
         nsight=args.nsight,
@@ -180,6 +212,9 @@ def main(args, pg):
         model_flops_per_token=flops_per_token,
         visualize_dag=args.save_viz,
         const_attrs={"rope_cache": rope_cache},
+        use_inductor=args.use_inductor,
+        ar_a2a_same_stream=args.ar_a2a_same_stream,
+        overlap_zero_ops=args.overlap_zero_ops,
     )
 
     del x, y
@@ -192,6 +227,7 @@ def main(args, pg):
     actors = piper_metadata.actors
 
     logger.info(f"Running {args.iters} timed iterations")
+    ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
@@ -200,19 +236,24 @@ def main(args, pg):
         iter_times.append(end - start)
         time.sleep(1)
 
+    peak_memory_stats = ray.get(
+        [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
+    )
+
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     metrics = _build_benchmark_metrics(
         args,
         dp_rank,
         iter_times,
+        peak_memory_stats=peak_memory_stats,
     )
-    iter_time_msg, throughput_msg, _ = _format_benchmark_log_lines(metrics)
+    metric_lines = _format_benchmark_log_lines(metrics)
     metrics_msg = f"rank {dp_rank} benchmark metrics will be saved by the driver to {_metrics_output_path(args)}"
-    logger.info(iter_time_msg)
-    logger.info(throughput_msg)
+    for line in metric_lines:
+        logger.info(line)
     logger.info(metrics_msg)
-    print(iter_time_msg, flush=True)
-    print(throughput_msg, flush=True)
+    for line in metric_lines:
+        print(line, flush=True)
     print(metrics_msg, flush=True)
 
     if args.tracing:
@@ -263,7 +304,7 @@ def parse_args():
     )
     parser.add_argument('--model', choices=['9M', '1B', '9B', '48B', '30B-A3B', '30-A3B-half', '72B'], default='1B',
                         help='Model configuration: 9M, 1B, 9B, 48B, 30B-A3B, 30-A3B-half, or 72B (default: 1B)')
-    parser.add_argument("--schedule", choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "dualpipev-seq", "zerobubble"], default="1f1b",)
+    parser.add_argument("--schedule", choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "dualpipev-seq", "zerobubble", "interleaved-zerobubble"], default="1f1b",)
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--pp", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -292,6 +333,30 @@ def parse_args():
                         help="Ray temp directory (default: /tmp/piper/ray_tmp)")
     parser.add_argument("--output-dir", default="out",
                         help="Directory for benchmark metrics output (default: out)")
+    parser.add_argument(
+        "--use-inductor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether actors torch.compile stage GraphModules in _load_stage (default: true)",
+    )
+    parser.add_argument(
+        "--gradient-accumulation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to delay bucket gradient reductions to the last occurrence (default: true)",
+    )
+    parser.add_argument(
+        "--ar-a2a-same-stream",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether A2A ops should share the AR CUDA stream on actors (default: false)",
+    )
+    parser.add_argument(
+        "--overlap-zero-ops",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to run overlap_zero_ops on the per-rank DAGs (default: false)",
+    )
     return parser.parse_args()
 
 

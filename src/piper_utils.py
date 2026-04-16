@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from typing import Any, Optional
 
-LOG_LEVEL = "DEBUG"
+LOG_LEVEL = "INFO"
 
 """ 
 Print the backward graph of a tensor
@@ -349,6 +349,10 @@ class PiperMetadata:
     full_dag_no_overlap = None  # Deep copy of the full DAG (pre-P2P-split, no overlap_a2a_tasks); used for profiling and critical-path analysis
     per_rank_dags = None  # Per-rank TaskDAGs built by the piper backend
     zero_stage: int = 0  # ZeRO stage: 0=disabled, 1=optim states, 2=+gradients, 3=+parameters
+    gradient_accumulation: bool = True  # Delay gradient sync to the last occurrence of each bucket
+    use_inductor: bool = False  # Whether actors should torch.compile stage GraphModules in _load_stage
+    ar_a2a_same_stream: bool = False  # Whether A2A ops should share the AR stream on actors
+    overlap_zero_ops: bool = False  # Whether to apply overlap_zero_ops to per-rank DAGs
     schedule_name: str = ""  # Human-readable schedule name for debug artifacts
     visualize_dag_render: bool = True  # If False, save Graphviz source only
     stage_bucket_counts: dict = {}   # stage_id -> number of buckets (set by piper backend)

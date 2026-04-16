@@ -333,7 +333,7 @@ def piper(gm, example_inputs, **kwargs):
         # Split into per-rank DAGs.
         per_rank_dags = split_dag_by_rank(dag)
 
-        # Insert ZeRO/DP communicatino tasks
+        # Insert ZeRO/DP communication tasks.
         if dp_degree > 1:
             logger.debug(
                 f"ZeRO bucket filter: {sorted(piper_metadata.zero_bucket_keys)}"
@@ -342,8 +342,12 @@ def piper(gm, example_inputs, **kwargs):
                 per_rank_dags,
                 piper_metadata.zero_stage,
                 zero_bucket_keys=piper_metadata.zero_bucket_keys,
+                gradient_accumulation=piper_metadata.gradient_accumulation,
             )
-            logger.debug(f"Inserted ZeRO-{piper_metadata.zero_stage} collective nodes")
+            logger.debug(
+                f"Inserted ZeRO-{piper_metadata.zero_stage} collective nodes "
+                f"(gradient_accumulation={piper_metadata.gradient_accumulation})"
+            )
 
             overlappable = find_overlappable_tasks(piper_metadata.schedule)
             for t1, t2 in overlappable:
@@ -355,8 +359,8 @@ def piper(gm, example_inputs, **kwargs):
         # Assign time steps
         for rank_dag in per_rank_dags:
             assign_time_steps(rank_dag)
-            # if dp_degree > 1:
-            #     overlap_zero_ops(rank_dag)
+            if piper_metadata.overlap_zero_ops:
+                overlap_zero_ops(rank_dag)
         logger.debug("Assigned time steps")
 
         piper_metadata.per_rank_dags = per_rank_dags
@@ -460,36 +464,6 @@ def piper_exec_dag(loss_fn, profiling: bool = False, log_stats: bool = False) ->
 def _log_step_stats(step_time: float, log_memory: bool, actors: dict, results: list | None = None) -> None:
     """Log throughput, MFU, and optionally per-rank peak GPU memory."""
     stats = [f"step_time={step_time:.3f}s"]
-
-    if results:
-        schedule_reduced_payload_bytes = 0
-        schedule_all_reduce_payload_bytes = 0
-        schedule_reduce_scatter_payload_bytes = 0
-        runtime_reduced_payload_bytes = 0
-        runtime_all_reduce_payload_bytes = 0
-        runtime_reduce_scatter_payload_bytes = 0
-        runtime_all_reduce_ops = 0
-        runtime_reduce_scatter_ops = 0
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            schedule_reduced_payload_bytes += int(result.get("schedule_reduced_payload_bytes", 0))
-            schedule_all_reduce_payload_bytes += int(result.get("schedule_all_reduce_payload_bytes", 0))
-            schedule_reduce_scatter_payload_bytes += int(result.get("schedule_reduce_scatter_payload_bytes", 0))
-            runtime_reduced_payload_bytes += int(result.get("runtime_reduced_payload_bytes", 0))
-            runtime_all_reduce_payload_bytes += int(result.get("runtime_all_reduce_payload_bytes", 0))
-            runtime_reduce_scatter_payload_bytes += int(result.get("runtime_reduce_scatter_payload_bytes", 0))
-            runtime_all_reduce_ops += int(result.get("runtime_all_reduce_ops", 0))
-            runtime_reduce_scatter_ops += int(result.get("runtime_reduce_scatter_ops", 0))
-        stats.append(f"schedule_reduced_payload_total_gb={schedule_reduced_payload_bytes / (1024 ** 3):.6f}")
-        stats.append(f"schedule_all_reduce_payload_gb={schedule_all_reduce_payload_bytes / (1024 ** 3):.6f}")
-        stats.append(f"schedule_reduce_scatter_payload_gb={schedule_reduce_scatter_payload_bytes / (1024 ** 3):.6f}")
-        stats.append(f"runtime_reduced_payload_total_gb={runtime_reduced_payload_bytes / (1024 ** 3):.6f}")
-        stats.append(f"runtime_all_reduce_payload_gb={runtime_all_reduce_payload_bytes / (1024 ** 3):.6f}")
-        stats.append(f"runtime_reduce_scatter_payload_gb={runtime_reduce_scatter_payload_bytes / (1024 ** 3):.6f}")
-        stats.append(f"runtime_all_reduce_ops={runtime_all_reduce_ops}")
-        stats.append(f"runtime_reduce_scatter_ops={runtime_reduce_scatter_ops}")
-        stats.append(f"runtime_payload_matches_schedule={runtime_reduced_payload_bytes == schedule_reduced_payload_bytes}")
 
     tokens = piper_metadata.tokens_per_step
     if tokens is not None:
