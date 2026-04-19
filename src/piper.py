@@ -7,7 +7,14 @@ import pickle
 import time
 import threading
 from torch._dynamo.backends.registry import register_backend
-from .piper_utils import _serialize_graphmodule, piper_metadata, create_logger, LOG_LEVEL, get_gpu_peak_flops_bf16
+from .piper_utils import (
+    _serialize_graphmodule,
+    piper_metadata,
+    create_logger,
+    LOG_LEVEL,
+    get_gpu_peak_flops_bf16,
+    should_enable_ep,
+)
 
 
 def _collect_triton_constant_args(gm):
@@ -36,22 +43,21 @@ def _collect_triton_constant_args(gm):
 from .piper_graph_transform import (
     _split_gm_by_stages,
     _profile_and_split_gm,
+    _fuse_consecutive_zero3_param_sequences,
     expand_chunks_to_dags,
     add_temporal_dependencies,
     split_dag_by_rank,
     assign_time_steps,
-    overlap_zero_ops,
-    find_overlappable_tasks,
+    get_overlappable_tasks,
     insert_zero_ops,
-    overlap_a2a_tasks,
+    overlap_chunks,
     visualize_dag,
-    compute_critical_path,
     print_dag_order,
     bucket_stage,
     apply_activation_checkpointing,
     split_by_a2a,
 )
-from .piper_exec import Chunk, TaskType, BatchMeta
+from .piper_exec import Chunk
 from .piper_actor import _get_actor
 
 logger = create_logger("piper_backend", LOG_LEVEL)
@@ -106,8 +112,8 @@ def piper(gm, example_inputs, **kwargs):
         actor = _get_actor(actor_id)
         actor_stages.append((actor, stage_id))
 
-        # Split at A2A annotation boundaries (expert-parallel only, requires dp_degree > 1).
-        if dp_degree > 1:
+        # Split at A2A annotation boundaries only for multi-DP runs with EP enabled.
+        if dp_degree > 1 and should_enable_ep(dp_degree):
             a2a_segments, boundary_infos = split_by_a2a(stage_gm, graphargs, input_idxs, param_idxs)
             if boundary_infos:
                 logger.debug(
@@ -123,8 +129,9 @@ def piper(gm, example_inputs, **kwargs):
         a2a_boundaries: dict = {}  # boundary_bucket_id -> tensor_idx
 
         for seg_idx, (seg_gm, seg_in, seg_param, seg_args) in enumerate(a2a_segments):
+            buckets = [(seg_gm, seg_in, seg_param, seg_args)]
             # Hack: only bucket even-indexed segments to avoid bucketing MoE subgraphs
-            if piper_metadata.bucket_size is not None:
+            if dp_degree > 1 and piper_metadata.bucket_size is not None:
                 if seg_idx % 2 == 0:
                     buckets = bucket_stage(
                         seg_gm,
@@ -137,21 +144,26 @@ def piper(gm, example_inputs, **kwargs):
                 else:
                     bucket_zero_flags = [False]
             else:
-                buckets = [(seg_gm, seg_in, seg_param, seg_args)]
                 if seg_idx % 2 == 0:
                     bucket_zero_flags = [True]
                 else:
                     bucket_zero_flags = [False]
 
-            logger.debug(
+            logger.info(
                 f"Stage {stage_id} segment {seg_idx} bucketed into {len(buckets)} buckets"
             )
             for b_idx, (_, _, bp, ba) in enumerate(buckets):
+                bucket_total_mb = 0.0
+                for i in bp:
+                    arg = ba[i] if i < len(ba) else None
+                    if arg is not None and hasattr(arg, "numel"):
+                        bucket_total_mb += arg.numel() * arg.element_size() / (1024 * 1024)
+                logger.info(f"  bucket {b_idx} total size={bucket_total_mb:.3f}MB")
                 for i in bp:
                     arg = ba[i] if i < len(ba) else None
                     if arg is not None and hasattr(arg, "numel"):
                         mb = arg.numel() * arg.element_size() / (1024 * 1024)
-                        logger.debug(
+                        logger.info(
                             f"  bucket {b_idx} tensor idx={i} shape={tuple(arg.shape)} size={mb:.3f}MB"
                         )
 
@@ -349,18 +361,27 @@ def piper(gm, example_inputs, **kwargs):
                 f"(gradient_accumulation={piper_metadata.gradient_accumulation})"
             )
 
-            overlappable = find_overlappable_tasks(piper_metadata.schedule)
+        overlappable_by_rank: dict[int, list[tuple[Chunk, Chunk]]] = {}
+        if piper_metadata.overlap_chunks:
+            # overlappable = find_overlappable_tasks(piper_metadata.schedule)
+            overlappable = get_overlappable_tasks(piper_metadata.schedule)
             for t1, t2 in overlappable:
-                logger.debug(
-                    f"Found adjacent task pair for A2A/compute overlap: "
-                    f"{t1} -> {t2}"
+                overlappable_by_rank.setdefault(t1.pp_rank, []).append((t1, t2))
+                logger.debug(f"Found intra-FWD_BWD overlap pair: {t1} -> {t2}")
+
+        for pp_rank, rank_dag in enumerate(per_rank_dags):
+            rank_pairs = overlappable_by_rank.get(pp_rank, [])
+            if rank_pairs:
+                overlap_chunks(rank_dag, rank_pairs)
+            if piper_metadata.zero_stage == 3:
+                _fuse_consecutive_zero3_param_sequences(
+                    rank_dag,
+                    zero_bucket_keys=piper_metadata.zero_bucket_keys,
                 )
 
         # Assign time steps
         for rank_dag in per_rank_dags:
             assign_time_steps(rank_dag)
-            if piper_metadata.overlap_zero_ops:
-                overlap_zero_ops(rank_dag)
         logger.debug("Assigned time steps")
 
         piper_metadata.per_rank_dags = per_rank_dags
@@ -373,7 +394,12 @@ def piper(gm, example_inputs, **kwargs):
                     visualize_dag(per_rank_dag, output_path=f"out/rank{pp_rank}_dag")
                 except Exception as e:
                     logger.warning(f"DAG visualization failed for rank {pp_rank} (DAG may be too large for dot): {e}")
-            print_dag_order(per_rank_dag, label=f"rank {pp_rank}", rank=pp_rank)
+            print_dag_order(
+                per_rank_dag,
+                label=f"rank {pp_rank}",
+                rank=pp_rank,
+                out_dir=piper_metadata.output_dir,
+            )
 
 
         # Send DAG to actors
@@ -483,13 +509,5 @@ def _log_step_stats(step_time: float, log_memory: bool, actors: dict, results: l
                 "MFU not computed: GPU peak FLOPs unknown for this device. "
                 "Add it to _GPU_PEAK_FLOPS_BF16 in piper_utils.py."
             )
-
-    if log_memory:
-        mem_refs = [
-            actors[pp_rank].get_and_reset_peak_memory_stats.remote()
-            for pp_rank in range(len(piper_metadata.per_rank_dags))
-        ]
-        for global_rank, max_alloc_bytes in ray.get(mem_refs):
-            stats.append(f"rank{global_rank}_peak_mem={max_alloc_bytes / 1e9:.2f}GB")
 
     logger.info("  ".join(stats))

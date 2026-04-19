@@ -220,7 +220,9 @@ class Task:
       :func:`overlap_a2a_tasks` can introduce forks and joins so the fields
       are lists, mirroring ``data_preds`` / ``data_succs``.
     """
-    chunk: Chunk
+    task_type: TaskType
+    batches: list[BatchMeta]
+    task_pp_rank: int
     pp_rank: int    # row index in PipelineSchedule.grid
     time_step: int  # column index in PipelineSchedule.grid
 
@@ -235,12 +237,17 @@ class Task:
 
     # Set by graph-transform passes (not meaningful for raw schedule tasks)
     bucket_id: int = 0           # stage-local bucket index (stage_bucket_id); actor must not use this
+    resource: str = "compute_stream"
     # Task-type-specific metadata (e.g. {"a2a_tensor_idx": int} for A2A tasks).
     custom_metadata: dict = field(default_factory=dict)
 
     # The original Chunk from the PipelineSchedule that this task was derived from.
     # Set by expand_chunks_to_dags; preserved through all subsequent transforms.
     source_chunk: Optional[Chunk] = None
+
+    # The specific logical chunk that this task belongs to. For FWD_BWD cells,
+    # this distinguishes the derived FWD half from the derived BWD half.
+    associated_chunk: Optional[Chunk] = None
 
     # Unique integer ID assigned at construction; survives pickle round-trips.
     uid: int = field(default_factory=lambda: next(_uid_counter))
@@ -263,8 +270,8 @@ class Task:
 
     def node_id(self) -> str:
         """Unique string identifier for use as a graph node key."""
-        ttype = self.chunk.type.value if self.chunk.type is not None else "none"
-        mb = self.chunk.batches[0].mb_idx if self.chunk.batches else "x"
+        ttype = self.task_type.value if self.task_type is not None else "none"
+        mb = self.batches[0].mb_idx if self.batches else "x"
         return f"r{self.pp_rank}_t{self.time_step}_{ttype}_mb{mb}"
 
 
@@ -273,22 +280,26 @@ def runtime_sort_key(node: Task) -> tuple:
 
     Runtime dispatch order is driven by ``Task.time_step`` first. For tasks that
     intentionally share a time step, dispatch uses a fixed priority:
-    SEND, A2A, RS/AR, AG, compute, RECV.
+    SEND, A2A, alloc, AG, compute, RS/AR, free, RECV.
     """
     priority = {
         TaskType.SEND: 0,
-        TaskType.FWD_A2A: 1,
-        TaskType.BWD_A2A: 1,
-        TaskType.REDUCE_SCATTER: 2,
-        TaskType.ALL_REDUCE: 2,
-        TaskType.ALL_GATHER: 3,
-        TaskType.FWD: 4,
-        TaskType.BWD: 4,
-        TaskType.BWD_I: 4,
-        TaskType.BWD_W: 4,
-        TaskType.FWD_BWD: 4,
-        TaskType.RECV: 5,
-    }.get(node.chunk.type, 4)
+        TaskType.FREE_FULL_GRADS: 1,
+        TaskType.FREE_FULL_PARAMS: 1,
+        TaskType.FWD_A2A: 2,
+        TaskType.BWD_A2A: 2,
+        TaskType.REDUCE_SCATTER: 3,
+        TaskType.ALL_REDUCE: 3,
+        TaskType.ALL_GATHER: 4,
+        TaskType.FWD: 5,
+        TaskType.BWD: 5,
+        TaskType.BWD_I: 5,
+        TaskType.BWD_W: 5,
+        TaskType.FWD_BWD: 5,
+        TaskType.ALLOC_FULL_PARAMS: 6,
+        TaskType.ALLOC_FULL_GRADS: 6,
+        TaskType.RECV: 7,
+    }.get(node.task_type, 4)
     return (node.time_step, priority, node.uid)
 
 
@@ -297,17 +308,17 @@ def _rebuild_task_dag(node_data):
     by TaskDAG.__reduce__.  Must be a module-level function so pickle can find
     it by name."""
     nodes = [
-        Task(chunk=d[0], pp_rank=d[1], time_step=d[2], peer_pp_rank=d[3],
-                 bucket_id=d[8], custom_metadata=d[9], source_chunk=d[11],
-                 unique_bucket_id=d[12], compute_loss=d[13])
+        Task(task_type=d[0], batches=d[1], task_pp_rank=d[2], pp_rank=d[3], time_step=d[4], peer_pp_rank=d[5],
+                 bucket_id=d[10], resource=d[11], custom_metadata=d[12], source_chunk=d[14],
+                 associated_chunk=d[15], unique_bucket_id=d[16], compute_loss=d[17])
         for d in node_data
     ]
     for node, d in zip(nodes, node_data):
-        node.data_preds     = [nodes[j] for j in d[4]]
-        node.data_succs     = [nodes[j] for j in d[5]]
-        node.temporal_preds = [nodes[j] for j in d[6]]
-        node.temporal_succs = [nodes[j] for j in d[7]]
-        node.uid            = d[10]
+        node.data_preds     = [nodes[j] for j in d[6]]
+        node.data_succs     = [nodes[j] for j in d[7]]
+        node.temporal_preds = [nodes[j] for j in d[8]]
+        node.temporal_succs = [nodes[j] for j in d[9]]
+        node.uid            = d[13]
     return TaskDAG(nodes=nodes)
 
 
@@ -330,13 +341,13 @@ class TaskDAG:
         idx = {id(n): i for i, n in enumerate(self.nodes)}
         node_data = [
             (
-                n.chunk, n.pp_rank, n.time_step, n.peer_pp_rank,
+                n.task_type, n.batches, n.task_pp_rank, n.pp_rank, n.time_step, n.peer_pp_rank,
                 [idx[id(p)] for p in n.data_preds],
                 [idx[id(s)] for s in n.data_succs],
                 [idx[id(p)] for p in n.temporal_preds],
                 [idx[id(s)] for s in n.temporal_succs],
-                n.bucket_id, n.custom_metadata, n.uid, n.source_chunk,
-                n.unique_bucket_id, n.compute_loss,
+                n.bucket_id, n.resource, n.custom_metadata, n.uid, n.source_chunk,
+                n.associated_chunk, n.unique_bucket_id, n.compute_loss,
             )
             for n in self.nodes
         ]

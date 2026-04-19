@@ -114,8 +114,10 @@ def piper_setup(
     zero_stage: int = 0,
     gradient_accumulation: bool = True,
     use_inductor: bool = False,
+    enable_ep: bool = False,
     ar_a2a_same_stream: bool = False,
     overlap_zero_ops: bool = False,
+    overlap_chunks: bool = False,
     schedule_name: str = "",
     visualize_dag_render: bool = True,
     no_nvtx: bool = False,
@@ -125,6 +127,7 @@ def piper_setup(
     temp_dir: str = None,
     model_flops_per_token: float = None,
     visualize_dag: bool = True,
+    output_dir: str = "out",
     const_attrs: dict = None,
 ):
     """
@@ -146,10 +149,14 @@ def piper_setup(
             until the last occurrence of each bucket.
         use_inductor: When true, actors torch.compile stage GraphModules
             during _load_stage with the default inductor backend.
+        enable_ep: When true, honor expert-parallel A2A annotations by
+            splitting stage graphs and inserting DAG-level A2A tasks.
         ar_a2a_same_stream: When true, actors run A2A ops on the same CUDA
             stream as AR ops.
         overlap_zero_ops: When true, run overlap_zero_ops on per-rank DAGs
             after ZeRO collective insertion.
+        overlap_chunks: When true, apply the chunk-overlap transform to
+            per-rank DAGs before assigning time steps.
     """
 
     # Clear Dynamo's global compilation cache so that a previous piper_setup
@@ -166,13 +173,16 @@ def piper_setup(
     piper_metadata.zero_stage = int(zero_stage)
     piper_metadata.gradient_accumulation = bool(gradient_accumulation)
     piper_metadata.use_inductor = bool(use_inductor)
+    piper_metadata.enable_ep = bool(enable_ep)
     piper_metadata.ar_a2a_same_stream = bool(ar_a2a_same_stream)
     piper_metadata.overlap_zero_ops = bool(overlap_zero_ops)
+    piper_metadata.overlap_chunks = bool(overlap_chunks)
     piper_metadata.schedule_name = schedule_name
     piper_metadata.visualize_dag_render = visualize_dag_render
     piper_metadata.a2a_ar_no_overlap = a2a_ar_no_overlap
     piper_metadata.schedule = schedule
     piper_metadata.visualize_dag = visualize_dag
+    piper_metadata.output_dir = output_dir
 
     # Reset DAG/compile fields so stale data from a prior run never leaks into
     # this run if the piper backend is somehow not re-invoked.

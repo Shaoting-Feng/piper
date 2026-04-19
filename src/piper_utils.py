@@ -351,8 +351,10 @@ class PiperMetadata:
     zero_stage: int = 0  # ZeRO stage: 0=disabled, 1=optim states, 2=+gradients, 3=+parameters
     gradient_accumulation: bool = True  # Delay gradient sync to the last occurrence of each bucket
     use_inductor: bool = False  # Whether actors should torch.compile stage GraphModules in _load_stage
+    enable_ep: bool = False  # Whether expert-parallel A2A graph splitting/tasks are enabled
     ar_a2a_same_stream: bool = False  # Whether A2A ops should share the AR stream on actors
     overlap_zero_ops: bool = False  # Whether to apply overlap_zero_ops to per-rank DAGs
+    overlap_chunks: bool = False  # Whether to apply the chunk-overlap transform to per-rank DAGs
     schedule_name: str = ""  # Human-readable schedule name for debug artifacts
     visualize_dag_render: bool = True  # If False, save Graphviz source only
     stage_bucket_counts: dict = {}   # stage_id -> number of buckets (set by piper backend)
@@ -366,8 +368,13 @@ class PiperMetadata:
     model_flops_per_token: Optional[float] = None  # FLOPs per token for forward+backward pass
     tokens_per_step: Optional[int] = None           # Global batch tokens per training step
     visualize_dag: bool = True  # Whether to render per-rank DAG PNGs after compilation
+    output_dir: str = "out"  # Base directory for debug artifacts emitted during runs
 
 piper_metadata = PiperMetadata()
+
+
+def should_enable_ep(dp_degree: int) -> bool:
+    return bool(piper_metadata.enable_ep) and dp_degree > 1
 
 
 # ---------------------------------------------------------------------------

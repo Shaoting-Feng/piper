@@ -52,8 +52,10 @@ def _metrics_output_path(args):
         args.output_dir,
         (
             f"qwen{args.model}-pp{args.pp}-dp{args.dp}-zero{args.zero_stage}-"
+            f"ep{int(args.ep)}-"
             f"bs{args.batch_size}-sl{args.seq_len}-ga{int(args.gradient_accumulation)}-"
             f"aras{int(args.ar_a2a_same_stream)}-ozo{int(args.overlap_zero_ops)}-"
+            f"och{int(args.overlap_chunks)}-"
             f"{args.schedule}"
         ),
     )
@@ -70,12 +72,14 @@ def _build_benchmark_metrics(args, dp_rank, iter_times, peak_memory_stats=None):
         "schedule": args.schedule,
         "pp": args.pp,
         "dp": args.dp,
+        "ep": bool(args.ep),
         "batch_size": args.batch_size,
         "mbs": args.mbs,
         "seq_len": args.seq_len,
         "gradient_accumulation": bool(args.gradient_accumulation),
         "ar_a2a_same_stream": bool(args.ar_a2a_same_stream),
         "overlap_zero_ops": bool(args.overlap_zero_ops),
+        "overlap_chunks": bool(args.overlap_chunks),
         "samples": len(iter_times),
         "iter_time_mean_s": mean_iter_time,
         "iter_time_std_s": std_iter_time,
@@ -211,10 +215,13 @@ def main(args, pg):
         temp_dir=args.temp_dir,
         model_flops_per_token=flops_per_token,
         visualize_dag=args.save_viz,
+        output_dir=args.output_dir,
         const_attrs={"rope_cache": rope_cache},
         use_inductor=args.use_inductor,
+        enable_ep=args.ep,
         ar_a2a_same_stream=args.ar_a2a_same_stream,
         overlap_zero_ops=args.overlap_zero_ops,
+        overlap_chunks=args.overlap_chunks,
     )
 
     del x, y
@@ -306,6 +313,12 @@ def parse_args():
                         help='Model configuration: 9M, 1B, 9B, 48B, 30B-A3B, 30-A3B-half, or 72B (default: 1B)')
     parser.add_argument("--schedule", choices=["gpipe", "1f1b", "no-pp", "interleaved-1f1b", "dualpipev", "dualpipev-seq", "zerobubble", "interleaved-zerobubble"], default="1f1b",)
     parser.add_argument("--dp", type=int, default=1)
+    parser.add_argument(
+        "--ep",
+        action="store_true",
+        default=False,
+        help="Enable expert-parallel handling of all_to_all annotations",
+    )
     parser.add_argument("--pp", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=1024)
@@ -356,6 +369,12 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Whether to run overlap_zero_ops on the per-rank DAGs (default: false)",
+    )
+    parser.add_argument(
+        "--overlap-chunks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to run overlap_chunks on the per-rank DAGs (default: false)",
     )
     return parser.parse_args()
 

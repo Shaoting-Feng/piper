@@ -15,7 +15,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             return Qwen3ModelArgs(
                 vocab_size=2048,
                 dim=256,
-                n_layers=4,
+                n_layers=8,
                 n_heads=8,
                 n_kv_heads=4,
                 head_dim=32,
@@ -364,18 +364,17 @@ class PiperQwen3Model(Qwen3Model):
         num_layers = len(self.layers)
         layers_per_stage = num_layers // self.num_stages
 
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            for stage_id in range(self.num_stages):
-                with torch.fx.traceback.annotate({"stage": stage_id}):
-                    if stage_id == 0:
-                        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        for stage_id in range(self.num_stages):
+            with torch.fx.traceback.annotate({"stage": stage_id}):
+                if stage_id == 0:
+                    h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
-                    for i in range(stage_id * layers_per_stage, (stage_id + 1) * layers_per_stage):
-                        layer = self.layers[str(i)]
-                        h = layer(h, self.rope_cache, attention_masks, positions)
+                for i in range(stage_id * layers_per_stage, (stage_id + 1) * layers_per_stage):
+                    layer = self.layers[str(i)]
+                    h = layer(h, self.rope_cache, attention_masks, positions)
 
-                    if stage_id == self.num_stages - 1:
-                        h = self.norm(h) if self.norm is not None else h
-                        output = self.output(h) if self.output is not None else h
+                if stage_id == self.num_stages - 1:
+                    h = self.norm(h) if self.norm is not None else h
+                    output = self.output(h) if self.output is not None else h
 
         return output
