@@ -70,8 +70,8 @@ def _create_actors(
         }} if profile else {}
         nccl_env = {
             "env_vars": {
-                "NCCL_SOCKET_IFNAME": "ens32",
-                "GLOO_SOCKET_IFNAME": "ens32",
+                # "NCCL_SOCKET_IFNAME": "ens32",
+                # "GLOO_SOCKET_IFNAME": "ens32",
                 "NCCL_DEBUG": "WARN",
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
             }
@@ -167,6 +167,7 @@ class PiperActor:
         self.labels = None
 
         self.comp_stream = torch.cuda.Stream()
+        self.overlapped_comp_stream = torch.cuda.Stream()
         self.ar_stream = torch.cuda.Stream()
         if self.ar_a2a_same_stream:
             self.a2a_stream = self.ar_stream
@@ -190,6 +191,7 @@ class PiperActor:
         self.memory_tracing_enabled = False
         # DAG execution state
         self.dag = None
+        self.sorted_dag_nodes = None
 
         # Unified inter-task buffer.  Keyed by task.uid (int), storing whatever
         # data the task produced for downstream consumers.
@@ -350,11 +352,12 @@ class PiperActor:
             if self.pp_degree > 1:
                 self._join_pp_process_group()
 
-            # Force cuBLAS context initialization on comp_stream so the first
-            # backward pass does not encounter a "no current CUDA context" warning.
-            with torch.cuda.stream(self.comp_stream):
-                _w = torch.zeros(4, 4, device=self.device)
-                torch.mm(_w, _w)
+            # Force cuBLAS context initialization on both compute streams so the
+            # first backward pass does not encounter a "no current CUDA context" warning.
+            for compute_stream in (self.comp_stream, self.overlapped_comp_stream):
+                with torch.cuda.stream(compute_stream):
+                    _w = torch.zeros(4, 4, device=self.device)
+                    torch.mm(_w, _w)
 
             self.logger.info(f"Actor {self.global_rank} joined process groups")
 
@@ -998,7 +1001,8 @@ class PiperActor:
 
     def load_dag(self, dag: TaskDAG) -> None:
         """Store the per-rank TaskDAG for subsequent run_dag() calls."""
-        self.dag = sorted(dag.nodes, key=runtime_sort_key)
+        self.dag = dag
+        self.sorted_dag_nodes = sorted(dag.nodes, key=runtime_sort_key)
 
     def get_all_params(self) -> dict:
         """Return {unique_bucket_id: flat_cpu_tensor} for every trainable bucket."""
@@ -1044,8 +1048,17 @@ class PiperActor:
         """Return the set of unique_bucket_ids loaded on this actor."""
         return list(self.bucket_fwd_fns.keys())
 
-    def _timing_stream(self, task_type) -> "torch.cuda.Stream":
+    def _compute_stream_for_id(self, compute_stream_id: str) -> "torch.cuda.Stream":
+        if compute_stream_id == "overlapped_comp_stream":
+            return self.overlapped_comp_stream
+        return self.comp_stream
+
+    def _compute_stream_for_task(self, task: Task) -> "torch.cuda.Stream":
+        return self._compute_stream_for_id(task.compute_stream_id)
+
+    def _timing_stream(self, task) -> "torch.cuda.Stream":
         """Return the CUDA stream that drives work for the given task type."""
+        task_type = task.task_type
         if task_type == TaskType.SEND:
             return self.p2p_send_stream
         if task_type == TaskType.RECV:
@@ -1054,7 +1067,7 @@ class PiperActor:
             return self.a2a_stream
         if task_type in (TaskType.ALL_REDUCE, TaskType.REDUCE_SCATTER, TaskType.ALL_GATHER):
             return self.ar_stream
-        return self.comp_stream
+        return self._compute_stream_for_task(task)
 
     def get_node_runtimes(self) -> dict:
         """Return ``{uid: profiling_measurements}`` for every profiled DAG node.
@@ -1338,6 +1351,7 @@ class PiperActor:
         - RECV records a recv_event after the dist.recv completes.
         """
         assert self.dag is not None, "load_dag() must be called before run_dag()"
+        assert self.sorted_dag_nodes is not None, "load_dag() must initialize sorted node order"
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
         verbose_enabled = self.logger.isEnabledFor(VERBOSE)
 
@@ -1369,14 +1383,15 @@ class PiperActor:
         self._prof_records: list = []
 
         self._init_task_buffer_refcounts(self.dag)
-        ts_to_comp_event: dict[int, torch.cuda.Event] = {}
+        last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
 
         def _wait_for_all_gather(compute_node: Task) -> None:
+            compute_stream = self._compute_stream_for_task(compute_node)
             for pred in compute_node.data_preds:
                 if pred.task_type == TaskType.ALL_GATHER:
                     ag_evt = self.ag_events.get(pred.uid)
                     if ag_evt is not None:
-                        self.comp_stream.wait_event(ag_evt)
+                        compute_stream.wait_event(ag_evt)
 
         def _metadata_ubids(node: Task, key: str) -> list[int]:
             value = node.custom_metadata.get(key)
@@ -1423,12 +1438,13 @@ class PiperActor:
             finally:
                 self._nvtx_pop()
 
-        for node in self.dag:
+        for node in self.sorted_dag_nodes:
 
             task_type = node.task_type
             batch = node.batches[0]
             mb_idx = batch.mb_idx
             ubid = node.unique_bucket_id  # None for non-compute nodes
+            node_comp_stream = self._compute_stream_for_task(node)
 
             if debug_enabled:
                 self.logger.debug(
@@ -1437,7 +1453,7 @@ class PiperActor:
                 )
 
             if profiling:
-                _stream = self._timing_stream(task_type)
+                _stream = self._timing_stream(node)
                 _start_evt = torch.cuda.Event(enable_timing=True)
                 _start_evt.record(_stream)
                 _mem_before = torch.cuda.memory_allocated()
@@ -1465,7 +1481,7 @@ class PiperActor:
                 case TaskType.RECV:
                     # data_succs[0] is the downstream compute task.
                     compute_node = node.data_succs[0]
-                    comp_evt = ts_to_comp_event.get(node.time_step)
+                    comp_evt = last_comp_event_by_stream.get(node.compute_stream_id)
                     if comp_evt is not None:
                         self.p2p_recv_stream.wait_event(comp_evt)
                     if compute_node.task_type == TaskType.FWD:
@@ -1505,7 +1521,7 @@ class PiperActor:
                     a2a_evt = torch.cuda.Event()
                     a2a_evt.record(self.a2a_stream)
                     self.a2a_events[node.uid] = a2a_evt
-                    self.comp_stream.wait_event(a2a_evt)
+                    node_comp_stream.wait_event(a2a_evt)
 
                 case TaskType.BWD_A2A:
                     bwd_pred = next(
@@ -1534,7 +1550,7 @@ class PiperActor:
                     a2a_evt = torch.cuda.Event()
                     a2a_evt.record(self.a2a_stream)
                     self.a2a_events[node.uid] = a2a_evt
-                    self.comp_stream.wait_event(a2a_evt)
+                    node_comp_stream.wait_event(a2a_evt)
 
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
@@ -1607,7 +1623,7 @@ class PiperActor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.recv_events:
-                        self.comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
+                        node_comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
 
                     # Gather input tensors from task_buffer.
                     # FWD(bkt=0 of first stage): inputs come from self.inputs.
@@ -1630,9 +1646,9 @@ class PiperActor:
                     _wait_for_all_gather(node)
 
                     self._nvtx_push(f"forward_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(self.comp_stream, "forward")
-                    fwd_out = self._forward_dag(ubid, mb_idx, input_tensors)
-                    self._stop_timing(self.comp_stream, "forward")
+                    self._start_timing(node_comp_stream, "forward")
+                    fwd_out = self._forward_dag(ubid, mb_idx, input_tensors, node_comp_stream)
+                    self._stop_timing(node_comp_stream, "forward")
                     self._nvtx_pop()
                     self.task_buffer[node.uid] = fwd_out
                     # Shape ref for BWD RECV: store lightweight metadata (shape, dtype) so
@@ -1640,9 +1656,9 @@ class PiperActor:
                     self.task_buffer[("shape_ref", ubid)] = [(t.shape, t.dtype) for t in fwd_out["out_with_grad"]]
                     self.task_buffer[(ubid, mb_idx)] = fwd_out  # per-mb FWD data for BWD
                     evt = torch.cuda.Event()
-                    evt.record(self.comp_stream)
+                    evt.record(node_comp_stream)
                     comp_events[node.uid] = evt
-                    ts_to_comp_event[node.time_step] = evt
+                    last_comp_event_by_stream[node.compute_stream_id] = evt
                     if node.custom_metadata.get("zero_free_full_params_after"):
                         evt.synchronize()
                         self._free_full_params(ubid)
@@ -1653,7 +1669,7 @@ class PiperActor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.recv_events:
-                        self.comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
+                        node_comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
                     _wait_for_all_gather(node)
 
                     # Resolve outputs and upstream grads via per-mb ubid lookup.
@@ -1661,7 +1677,7 @@ class PiperActor:
 
                     if node.compute_loss:
                         assert loss_fn is not None
-                        with torch.cuda.stream(self.comp_stream):
+                        with torch.cuda.stream(node_comp_stream):
                             outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
                         upstream_grads = None
                     elif recv_pred is not None:
@@ -1722,13 +1738,14 @@ class PiperActor:
                         self._alloc_full_grads(ubid)
 
                     self._nvtx_push(f"backward_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(self.comp_stream, "backward")
+                    self._start_timing(node_comp_stream, "backward")
                     bwd_out = self._backward_dag(
                         ubid, mb_idx, outputs_or_loss, upstream_grads,
                         pre_detach_outs, detached_outs, inp_with_grad,
                         fwd_out.get("out_with_grad"),
+                        node_comp_stream,
                     )
-                    self._stop_timing(self.comp_stream, "backward")
+                    self._stop_timing(node_comp_stream, "backward")
                     self._nvtx_pop()
                     buf = bwd_out if bwd_out is not None else {}
                     # Full-length inp_grads parallel to fwd_inputs / detached_outs so
@@ -1748,10 +1765,10 @@ class PiperActor:
                     fwd_out.clear()
                     del self.task_buffer[(ubid, mb_idx)]
                     evt = torch.cuda.Event()
-                    evt.record(self.comp_stream)
+                    evt.record(node_comp_stream)
                     comp_events[node.uid] = evt
                     self.bwd_events[ubid] = evt
-                    ts_to_comp_event[node.time_step] = evt
+                    last_comp_event_by_stream[node.compute_stream_id] = evt
                     if node.custom_metadata.get("zero_free_full_params_after"):
                         evt.synchronize()
                         self._free_full_params(ubid)
@@ -1762,7 +1779,7 @@ class PiperActor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.recv_events:
-                        self.comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
+                        node_comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
                     _wait_for_all_gather(node)
 
                     # Resolve stage_outputs_or_loss and output_grads.
@@ -1770,7 +1787,7 @@ class PiperActor:
 
                     if node.compute_loss:
                         assert loss_fn is not None
-                        with torch.cuda.stream(self.comp_stream):
+                        with torch.cuda.stream(node_comp_stream):
                             stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
                         output_grads = None
                     elif recv_pred is not None:
@@ -1817,12 +1834,12 @@ class PiperActor:
                                if b_fwd_args[i] is not None]
 
                     self._nvtx_push(f"backward_input_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(self.comp_stream, "backward_input")
-                    with torch.cuda.stream(self.comp_stream):
+                    self._start_timing(node_comp_stream, "backward_input")
+                    with torch.cuda.stream(node_comp_stream):
                         dinputs, param_groups = self._bucket_backward_input(
                             stage_outputs_or_loss, output_grads, input_values, iter(weights)
                         )
-                    self._stop_timing(self.comp_stream, "backward_input")
+                    self._stop_timing(node_comp_stream, "backward_input")
                     self._nvtx_pop()
                     # Full-length inp_grads parallel to fwd_inputs / detached_outs.
                     fwd_inputs_full = fwd_out.get("fwd_inputs")
@@ -1866,10 +1883,10 @@ class PiperActor:
                     del stage_outputs_or_loss, fwd_out
                     del self.task_buffer[(ubid, mb_idx)]
                     evt = torch.cuda.Event()
-                    evt.record(self.comp_stream)
+                    evt.record(node_comp_stream)
                     comp_events[node.uid] = evt
                     self.bwd_events[ubid] = evt
-                    ts_to_comp_event[node.time_step] = evt
+                    last_comp_event_by_stream[node.compute_stream_id] = evt
                     if node.custom_metadata.get("zero_free_full_params_after"):
                         evt.synchronize()
                         self._free_full_params(ubid)
@@ -1906,10 +1923,10 @@ class PiperActor:
                     weights = [b_fwd_args[i] for i in self.bucket_param_idxs[ubid]
                                if b_fwd_args[i] is not None]
                     self._nvtx_push(f"backward_weight_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(self.comp_stream, "backward_weight")
-                    with torch.cuda.stream(self.comp_stream):
+                    self._start_timing(node_comp_stream, "backward_weight")
+                    with torch.cuda.stream(node_comp_stream):
                         self._bucket_backward_weight(iter(weights), param_groups, ubid=ubid, mb_idx=mb_idx)
-                    self._stop_timing(self.comp_stream, "backward_weight")
+                    self._stop_timing(node_comp_stream, "backward_weight")
                     self._nvtx_pop()
                     self._accumulate_zero_param_grads_to_flat(ubid)
                     self.task_buffer[node.uid] = {}
@@ -1918,10 +1935,10 @@ class PiperActor:
                     # the autograd graph was freed by retain_graph=False.  Drop the shell.
                     self._release_task_buffer_uid(bwdi_node.uid)
                     evt = torch.cuda.Event()
-                    evt.record(self.comp_stream)
+                    evt.record(node_comp_stream)
                     comp_events[node.uid] = evt
                     self.bwd_events[ubid] = evt
-                    ts_to_comp_event[node.time_step] = evt
+                    last_comp_event_by_stream[node.compute_stream_id] = evt
                     if node.custom_metadata.get("zero_free_full_params_after"):
                         evt.synchronize()
                         self._free_full_params(ubid)
@@ -2030,7 +2047,7 @@ class PiperActor:
             dist.all_to_all_single(output_buf, input_tensor, group=self.ep_group)
         return output_buf
 
-    def _forward_dag(self, ubid: int, mb_idx: int, input_tensors) -> dict:
+    def _forward_dag(self, ubid: int, mb_idx: int, input_tensors, compute_stream) -> dict:
         """Run the forward function for bucket *ubid* and return a result dict.
 
         The result dict always contains:
@@ -2078,7 +2095,7 @@ class PiperActor:
             )
 
         # Run the forward function.
-        with torch.cuda.stream(self.comp_stream):
+        with torch.cuda.stream(compute_stream):
             output = fwd_fn(fwd_args)
 
         # Clear input slots so we don't hold stale tensor references.
@@ -2117,6 +2134,7 @@ class PiperActor:
         detached_outs,
         inp_with_grad,
         out_with_grad,
+        compute_stream,
     ) -> dict | None:
         """Fused backward pass (BWD) for a single bucket.
 
@@ -2127,15 +2145,13 @@ class PiperActor:
         Returns a dict with ``"send_output"`` (input grad list) when this is the
         first-bucket-of-stage and the stage has a predecessor, or None otherwise.
         """
-        comp_stream = self.comp_stream
-
         if pre_detach_outs is None:
             # Last bucket (or only bucket): backward from stage outputs or loss.
             if upstream_grads is not None:
-                with torch.cuda.stream(comp_stream):
+                with torch.cuda.stream(compute_stream):
                     torch.autograd.backward(outputs_or_loss, upstream_grads)
             else:
-                with torch.cuda.stream(comp_stream):
+                with torch.cuda.stream(compute_stream):
                     outputs_or_loss[0].backward()
         else:
             # Non-last bucket: propagate through the bucket boundary.
@@ -2151,7 +2167,7 @@ class PiperActor:
             if bwd_pairs:
                 outputs_bwd = [p for p, _g in bwd_pairs]
                 grads_bwd = [g for _p, g in bwd_pairs]
-                with torch.cuda.stream(comp_stream):
+                with torch.cuda.stream(compute_stream):
                     torch.autograd.backward(outputs_bwd, grads_bwd)
 
         # Collect stage-input grads for SEND — applies to both last-bucket and

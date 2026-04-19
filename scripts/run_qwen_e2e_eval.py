@@ -164,7 +164,7 @@ def parse_args() -> argparse.Namespace:
         "--zero-grad-acc-settings",
         nargs="+",
         choices=["on", "off"],
-        default=["off"],
+        default=["on"],
         help="Gradient accumulation settings to include in the zero sweep. "
              "Examples: --zero-grad-acc-settings on | off | off on",
     )

@@ -238,6 +238,7 @@ class Task:
     # Set by graph-transform passes (not meaningful for raw schedule tasks)
     bucket_id: int = 0           # stage-local bucket index (stage_bucket_id); actor must not use this
     resource: str = "compute_stream"
+    compute_stream_id: str = "comp_stream"
     # Task-type-specific metadata (e.g. {"a2a_tensor_idx": int} for A2A tasks).
     custom_metadata: dict = field(default_factory=dict)
 
@@ -309,8 +310,8 @@ def _rebuild_task_dag(node_data):
     it by name."""
     nodes = [
         Task(task_type=d[0], batches=d[1], task_pp_rank=d[2], pp_rank=d[3], time_step=d[4], peer_pp_rank=d[5],
-                 bucket_id=d[10], resource=d[11], custom_metadata=d[12], source_chunk=d[14],
-                 associated_chunk=d[15], unique_bucket_id=d[16], compute_loss=d[17])
+                 bucket_id=d[10], resource=d[11], compute_stream_id=d[12], custom_metadata=d[13], source_chunk=d[15],
+                 associated_chunk=d[16], unique_bucket_id=d[17], compute_loss=d[18])
         for d in node_data
     ]
     for node, d in zip(nodes, node_data):
@@ -318,7 +319,7 @@ def _rebuild_task_dag(node_data):
         node.data_succs     = [nodes[j] for j in d[7]]
         node.temporal_preds = [nodes[j] for j in d[8]]
         node.temporal_succs = [nodes[j] for j in d[9]]
-        node.uid            = d[13]
+        node.uid            = d[14]
     return TaskDAG(nodes=nodes)
 
 
@@ -346,7 +347,7 @@ class TaskDAG:
                 [idx[id(s)] for s in n.data_succs],
                 [idx[id(p)] for p in n.temporal_preds],
                 [idx[id(s)] for s in n.temporal_succs],
-                n.bucket_id, n.resource, n.custom_metadata, n.uid, n.source_chunk,
+                n.bucket_id, n.resource, n.compute_stream_id, n.custom_metadata, n.uid, n.source_chunk,
                 n.associated_chunk, n.unique_bucket_id, n.compute_loss,
             )
             for n in self.nodes

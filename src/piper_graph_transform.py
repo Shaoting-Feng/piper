@@ -1345,6 +1345,7 @@ def _splice_a2a_nodes(
                     custom_metadata={"a2a_tensor_idx": boundaries[bkt_id]},
                     source_chunk=source_chunk,
                     associated_chunk=source_chunk,
+                    compute_stream_id=task.compute_stream_id,
                 )
                 # Rewire data: task → next_task  ⟹  task → a2a → next_task
                 task.data_succs.remove(next_task)
@@ -1376,6 +1377,7 @@ def _splice_a2a_nodes(
                     custom_metadata={"a2a_tensor_idx": boundaries[bkt_id]},
                     source_chunk=source_chunk,
                     associated_chunk=source_chunk,
+                    compute_stream_id=task.compute_stream_id,
                 )
                 # Rewire data: prev_task → task  ⟹  prev_task → a2a → task
                 prev_task.data_succs.remove(task)
@@ -1435,6 +1437,7 @@ def _build_chunk_task_chain(
             time_step=col_idx,
             source_chunk=chunk,
             associated_chunk=chunk,
+            compute_stream_id="comp_stream",
         )
         return [task], task, task
 
@@ -1451,6 +1454,7 @@ def _build_chunk_task_chain(
                 bucket_id=b,
                 source_chunk=chunk,
                 associated_chunk=chunk,
+                compute_stream_id="comp_stream",
             )
             for i, b in enumerate(range(K))
         ]
@@ -1466,6 +1470,7 @@ def _build_chunk_task_chain(
                 bucket_id=K - 1 - i,
                 source_chunk=chunk,
                 associated_chunk=chunk,
+                compute_stream_id="comp_stream",
             )
             for i in range(K)
         ]
@@ -1686,6 +1691,7 @@ def expand_chunks_to_dags(
             resource="pp_stream",
             source_chunk=src.source_chunk,
             associated_chunk=src.associated_chunk,
+            compute_stream_id=src.compute_stream_id,
         )
         src.data_succs.append(send_node)
         send_node.data_preds.append(src)
@@ -1703,6 +1709,7 @@ def expand_chunks_to_dags(
             resource="pp_stream",
             source_chunk=dst.source_chunk,
             associated_chunk=dst.associated_chunk,
+            compute_stream_id=dst.compute_stream_id,
             custom_metadata=recv_metadata,
         )
         recv_node.data_succs.append(dst)
@@ -1824,6 +1831,7 @@ def add_temporal_dependencies(dag: "TaskDAG", schedule) -> None:
             pp_rank=ref_tail.pp_rank,
             time_step=0,
             source_chunk=non_none[-1][1],
+            compute_stream_id="comp_stream",
         )
 
         # Wire every BWD chunk tail → UPD.
@@ -1922,6 +1930,7 @@ def _zero_task(
         time_step=time_step,
         bucket_id=bucket_id,
         resource=resource,
+        compute_stream_id=ref.compute_stream_id,
         unique_bucket_id=ubid,
         source_chunk=source_chunk or ref.source_chunk,
         associated_chunk=ref.associated_chunk,
@@ -3923,6 +3932,10 @@ def overlap_chunks(rank_dag: TaskDAG, chunk_pairs: list[tuple[Chunk, Chunk]]) ->
     for first_chunk, second_chunk in chunk_pairs:
         first_tasks = _tasks_for_chunk(rank_dag, first_chunk)
         second_tasks = _tasks_for_chunk(rank_dag, second_chunk)
+        for task in first_tasks:
+            task.compute_stream_id = "comp_stream"
+        for task in second_tasks:
+            task.compute_stream_id = "overlapped_comp_stream"
         first_ids = {id(task) for task in first_tasks}
         second_ids = {id(task) for task in second_tasks}
         pair_ids = first_ids | second_ids
