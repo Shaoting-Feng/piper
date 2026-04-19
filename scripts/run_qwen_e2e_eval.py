@@ -249,6 +249,22 @@ def _metrics_name(model: str, exp: Experiment) -> str:
     )
 
 
+def _runner_experiment_name(model: str, exp: Experiment) -> str:
+    bucket_part = (
+        f"-bucket{_format_bucket_size(exp.bucket_size_mb)}"
+        if exp.bucket_size_mb is not None
+        else ""
+    )
+    nsight_part = "-nsight1" if exp.nsight else ""
+    return (
+        f"qwen{model}-sched_{exp.schedule}-pp{exp.pp}-dp{exp.dp}-"
+        f"ep{int(exp.ep)}-zero{exp.zero_stage}{bucket_part}{nsight_part}-"
+        f"bs{exp.batch_size}-sl{exp.seq_len}-mbs{exp.mbs}-"
+        f"ga{int(exp.gradient_accumulation)}-aras{int(exp.ar_a2a_same_stream)}-"
+        f"ozo{int(exp.overlap_zero_ops)}-och{int(exp.overlap_chunks)}"
+    )
+
+
 def _remote_experiment_output_dir(args: argparse.Namespace, exp: Experiment) -> str:
     return f"{args.remote_output_dir.rstrip('/')}/{exp.slug()}"
 
@@ -268,6 +284,15 @@ def _metrics_remote_paths(
             f"{exp.schedule}"
         ),
     ]
+
+
+def _cluster_log_candidates(
+    model: str,
+    exp: Experiment,
+    fetch_dir: Path,
+) -> list[Path]:
+    pattern = f"{_runner_experiment_name(model, exp)}_*.cluster.log"
+    return sorted(fetch_dir.glob(pattern))
 
 
 def _runner_command(args: argparse.Namespace, exp: Experiment, fetch_dir: Path) -> list[str]:
@@ -346,8 +371,18 @@ def _fetch_remote_metrics(
     exp: Experiment,
     destination: Path,
     remote_output_dir: str,
+    remote_metrics_path: str | None = None,
 ) -> bool:
-    for remote_path in _metrics_remote_paths(model, exp, remote_output_dir):
+    remote_paths: list[str] = []
+    if remote_metrics_path:
+        remote_paths.append(remote_metrics_path)
+    remote_paths.extend(_metrics_remote_paths(model, exp, remote_output_dir))
+
+    seen: set[str] = set()
+    for remote_path in remote_paths:
+        if remote_path in seen:
+            continue
+        seen.add(remote_path)
         remote_command = (
             "docker exec piper_ray bash -lc "
             + json.dumps(f"test -f {remote_path} && cat {remote_path}")
@@ -366,6 +401,24 @@ def _fetch_remote_metrics(
         return True
 
     return False
+
+
+def _experiment_fetch_dir(fetch_dir: Path, exp: Experiment) -> Path:
+    return fetch_dir / exp.slug()
+
+
+def _fetched_metrics_path(fetch_dir: Path, exp: Experiment, remote_metrics_path: str | None) -> Path:
+    if remote_metrics_path:
+        return _experiment_fetch_dir(fetch_dir, exp) / Path(remote_metrics_path).name
+    return _experiment_fetch_dir(fetch_dir, exp) / f"{exp.slug()}.metrics"
+
+
+def _copy_local_metrics(source: Path, destination: Path) -> bool:
+    if not source.is_file():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    return True
 
 
 def _fetch_remote_dag_order_logs(
@@ -592,6 +645,25 @@ def _recover_metrics_from_cluster_log(
     if not cluster_log_path.is_file():
         return False
 
+    records: list[dict] = []
+    marker = "metrics_json="
+    for raw_line in cluster_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = _strip_ansi(raw_line)
+        if marker not in line:
+            continue
+        payload = line.split(marker, maxsplit=1)[1].strip()
+        try:
+            records.append(json.loads(payload))
+        except json.JSONDecodeError:
+            continue
+
+    if records:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with open(destination, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(f"rank {record['dp_rank']} metrics_json= {json.dumps(record, sort_keys=True)}\n")
+        return True
+
     dp_rank_by_pid: dict[str, int] = {}
     iter_times_by_pid: dict[str, list[float]] = {}
     peak_memory_by_pid: dict[str, dict[str, dict[str, float | int]]] = {}
@@ -669,23 +741,37 @@ def _recover_metrics_from_fetch_logs(
     fetch_dir: Path,
     destination: Path,
 ) -> bool:
-    bucket_part = (
-        f"-bucket{_format_bucket_size(exp.bucket_size_mb)}"
-        if exp.bucket_size_mb is not None
-        else ""
-    )
-    nsight_part = "-nsight1" if exp.nsight else ""
-    pattern = (
-        f"qwen{args.model}-sched_{exp.schedule}-pp{exp.pp}-dp{exp.dp}-"
-        f"zero{exp.zero_stage}{bucket_part}{nsight_part}-bs{exp.batch_size}-sl{exp.seq_len}-"
-        f"mbs{exp.mbs}-ga{int(exp.gradient_accumulation)}-"
-        f"aras{int(exp.ar_a2a_same_stream)}-ozo{int(exp.overlap_zero_ops)}-"
-        f"och{int(exp.overlap_chunks)}_*.cluster.log"
-    )
-    candidates = sorted(fetch_dir.glob(pattern))
+    fetched_dir = _experiment_fetch_dir(fetch_dir, exp)
+    if fetched_dir.is_dir():
+        for candidate in sorted(fetched_dir.glob("*")):
+            if _copy_local_metrics(candidate, destination) and _parse_metrics_records(destination):
+                return True
+
+    candidates = _cluster_log_candidates(args.model, exp, fetch_dir)
     if not candidates:
         return False
     return _recover_metrics_from_cluster_log(exp, candidates[-1], destination, args.iters)
+
+
+def _extract_remote_metrics_path(log_path: Path) -> str | None:
+    if not log_path.is_file():
+        return None
+
+    metrics_path: str | None = None
+    for raw_line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = _strip_ansi(raw_line)
+        for pattern in (
+            r"benchmark metrics will be saved by the driver to (\S+)",
+            r"Benchmark metrics saved to (\S+)",
+        ):
+            match = re.search(pattern, line)
+            if match:
+                metrics_path = match.group(1)
+    return metrics_path
+
+
+def _extract_remote_metrics_path_from_cluster_log(cluster_log_path: Path) -> str | None:
+    return _extract_remote_metrics_path(cluster_log_path)
 
 
 def _parse_metrics_records(metrics_path: Path) -> list[dict]:
@@ -840,6 +926,8 @@ def _run_experiment(
 ) -> dict[str, object]:
     exp_logs_dir = logs_dir / exp.slug()
     exp_logs_dir.mkdir(parents=True, exist_ok=True)
+    exp_fetch_dir = _experiment_fetch_dir(fetch_dir, exp)
+    exp_fetch_dir.mkdir(parents=True, exist_ok=True)
     log_path = exp_logs_dir / "run.log"
     metrics_path = metrics_dir / f"{exp.slug()}.metrics"
     command = _runner_command(args, exp, fetch_dir)
@@ -885,12 +973,34 @@ def _run_experiment(
             text=True,
         )
 
-    metrics_found = _fetch_remote_metrics(
-        args.model,
-        exp,
-        metrics_path,
-        _remote_experiment_output_dir(args, exp),
-    )
+    remote_metrics_path = _extract_remote_metrics_path(log_path)
+    if remote_metrics_path is None:
+        cluster_log_candidates = _cluster_log_candidates(args.model, exp, fetch_dir)
+        if cluster_log_candidates:
+            remote_metrics_path = _extract_remote_metrics_path_from_cluster_log(cluster_log_candidates[-1])
+
+    fetched_metrics_path = _fetched_metrics_path(fetch_dir, exp, remote_metrics_path)
+    metrics_found = False
+    if remote_metrics_path is not None:
+        metrics_found = _fetch_remote_metrics(
+            args.model,
+            exp,
+            fetched_metrics_path,
+            _remote_experiment_output_dir(args, exp),
+            remote_metrics_path=remote_metrics_path,
+        )
+        if metrics_found:
+            _copy_local_metrics(fetched_metrics_path, metrics_path)
+    if not metrics_found:
+        metrics_found = _fetch_remote_metrics(
+            args.model,
+            exp,
+            fetched_metrics_path,
+            _remote_experiment_output_dir(args, exp),
+            remote_metrics_path=None,
+        )
+        if metrics_found:
+            _copy_local_metrics(fetched_metrics_path, metrics_path)
     dag_order_paths = _fetch_remote_dag_order_logs(args, exp, exp_logs_dir)
     nsight_paths = _copy_experiment_nsight_profiles(exp, log_path, exp_logs_dir)
     if not metrics_found:
@@ -900,18 +1010,21 @@ def _run_experiment(
     status = "success"
     failure_reason = ""
     aggregated: dict[str, object] = {}
-    if result.returncode != 0:
+    if records:
+        aggregated = _aggregate_metrics(records)
+        if result.returncode != 0 and _looks_like_oom(log_path):
+            status = "oom"
+            failure_reason = "oom"
+    elif result.returncode != 0:
         if _looks_like_oom(log_path):
             status = "oom"
             failure_reason = "oom"
         else:
             status = "failed"
             failure_reason = f"runner_exit_{result.returncode}"
-    elif not records:
+    else:
         status = "failed"
         failure_reason = "missing_metrics"
-    else:
-        aggregated = _aggregate_metrics(records)
 
     print(
         f"[{index}/{total}] {status.upper()} {exp.sweep}: {exp.label()} "
@@ -935,6 +1048,7 @@ def _run_experiment(
         "schedule": exp.schedule,
         "pp": exp.pp,
         "dp": exp.dp,
+        "ep": int(exp.ep),
         "zero_stage": exp.zero_stage,
         "bucket_size_mb": _format_bucket_size(exp.bucket_size_mb) if exp.bucket_size_mb is not None else "",
         "batch_size": exp.batch_size,
@@ -1044,6 +1158,7 @@ def _hydrate_existing_rows(existing_rows: list[dict[str, object]]) -> list[dict[
 def _completed_keys_from_metrics(
     experiments: list[Experiment],
     metrics_dir: Path,
+    fetch_dir: Path,
     existing_by_key: dict[tuple[object, ...], dict[str, object]],
 ) -> set[tuple[object, ...]]:
     completed: set[tuple[object, ...]] = set()
@@ -1053,6 +1168,14 @@ def _completed_keys_from_metrics(
             continue
         metrics_path = metrics_dir / f"{exp.slug()}.metrics"
         records = _parse_metrics_records(metrics_path)
+        if not records:
+            fetched_dir = _experiment_fetch_dir(fetch_dir, exp)
+            if fetched_dir.is_dir():
+                for candidate in sorted(fetched_dir.glob("*")):
+                    records = _parse_metrics_records(candidate)
+                    if records:
+                        _copy_local_metrics(candidate, metrics_path)
+                        break
         if records:
             completed.add(exp.key())
     return completed
@@ -1304,7 +1427,7 @@ def main() -> int:
         for key, row in existing_by_key.items()
         if row.get("status") in {"success", "oom"}
     }
-    completed_keys |= _completed_keys_from_metrics(experiments, metrics_dir, existing_by_key)
+    completed_keys |= _completed_keys_from_metrics(experiments, metrics_dir, fetch_dir, existing_by_key)
 
     for exp in experiments:
         existing_row = existing_by_key.get(exp.key())

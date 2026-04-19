@@ -285,21 +285,17 @@ def runtime_sort_key(node: Task) -> tuple:
     """
     priority = {
         TaskType.SEND: 0,
-        TaskType.FREE_FULL_GRADS: 1,
-        TaskType.FREE_FULL_PARAMS: 1,
-        TaskType.FWD_A2A: 2,
-        TaskType.BWD_A2A: 2,
-        TaskType.REDUCE_SCATTER: 3,
-        TaskType.ALL_REDUCE: 3,
-        TaskType.ALL_GATHER: 4,
-        TaskType.FWD: 5,
-        TaskType.BWD: 5,
-        TaskType.BWD_I: 5,
-        TaskType.BWD_W: 5,
-        TaskType.FWD_BWD: 5,
-        TaskType.ALLOC_FULL_PARAMS: 6,
-        TaskType.ALLOC_FULL_GRADS: 6,
-        TaskType.RECV: 7,
+        TaskType.FWD_A2A: 1,
+        TaskType.BWD_A2A: 1,
+        TaskType.REDUCE_SCATTER: 2,
+        TaskType.ALL_REDUCE: 2,
+        TaskType.ALL_GATHER: 3,
+        TaskType.FWD: 4,
+        TaskType.BWD: 4,
+        TaskType.BWD_I: 4,
+        TaskType.BWD_W: 4,
+        TaskType.FWD_BWD: 4,
+        TaskType.RECV: 5,
     }.get(node.task_type, 4)
     return (node.time_step, priority, node.uid)
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from typing import Any, Optional
 
-LOG_LEVEL = "DEBUG"
+LOG_LEVEL = "INFO"
 
 """ 
 Print the backward graph of a tensor
