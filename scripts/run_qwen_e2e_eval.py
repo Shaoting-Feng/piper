@@ -220,6 +220,17 @@ def parse_args() -> argparse.Namespace:
         default=["scalability", "zero", "schedule"],
         help="Subset of e2e sweeps to run. Default: scalability zero schedule",
     )
+    parser.add_argument(
+        "--memory-profile",
+        action="store_true",
+        help="Pass --memory-profile through to run-qwen-ec2.sh / test_qwen.",
+    )
+    parser.add_argument(
+        "--memory-profile-dir",
+        default=None,
+        help="Optional directory on the remote for pickles; forwarded if set.",
+    )
+
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -330,6 +341,12 @@ def _runner_command(args: argparse.Namespace, exp: Experiment, fetch_dir: Path) 
         command.append("--use-inductor")
     else:
         command.append("--no-use-inductor")
+    
+    if args.memory_profile:
+        command.append("--memory-profile")
+        mem_dir = args.memory_profile_dir or f"{remote_output_dir}/memory_snapshots"
+        command.extend(["--memory-profile-dir", mem_dir])
+
     return command
 
 
@@ -448,6 +465,49 @@ def _fetch_remote_dag_order_logs(
 
     return copied_paths
 
+def _fetch_remote_memory_snapshots(
+    args: argparse.Namespace,
+    exp: Experiment,
+    destination: Path,
+    log_path: Path,
+) -> bool:
+    """Copy memory_snapshots/ from piper_ray on every node (head + workers) into destination."""
+    if not args.memory_profile:
+        return False
+
+    remote_snap = f"{_remote_experiment_output_dir(args, exp)}/memory_snapshots"
+    destination.mkdir(parents=True, exist_ok=True)
+
+    any_ok = False
+    for node_label, node_kind, remote_host in _iter_remote_nodes(log_path):
+        stage = f"/tmp/piper_mem_stage_{exp.slug().replace('/', '_')}_{node_label}"
+        remote_command = (
+            f"rm -rf {stage} && mkdir -p {stage} && "
+            f"docker cp piper_ray:{remote_snap} {stage}/ 2>/dev/null || exit 0"
+        )
+        ssh_cmd = (
+            _ssh_head_command(remote_command)
+            if node_kind == "head"
+            else _ssh_worker_command(str(remote_host), remote_command)
+        )
+        subprocess.run(ssh_cmd, check=False, capture_output=True, text=True)
+
+        ok = _scp_from_remote(
+            node_kind=node_kind,
+            remote_host=remote_host,
+            remote_path=f"{stage}/memory_snapshots/.",
+            destination=destination,
+        )
+        any_ok = any_ok or ok
+
+        cleanup_cmd = (
+            _ssh_head_command(f"rm -rf {stage}")
+            if node_kind == "head"
+            else _ssh_worker_command(str(remote_host), f"rm -rf {stage}")
+        )
+        subprocess.run(cleanup_cmd, check=False, capture_output=True, text=True)
+
+    return any_ok
 
 def _strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -1002,6 +1062,10 @@ def _run_experiment(
         if metrics_found:
             _copy_local_metrics(fetched_metrics_path, metrics_path)
     dag_order_paths = _fetch_remote_dag_order_logs(args, exp, exp_logs_dir)
+    if args.memory_profile:
+        snap_dest = exp_logs_dir / "memory_snapshots"
+        _fetch_remote_memory_snapshots(args, exp, snap_dest, log_path)
+
     nsight_paths = _copy_experiment_nsight_profiles(exp, log_path, exp_logs_dir)
     if not metrics_found:
         metrics_found = _recover_metrics_from_fetch_logs(args, exp, fetch_dir, metrics_path)

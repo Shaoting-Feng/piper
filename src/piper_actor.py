@@ -53,6 +53,7 @@ def _create_actors(
     temp_dir: str = None,
     use_inductor: bool = False,
     ar_a2a_same_stream: bool = False,
+    memory_profile: bool = False,
 ):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     world_size = int(os.environ["PIPER_WORLD_SIZE"])
@@ -98,6 +99,7 @@ def _create_actors(
             no_nvtx=no_nvtx,
             use_inductor=use_inductor,
             ar_a2a_same_stream=ar_a2a_same_stream,
+            memory_profile=memory_profile,
         )
         piper_metadata.actors[pp_rank] = actor
 
@@ -125,6 +127,7 @@ class PiperActor:
         no_nvtx: bool = False,
         use_inductor: bool = False,
         ar_a2a_same_stream: bool = False,
+        memory_profile: bool = False,
     ):
         self.logger = create_logger("piper_actor", LOG_LEVEL)
 
@@ -132,6 +135,12 @@ class PiperActor:
         # traversed for stream-sync bookkeeping but never accumulate to p.grad.
         # Suppress the spurious stream-mismatch warning.
         set_warn_on_accumulate_grad_stream_mismatch(False)
+
+
+        if memory_profile:
+            torch.cuda.memory._record_memory_history(
+                enabled="all", context="all", stacks="all", max_entries=5_000_000,
+            )
 
         self.pp_rank = pp_rank
         self.optim_class = optim_class
@@ -264,6 +273,63 @@ class PiperActor:
 
     def get_peak_memory(self):
         return self.global_rank, torch.cuda.max_memory_allocated() / (1024**3)
+
+
+    def start_memory_recording(self, max_entries: int = 100000) -> None:
+        """Begin recording CUDA memory allocation history on this actor's GPU."""
+        torch.cuda.memory._record_memory_history(
+            enabled="all",
+            context="all",
+            stacks="all",
+            max_entries=max_entries,
+        )
+        self.logger.info(
+            f"Actor {self.global_rank}: started CUDA memory recording "
+            f"(max_entries={max_entries})"
+        )
+
+    def dump_memory_snapshot(self, path: str) -> str:
+        """Dump the recorded CUDA memory snapshot to a pickle file.
+
+        Returns the path to the written file.
+        """
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, f"rank{self.global_rank}_memory.pickle")
+        torch.cuda.memory._dump_snapshot(filepath)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        self.logger.info(
+            f"Actor {self.global_rank}: dumped memory snapshot to {filepath}"
+        )
+        return filepath
+
+    def set_oom_snapshot_dir(self, path: str) -> None:
+        """Tell this actor where to drop a memory snapshot if run_dag hits a CUDA OOM."""
+        os.makedirs(path, exist_ok=True)
+        self._oom_snapshot_dir = path
+
+    def _log_mem(self, label: str, extra: str = "") -> None:
+        """Emit a single-line memory trajectory marker to the actor log.
+
+        Captures current/reserved/peak allocator stats plus retry/OOM counters.
+        Cheap: no CUDA sync, just reads allocator counters.
+        """
+        try:
+            alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserv = torch.cuda.memory_reserved() / (1024 ** 3)
+            max_a = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            max_r = torch.cuda.max_memory_reserved() / (1024 ** 3)
+            stats = torch.cuda.memory_stats()
+            active = stats.get("active_bytes.all.current", 0) / (1024 ** 3)
+            retries = stats.get("num_alloc_retries", 0)
+            ooms = stats.get("num_ooms", 0)
+            self.logger.info(
+                f"[mem] rank={self.global_rank} stage={getattr(self, 'pp_rank', '?')} "
+                f"label={label} allocated={alloc:.3f}GB reserved={reserv:.3f}GB "
+                f"max_alloc={max_a:.3f}GB max_res={max_r:.3f}GB active={active:.3f}GB "
+                f"retries={retries} ooms={ooms} {extra}"
+            )
+        except Exception as e:
+            self.logger.warning(f"[mem] log failed (label={label}): {e}")
 
     def _nvtx_push(self, label: str) -> None:
         if not self.no_nvtx:
@@ -944,7 +1010,7 @@ class PiperActor:
                 self.bucket_flat_params[ubid] = flat_params
                 self.bucket_flat_grads[ubid] = (
                     None
-                    if self.zero_stage == 3
+                    if self.zero_stage in (2, 3)
                     else torch.zeros(padded_numel, dtype=self.zero_grad_dtype, device=self.device)
                 )
                 self.bucket_shard_params[ubid] = shard_param
@@ -988,12 +1054,7 @@ class PiperActor:
         # Keep first GraphModule for compatibility with external inspection tools.
         self.graph_modules[stage_id] = first_gm
 
-        allocated_gb = torch.cuda.memory_allocated(self.device) / (1024 ** 3)
-        reserved_gb = torch.cuda.memory_reserved(self.device) / (1024 ** 3)
-        self.logger.debug(
-            f"Actor {self.global_rank} _load_stage stage_id={stage_id}: GPU allocated={allocated_gb:.2f} GB, "
-            f"reserved={reserved_gb:.2f} GB"
-        )
+        self._log_mem(f"post_load_stage_{stage_id}")
 
     # -----------------------------------------------------------------------
     # DAG-based execution
@@ -1336,6 +1397,48 @@ class PiperActor:
             self.task_buffer_refcounts[uid] = remaining
 
     def run_dag(self, loss_fn=None, profiling: bool = False):
+        """Thin wrapper around ``_run_dag_body`` that dumps a CUDA memory
+        snapshot if the body raises ``torch.cuda.OutOfMemoryError``.
+
+        The dump is written to ``self._oom_snapshot_dir`` (set via
+        ``set_oom_snapshot_dir``) or ``/tmp/piper_oom_snapshots`` as a fallback.
+        The original exception is re-raised after the snapshot attempt so the
+        caller (driver) still sees the OOM.
+        """
+        # Mark the entire iteration boundary for the memory-viz timeline.
+        iter_idx = getattr(self, "_iter_counter", 0)
+        self._iter_counter = iter_idx + 1
+        self._nvtx_push(f"iter_{iter_idx}_rank_{self.global_rank}")
+        try:
+            self._log_mem(f"iter_{iter_idx}_start")
+            return self._run_dag_body(loss_fn=loss_fn, profiling=profiling)
+        except torch.cuda.OutOfMemoryError as oom_exc:
+            oom_dir = getattr(self, "_oom_snapshot_dir", None) or "/tmp/piper_oom_snapshots"
+            try:
+                os.makedirs(oom_dir, exist_ok=True)
+                filepath = os.path.join(
+                    oom_dir, f"oom_rank{self.global_rank}_memory.pickle"
+                )
+                torch.cuda.memory._dump_snapshot(filepath)
+                self.logger.error(
+                    f"[OOM] rank={self.global_rank} iter={iter_idx} "
+                    f"dumped snapshot to {filepath}: {oom_exc}"
+                )
+            except Exception as dump_exc:
+                self.logger.error(
+                    f"[OOM] rank={self.global_rank} iter={iter_idx} "
+                    f"snapshot dump FAILED: {dump_exc} (original OOM: {oom_exc})"
+                )
+            try:
+                torch.cuda.memory._record_memory_history(enabled=None)
+            except Exception:
+                pass
+            self._log_mem(f"iter_{iter_idx}_oom")
+            raise
+        finally:
+            self._nvtx_pop()
+
+    def _run_dag_body(self, loss_fn=None, profiling: bool = False):
         """Execute the loaded TaskDAG in topological order.
 
         All inter-task data is routed through ``task_buffer``, keyed by the
@@ -1354,7 +1457,6 @@ class PiperActor:
         assert self.sorted_dag_nodes is not None, "load_dag() must initialize sorted node order"
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
         verbose_enabled = self.logger.isEnabledFor(VERBOSE)
-
         # Reset per-iteration state
         self.task_buffer = {}
         self.task_buffer_refcounts = {}
@@ -1451,6 +1553,24 @@ class PiperActor:
                     f"run_dag dispatch (time {node.time_step}): {task_type.value} "
                     f"mb{mb_idx} ubid={ubid}"
                 )
+
+            # Timeline marker visible in NVTX traces & PyTorch memory-viz.
+            _task_label = f"{task_type.value}_mb{mb_idx}_ubid{ubid}_t{node.time_step}"
+            self._nvtx_push(_task_label)
+            _log_heavy_task = task_type in (
+                TaskType.FWD,
+                TaskType.BWD,
+                TaskType.BWD_I,
+                TaskType.BWD_W,
+                TaskType.FWD_BWD,
+                TaskType.UPD,
+                TaskType.ALLOC_FULL_PARAMS,
+                TaskType.FREE_FULL_PARAMS,
+                TaskType.ALLOC_FULL_GRADS,
+                TaskType.FREE_FULL_GRADS,
+            )
+            if _log_heavy_task:
+                self._log_mem(f"before_{_task_label}")
 
             if profiling:
                 _stream = self._timing_stream(node)
@@ -1956,6 +2076,10 @@ class PiperActor:
                 _mem_after = torch.cuda.memory_allocated()
                 self._prof_records.append((node, mb_idx, ubid, _start_evt, _end_evt, _mem_before))
                 self.logger.info(f"Rank {self.global_rank} task {node.task_type.value} (time {node.time_step}) mem before {_mem_before / 1024 ** 3:.2f} GB after {_mem_after / 1024 ** 3:.2f} GB")
+
+            if _log_heavy_task:
+                self._log_mem(f"after_{_task_label}")
+            self._nvtx_pop()
 
             if verbose_enabled:
                 tb_summary = self._summarize_task_buffer()

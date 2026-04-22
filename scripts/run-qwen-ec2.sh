@@ -60,6 +60,9 @@ GRADIENT_ACCUMULATION_ARG="--gradient-accumulation"
 AR_A2A_SAME_STREAM_ARG="--no-ar-a2a-same-stream"
 OVERLAP_ZERO_OPS_ARG="--no-overlap-zero-ops"
 OVERLAP_CHUNKS_ARG="--no-overlap-chunks"
+MEMORY_PROFILE=false
+MEMORY_PROFILE_DIR=""
+MEMORY_PROFILE_ARG=""
 
 SSH_BASE=(-i "$SSH_KEY" -o StrictHostKeyChecking=no)
 PROXY="ProxyCommand=ssh -i $SSH_KEY -o StrictHostKeyChecking=no -W %h:%p ubuntu@$HEAD_PUBLIC_IP"
@@ -91,6 +94,8 @@ while [[ $# -gt 0 ]]; do
         --use-inductor) USE_INDUCTOR_ARG="--use-inductor"; shift ;;
         --no-use-inductor) USE_INDUCTOR_ARG="--no-use-inductor"; shift ;;
         --log-to-file) LOG_TO_FILE=true; shift ;;
+        --memory-profile) MEMORY_PROFILE=true; shift ;;
+        --memory-profile-dir) MEMORY_PROFILE_DIR="$2"; shift 2 ;;
         --out-dir)     OUT_DIR="$2";     shift 2 ;;
         --remote-output-dir) REMOTE_OUTPUT_DIR="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -230,6 +235,11 @@ SNAPSHOT_DIR="$(mktemp -d)"
 HEAD_SNAPSHOT="$SNAPSHOT_DIR/head.snapshot"
 WORKER_LOG_NODES=()
 
+if $MEMORY_PROFILE; then
+    MEM_DIR="${MEMORY_PROFILE_DIR:-$REMOTE_OUTPUT_DIR/memory_snapshots/${EXPERIMENT_NAME}_${RUN_ID}}"
+    MEMORY_PROFILE_ARG="--memory-profile --memory-profile-dir $MEM_DIR"
+fi
+
 for worker_ip in "${WORKER1_PRIVATE_IP:-}" "${WORKER2_PRIVATE_IP:-}" "${WORKER3_PRIVATE_IP:-}"; do
     if [[ -n "$worker_ip" ]]; then
         WORKER_LOG_NODES+=("$worker_ip")
@@ -273,6 +283,7 @@ run_head_ssh \
      --output-dir $REMOTE_OUTPUT_DIR \
      $USE_INDUCTOR_ARG \
      $NSIGHT_ARG \
+     $MEMORY_PROFILE_ARG \
      --temp-dir /tmp/piper/ray_tmp > $REMOTE_LOG 2>&1'"
 RUN_STATUS=$?
 

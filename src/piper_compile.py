@@ -129,6 +129,7 @@ def piper_setup(
     visualize_dag: bool = True,
     output_dir: str = "out",
     const_attrs: dict = None,
+    memory_profile: bool = False,
 ):
     """
     Compile a model with the piper backend.
@@ -221,6 +222,7 @@ def piper_setup(
         naive_gradient_sync, profile=nsight, stage_to_device=stage_to_device,
         zero_stage=zero_stage, no_nvtx=no_nvtx, pg=pg, temp_dir=temp_dir,
         use_inductor=use_inductor, ar_a2a_same_stream=ar_a2a_same_stream,
+        memory_profile=memory_profile,
     )
 
     if dp_rank == 0:

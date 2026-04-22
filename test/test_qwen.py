@@ -216,6 +216,7 @@ def main(args, pg):
         model_flops_per_token=flops_per_token,
         visualize_dag=args.save_viz,
         output_dir=args.output_dir,
+        memory_profile=args.memory_profile,
         const_attrs={"rope_cache": rope_cache},
         use_inductor=args.use_inductor,
         enable_ep=args.ep,
@@ -226,22 +227,78 @@ def main(args, pg):
 
     del x, y
 
-    logger.info(f"Running {args.warmup} warmup iterations")
-    for _ in range(args.warmup):
-        piper_exec_dag(loss_fn)
-        time.sleep(1)
-
     actors = piper_metadata.actors
+
+    # Configure OOM snapshot destination on every actor so a CUDA OOM inside
+    # run_dag still produces a snapshot for pytorch.org/memory_viz.
+    mem_dir = args.memory_profile_dir or os.path.join(args.output_dir, "memory_snapshots")
+    os.makedirs(mem_dir, exist_ok=True)
+    ray.get([actor.set_oom_snapshot_dir.remote(mem_dir) for actor in actors.values()])
+
+    def _safe_dump_snapshots(reason: str, timeout: float = 30.0) -> None:
+        if not args.memory_profile:
+            return
+        refs_by_rank = {
+            rank: actor.dump_memory_snapshot.remote(mem_dir)
+            for rank, actor in actors.items()
+        }
+        # Use ray.wait with a timeout so a single NCCL-watchdog-hung actor
+        # cannot block the driver for the full NCCL timeout (~10 min).
+        ready, pending = ray.wait(
+            list(refs_by_rank.values()),
+            num_returns=len(refs_by_rank),
+            timeout=timeout,
+        )
+        for ref in ready:
+            try:
+                path = ray.get(ref)
+                logger.info(f"Memory snapshot saved ({reason}): {path}")
+            except Exception as exc:
+                logger.error(f"Snapshot dump failed on an actor ({reason}): {exc}")
+        if pending:
+            stuck_ranks = [
+                rank for rank, ref in refs_by_rank.items() if ref in pending
+            ]
+            logger.error(
+                f"Snapshot dump timed out after {timeout}s on ranks={stuck_ranks} "
+                f"(likely NCCL watchdog hang); skipping."
+            )
+
+    logger.info(f"Running {args.warmup} warmup iterations")
+    try:
+        for _ in range(args.warmup):
+            piper_exec_dag(loss_fn)
+            time.sleep(1)
+    except Exception:
+        _safe_dump_snapshots("warmup_exception")
+        raise
+
+    if args.memory_profile:
+        logger.info(f"Memory profiling enabled — snapshots will be saved under {mem_dir}")
+        try:
+            piper_exec_dag(loss_fn, log_stats=True)
+        finally:
+            _safe_dump_snapshots("profiling_iter")
 
     logger.info(f"Running {args.iters} timed iterations")
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
+    # Record post-reset / pre-training memory state on every actor so the log
+    # shows the baseline right before timed iterations begin.
+    try:
+        ray.get([actor._log_mem.remote("pre_timed_iters") for actor in actors.values()])
+    except Exception as log_exc:
+        logger.warning(f"pre_timed_iters _log_mem failed: {log_exc}")
     iter_times = []
-    for _ in range(args.iters):
-        start = time.perf_counter()
-        losses = piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
-        end = time.perf_counter()
-        iter_times.append(end - start)
-        time.sleep(1)
+    try:
+        for _ in range(args.iters):
+            start = time.perf_counter()
+            losses = piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
+            end = time.perf_counter()
+            iter_times.append(end - start)
+            time.sleep(1)
+    except Exception:
+        _safe_dump_snapshots("timed_iter_exception")
+        raise
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
@@ -375,6 +432,18 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Whether to run overlap_chunks on the per-rank DAGs (default: false)",
+    )
+    parser.add_argument(
+        "--memory-profile",
+        action="store_true",
+        default=False,
+        help="Record a CUDA memory snapshot for one iteration after warmup (PyTorch memory viz)",
+    )
+    parser.add_argument(
+        "--memory-profile-dir",
+        type=str,
+        default="",
+        help="Directory for rank*_memory.pickle (default: <output-dir>/memory_snapshots)",
     )
     return parser.parse_args()
 
