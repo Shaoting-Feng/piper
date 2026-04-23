@@ -265,40 +265,28 @@ def main(args, pg):
             )
 
     logger.info(f"Running {args.warmup} warmup iterations")
-    try:
-        for _ in range(args.warmup):
-            piper_exec_dag(loss_fn)
-            time.sleep(1)
-    except Exception:
-        _safe_dump_snapshots("warmup_exception")
-        raise
+    for _ in range(args.warmup):
+        piper_exec_dag(loss_fn)
+        time.sleep(1)
 
-    if args.memory_profile:
-        logger.info(f"Memory profiling enabled — snapshots will be saved under {mem_dir}")
-        try:
-            piper_exec_dag(loss_fn, log_stats=True)
-        finally:
-            _safe_dump_snapshots("profiling_iter")
+    # if args.memory_profile:
+    #     logger.info(f"Memory profiling enabled — snapshots will be saved under {mem_dir}")
+    #     try:
+    #         piper_exec_dag(loss_fn, log_stats=True)
+    #     finally:
+    #         _safe_dump_snapshots("profiling_iter")
 
     logger.info(f"Running {args.iters} timed iterations")
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
     # Record post-reset / pre-training memory state on every actor so the log
     # shows the baseline right before timed iterations begin.
-    try:
-        ray.get([actor._log_mem.remote("pre_timed_iters") for actor in actors.values()])
-    except Exception as log_exc:
-        logger.warning(f"pre_timed_iters _log_mem failed: {log_exc}")
     iter_times = []
-    try:
-        for _ in range(args.iters):
-            start = time.perf_counter()
-            losses = piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
-            end = time.perf_counter()
-            iter_times.append(end - start)
-            time.sleep(1)
-    except Exception:
-        _safe_dump_snapshots("timed_iter_exception")
-        raise
+    for _ in range(args.iters):
+        start = time.perf_counter()
+        losses = piper_exec_dag(loss_fn, log_stats=True, profiling=args.profiling)
+        end = time.perf_counter()
+        iter_times.append(end - start)
+        time.sleep(1)
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]

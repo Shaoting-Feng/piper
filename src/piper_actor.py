@@ -66,13 +66,16 @@ def _create_actors(
         global_rank = _get_rank(pp_rank, dp_rank, pp_degree)
         nsight_env = {"nsight": {
             "t": "cuda,cudnn,cublas,nvtx",
-            # "cuda-event-trace": "false",
+            "sample": "process-tree",
+            "backtrace": "dwarf",
+            "cudabacktrace": "sync:0,memory:0",
+            "python-backtrace": "cuda",
             "stop-on-exit": "true",
         }} if profile else {}
         nccl_env = {
             "env_vars": {
-                # "NCCL_SOCKET_IFNAME": "ens32",
-                # "GLOO_SOCKET_IFNAME": "ens32",
+                "NCCL_SOCKET_IFNAME": "ens32",
+                "GLOO_SOCKET_IFNAME": "ens32",
                 "NCCL_DEBUG": "WARN",
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
             }
@@ -322,7 +325,7 @@ class PiperActor:
             active = stats.get("active_bytes.all.current", 0) / (1024 ** 3)
             retries = stats.get("num_alloc_retries", 0)
             ooms = stats.get("num_ooms", 0)
-            self.logger.info(
+            self.logger.debug(
                 f"[mem] rank={self.global_rank} stage={getattr(self, 'pp_rank', '?')} "
                 f"label={label} allocated={alloc:.3f}GB reserved={reserv:.3f}GB "
                 f"max_alloc={max_a:.3f}GB max_res={max_r:.3f}GB active={active:.3f}GB "
@@ -1054,7 +1057,7 @@ class PiperActor:
         # Keep first GraphModule for compatibility with external inspection tools.
         self.graph_modules[stage_id] = first_gm
 
-        self._log_mem(f"post_load_stage_{stage_id}")
+        # self._log_mem(f"post_load_stage_{stage_id}")
 
     # -----------------------------------------------------------------------
     # DAG-based execution
@@ -1410,7 +1413,7 @@ class PiperActor:
         self._iter_counter = iter_idx + 1
         self._nvtx_push(f"iter_{iter_idx}_rank_{self.global_rank}")
         try:
-            self._log_mem(f"iter_{iter_idx}_start")
+            # self._log_mem(f"iter_{iter_idx}_start")
             return self._run_dag_body(loss_fn=loss_fn, profiling=profiling)
         except torch.cuda.OutOfMemoryError as oom_exc:
             oom_dir = getattr(self, "_oom_snapshot_dir", None) or "/tmp/piper_oom_snapshots"
@@ -1433,7 +1436,7 @@ class PiperActor:
                 torch.cuda.memory._record_memory_history(enabled=None)
             except Exception:
                 pass
-            self._log_mem(f"iter_{iter_idx}_oom")
+            # self._log_mem(f"iter_{iter_idx}_oom")
             raise
         finally:
             self._nvtx_pop()
@@ -1569,8 +1572,8 @@ class PiperActor:
                 TaskType.ALLOC_FULL_GRADS,
                 TaskType.FREE_FULL_GRADS,
             )
-            if _log_heavy_task:
-                self._log_mem(f"before_{_task_label}")
+            # if _log_heavy_task:
+                # self._log_mem(f"before_{_task_label}")
 
             if profiling:
                 _stream = self._timing_stream(node)
@@ -2077,8 +2080,8 @@ class PiperActor:
                 self._prof_records.append((node, mb_idx, ubid, _start_evt, _end_evt, _mem_before))
                 self.logger.info(f"Rank {self.global_rank} task {node.task_type.value} (time {node.time_step}) mem before {_mem_before / 1024 ** 3:.2f} GB after {_mem_after / 1024 ** 3:.2f} GB")
 
-            if _log_heavy_task:
-                self._log_mem(f"after_{_task_label}")
+            # if _log_heavy_task:
+                # self._log_mem(f"after_{_task_label}")
             self._nvtx_pop()
 
             if verbose_enabled:
@@ -2166,7 +2169,7 @@ class PiperActor:
         Used for both FWD_A2A and BWD_A2A — the operation is symmetric.
         Stream waits and event recording are handled by run_dag.
         """
-        output_buf = torch.empty_like(input_tensor)
+        output_buf = torch.empty_like(input_tensor, device=self.device)
         with torch.cuda.stream(self.a2a_stream):
             dist.all_to_all_single(output_buf, input_tensor, group=self.ep_group)
         return output_buf
