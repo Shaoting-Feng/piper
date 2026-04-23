@@ -28,10 +28,13 @@ def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, training_func: Callab
 class PiperProgramCoordinator:
     """Central Actor that Coordinates all the DP replicas of a single pipeline"""
 
-    def __init__(self, dp_degree, pp_degree):
+    def __init__(self, dp_degree, pp_degree, pp_outer: bool = False):
         self.dp_degree = dp_degree
         self.pp_degree = pp_degree
         self.world_size = dp_degree * pp_degree
+        # pp_outer=True means one PP stage per node (placement bundles keyed by
+        # pp_rank). In that mode DP drivers are spread across the pp bundles.
+        self.pp_outer = pp_outer
 
     def run_program(self, training_func: Callable, pg, *args, **kwargs):
         from .piper_compile import _RANK0_ADDR_ACTOR, _COMPILED_DATA_ACTOR
@@ -51,7 +54,9 @@ class PiperProgramCoordinator:
                 run_dp_rank.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg,
-                        placement_group_bundle_index=dp_rank,
+                        placement_group_bundle_index=(
+                            dp_rank % self.pp_degree if self.pp_outer else dp_rank
+                        ),
                     )
                 ).remote(
                     dp_rank,

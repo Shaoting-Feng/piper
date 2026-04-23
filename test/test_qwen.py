@@ -223,6 +223,7 @@ def main(args, pg):
         ar_a2a_same_stream=args.ar_a2a_same_stream,
         overlap_zero_ops=args.overlap_zero_ops,
         overlap_chunks=args.overlap_chunks,
+        pp_outer=args.pp_outer,
     )
 
     del x, y
@@ -434,6 +435,17 @@ def parse_args():
         help="Whether to run overlap_chunks on the per-rank DAGs (default: false)",
     )
     parser.add_argument(
+        "--pp-outer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use PP as the outer placement dim (one pipeline stage per node, "
+            "all DP replicas for that stage colocated). Makes per-stage EP/DP "
+            "collectives intra-node at the cost of inter-node PP P2P. "
+            "Default: false (one DP replica per node, PP inner)."
+        ),
+    )
+    parser.add_argument(
         "--memory-profile",
         action="store_true",
         default=False,
@@ -477,10 +489,30 @@ if __name__ == "__main__":
             include_dashboard=False,
             _temp_dir=args.temp_dir,
         )
-    pg = placement_group([{"CPU": args.pp, "GPU": args.pp}] * args.dp, strategy="SPREAD")
+    if args.pp_outer:
+        # PP is the outer placement dim: one bundle per pipeline stage, pinned
+        # to its own node via STRICT_SPREAD. Each bundle reserves dp GPUs so
+        # all DP replicas at a given stage colocate on one node, making
+        # per-stage EP AllToAll and DP AllReduce intra-node.
+        # CPU per bundle = dp (one per actor; Ray's actor scheduling default is
+        # num_cpus=1) + ceil(dp/pp) slack for the run_dp_rank driver tasks that
+        # land in this bundle (see PiperProgramCoordinator.run_program).
+        drivers_per_bundle = (args.dp + args.pp - 1) // args.pp
+        pg = placement_group(
+            [{"CPU": args.dp + drivers_per_bundle, "GPU": args.dp}] * args.pp,
+            strategy="STRICT_SPREAD",
+        )
+    else:
+        # Legacy layout: one bundle per DP replica holding all PP ranks.
+        pg = placement_group(
+            [{"CPU": args.pp, "GPU": args.pp}] * args.dp,
+            strategy="SPREAD",
+        )
     ray.get(pg.ready(), timeout=600)
     logger.info(placement_group_table(pg))
-    piper_coordinator = PiperProgramCoordinator.remote(pp_degree=args.pp, dp_degree=args.dp)
+    piper_coordinator = PiperProgramCoordinator.remote(
+        pp_degree=args.pp, dp_degree=args.dp, pp_outer=args.pp_outer,
+    )
     handles = piper_coordinator.run_program.remote(main, pg, args, pg)
     dp_metrics = ray.get(handles)
     open(metrics_path, "w", encoding="utf-8").close()

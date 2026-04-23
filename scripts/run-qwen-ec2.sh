@@ -25,6 +25,11 @@
 #                    Run overlap_zero_ops on the per-rank DAGs (default: off)
 #   --overlap-chunks / --no-overlap-chunks
 #                    Run overlap_chunks on the per-rank DAGs (default: off)
+#   --pp-outer / --no-pp-outer
+#                    Use PP as the outer placement dim (one pipeline stage per
+#                    node, all DP replicas colocated). Makes per-stage EP/DP
+#                    collectives intra-node. Requires dp >= pp for sensible
+#                    packing. Default: off (legacy PP-inner layout).
 #   --warmup N       Warmup iterations (default: $WARMUP or 2)
 #   --iters N        Training iterations (default: $ITERS or 5)
 #   --ray-port PORT  Ray port (default: $RAY_PORT or 6379)
@@ -60,6 +65,7 @@ GRADIENT_ACCUMULATION_ARG="--gradient-accumulation"
 AR_A2A_SAME_STREAM_ARG="--no-ar-a2a-same-stream"
 OVERLAP_ZERO_OPS_ARG="--no-overlap-zero-ops"
 OVERLAP_CHUNKS_ARG="--no-overlap-chunks"
+PP_OUTER_ARG="--no-pp-outer"
 MEMORY_PROFILE=false
 MEMORY_PROFILE_DIR=""
 MEMORY_PROFILE_ARG=""
@@ -87,6 +93,8 @@ while [[ $# -gt 0 ]]; do
         --no-overlap-zero-ops) OVERLAP_ZERO_OPS_ARG="--no-overlap-zero-ops"; shift ;;
         --overlap-chunks) OVERLAP_CHUNKS_ARG="--overlap-chunks"; shift ;;
         --no-overlap-chunks) OVERLAP_CHUNKS_ARG="--no-overlap-chunks"; shift ;;
+        --pp-outer) PP_OUTER_ARG="--pp-outer"; shift ;;
+        --no-pp-outer) PP_OUTER_ARG="--no-pp-outer"; shift ;;
         --warmup)      WARMUP="$2";      shift 2 ;;
         --iters)       ITERS="$2";       shift 2 ;;
         --ray-port)    RAY_PORT="$2";    shift 2 ;;
@@ -197,12 +205,17 @@ if [[ "$OVERLAP_CHUNKS_ARG" == "--overlap-chunks" ]]; then
     OVERLAP_CHUNKS_LABEL=1
 fi
 
+PP_OUTER_LABEL=0
+if [[ "$PP_OUTER_ARG" == "--pp-outer" ]]; then
+    PP_OUTER_LABEL=1
+fi
+
 EP_LABEL=0
 if $EP; then
     EP_LABEL=1
 fi
 
-EXPERIMENT_NAME="qwen${MODEL}-sched_${SCHEDULE}-pp${PP}-dp${DP}-ep${EP_LABEL}-zero${ZERO_STAGE}${BUCKET_SIZE_LABEL}${NSIGHT_LABEL}-bs${BATCH_SIZE}-sl${SEQ_LEN}-mbs${MBS}-ga${GRADIENT_ACCUMULATION_LABEL}-aras${AR_A2A_SAME_STREAM_LABEL}-ozo${OVERLAP_ZERO_OPS_LABEL}-och${OVERLAP_CHUNKS_LABEL}"
+EXPERIMENT_NAME="qwen${MODEL}-sched_${SCHEDULE}-pp${PP}-dp${DP}-ep${EP_LABEL}-zero${ZERO_STAGE}${BUCKET_SIZE_LABEL}${NSIGHT_LABEL}-bs${BATCH_SIZE}-sl${SEQ_LEN}-mbs${MBS}-ga${GRADIENT_ACCUMULATION_LABEL}-aras${AR_A2A_SAME_STREAM_LABEL}-ozo${OVERLAP_ZERO_OPS_LABEL}-och${OVERLAP_CHUNKS_LABEL}-ppo${PP_OUTER_LABEL}"
 
 if $LOG_TO_FILE; then
     mkdir -p "$OUT_DIR"
@@ -276,6 +289,7 @@ run_head_ssh \
      $AR_A2A_SAME_STREAM_ARG \
      $OVERLAP_ZERO_OPS_ARG \
      $OVERLAP_CHUNKS_ARG \
+     $PP_OUTER_ARG \
      --warmup $WARMUP \
      --iters $ITERS \
      --address $HEAD_PRIVATE_IP \

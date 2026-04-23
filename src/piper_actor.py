@@ -54,6 +54,7 @@ def _create_actors(
     use_inductor: bool = False,
     ar_a2a_same_stream: bool = False,
     memory_profile: bool = False,
+    pp_outer: bool = False,
 ):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
     world_size = int(os.environ["PIPER_WORLD_SIZE"])
@@ -77,12 +78,17 @@ def _create_actors(
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
             }
         }
+        # When pp_outer=True, one bundle corresponds to one pipeline stage and
+        # holds all DP replicas for that stage (placement group shape is
+        # [{"GPU": dp}] * pp). Otherwise one bundle is one DP replica holding
+        # all PP ranks (shape is [{"GPU": pp}] * dp).
+        bundle_index = pp_rank if pp_outer else dp_rank
         actor = PiperActor.options(
             num_gpus=0.6,
             runtime_env={**nsight_env, **nccl_env},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=pg,
-                placement_group_bundle_index=dp_rank,
+                placement_group_bundle_index=bundle_index,
             ),
         ).remote(
             pp_rank,
