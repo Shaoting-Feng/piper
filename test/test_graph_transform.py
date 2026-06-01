@@ -11,7 +11,7 @@ inputs rather than represented as get_attr nodes.  This test captures graphs
 in that same way via a custom torch.compile backend.
 
 Usage:
-    python -m src.test_graph_transform
+    python -m test.test_graph_transform
 """
 import argparse
 import copy
@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.fx as fx
 
-from .piper_graph_transform import _split_gm_by_stages, _profile_and_split_gm
+from src.piper_graph_transform import _split_gm_by_stages, _profile_and_split_gm
 
 
 # ---------------------------------------------------------------------------

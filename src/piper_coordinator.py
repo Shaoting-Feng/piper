@@ -2,9 +2,11 @@ import ray
 from typing import Callable
 import os
 
+from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .piper_utils import create_logger, LOG_LEVEL
+from .piper_schedule import load_schedule_info
 
 
 # Coordinator needs GPUs when using profiling to infer stage boundaries
@@ -28,10 +30,17 @@ def run_dp_rank(dp_rank, dp_degree, pp_degree, world_size, training_func: Callab
 class PiperProgramCoordinator:
     """Central Actor that Coordinates all the DP replicas of a single pipeline"""
 
-    def __init__(self, dp_degree, pp_degree, pp_outer: bool = False):
-        self.dp_degree = dp_degree
-        self.pp_degree = pp_degree
-        self.world_size = dp_degree * pp_degree
+    def __init__(
+        self,
+        pp_outer: bool = False,
+        schedule_directives_file: str | None = None,
+    ):
+        if schedule_directives_file is None:
+            raise ValueError("PiperProgramCoordinator requires schedule_directives_file")
+        info = load_schedule_info(schedule_directives_file)
+        self.dp_degree = info["dp_degree"]
+        self.pp_degree = info["pp_degree"]
+        self.world_size = self.dp_degree * self.pp_degree
         # pp_outer=True means one PP stage per node (placement bundles keyed by
         # pp_rank). In that mode DP drivers are spread across the pp bundles.
         self.pp_outer = pp_outer
@@ -70,3 +79,21 @@ class PiperProgramCoordinator:
                 for dp_rank in range(self.dp_degree)
             ]
         )
+
+
+def create_piper_placement_group(schedule_directives_file: str, pp_outer: bool = False):
+    info = load_schedule_info(schedule_directives_file)
+    pp_degree = info["pp_degree"]
+    dp_degree = info["dp_degree"]
+
+    if pp_outer:
+        drivers_per_bundle = (dp_degree + pp_degree - 1) // pp_degree
+        return placement_group(
+            [{"CPU": dp_degree + drivers_per_bundle, "GPU": dp_degree}] * pp_degree,
+            strategy="STRICT_SPREAD",
+        )
+
+    return placement_group(
+        [{"CPU": pp_degree, "GPU": pp_degree}] * dp_degree,
+        strategy="SPREAD",
+    )

@@ -3,35 +3,28 @@ import torch
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List
 import gc
+from concurrent.futures import Future, ThreadPoolExecutor
 from torch.nn import Parameter
-from torch.autograd.graph import GradientEdge, Node, set_warn_on_accumulate_grad_stream_mismatch
+from torch.autograd.graph import GradientEdge, Node
+from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
 import torch.distributed as dist
 from collections import defaultdict
 
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .piper_utils import (
+    _serialize_graphmodule,
     _deserialize_graphmodule,
     create_logger,
     LOG_LEVEL,
-    VERBOSE,
-    NcclOverlapDetector,
 )
 from .backward_utils import get_param_groups, construct_reverse_graph, _get_grad_fn_or_grad_acc
-from .piper_exec import TaskType, TaskDAG, Task, runtime_sort_key
+from .piper_exec import TaskType
+from .piper import _serial_topological_order, _training_dag_task_type
 
 CLEANUP_MEMORY = False
-
-# Disable AOT autograd's donated-buffer optimization so that retain_graph=True
-# works during the split BWD_I pass (which must keep the graph alive for BWD_W).
-# try:
-#     import torch._functorch.config as _tmp_fc
-#     _tmp_fc.donated_buffer = False
-#     del _tmp_fc  # remove from module globals so Ray/cloudpickle never sees it
-# except (ImportError, AttributeError):
-#     pass
 
 logger = create_logger("piper_actor", LOG_LEVEL)
 
@@ -42,18 +35,11 @@ def _get_rank(pp_rank, dp_rank, pp_degree):
 def _create_actors(
     num_actors,
     optim_class,
-    num_mbs,
-    num_stages,
-    naive_gradient_sync=False,
     profile=False,
-    stage_to_device=None,
-    zero_stage: int = 0,
     no_nvtx: bool = False,
     pg=None,
     temp_dir: str = None,
     use_inductor: bool = False,
-    ar_a2a_same_stream: bool = False,
-    memory_profile: bool = False,
     pp_outer: bool = False,
 ):
     dp_rank = int(os.environ["PIPER_DP_RANK"])
@@ -75,9 +61,10 @@ def _create_actors(
         }} if profile else {}
         nccl_env = {
             "env_vars": {
-                "NCCL_SOCKET_IFNAME": "ens32",
-                "GLOO_SOCKET_IFNAME": "ens32",
-                "NCCL_DEBUG": "WARN",
+                # "NCCL_SOCKET_IFNAME": "ens32",
+                # "GLOO_SOCKET_IFNAME": "ens32",
+                # "NCCL_P2P_DISABLE": "1",
+                # "NCCL_DEBUG": "INFO",
                 **({"TMPDIR": temp_dir} if (profile and temp_dir) else {}),
             }
         }
@@ -97,26 +84,14 @@ def _create_actors(
             pp_rank,
             optim_class,
             world_size,
-            num_mbs,
-            num_stages,
-            naive_gradient_sync,
             dp_rank=dp_rank,
             dp_degree=dp_degree,
             pp_degree=pp_degree,
-            stage_to_device=stage_to_device,
-            zero_stage=zero_stage,
             no_nvtx=no_nvtx,
             use_inductor=use_inductor,
-            ar_a2a_same_stream=ar_a2a_same_stream,
-            memory_profile=memory_profile,
         )
         piper_metadata.actors[pp_rank] = actor
 
-
-def _get_actor(pp_rank):
-    from .piper_utils import piper_metadata
-
-    return piper_metadata.actors[pp_rank]
 
 @ray.remote
 class PiperActor:
@@ -125,18 +100,11 @@ class PiperActor:
         pp_rank,
         optim_class,
         world_size,
-        num_mbs,
-        num_stages,
-        naive_gradient_sync=False,
         dp_rank=0,
         dp_degree=1,
         pp_degree=1,
-        stage_to_device=None,
-        zero_stage: int = 0,
         no_nvtx: bool = False,
         use_inductor: bool = False,
-        ar_a2a_same_stream: bool = False,
-        memory_profile: bool = False,
     ):
         self.logger = create_logger("piper_actor", LOG_LEVEL)
 
@@ -145,28 +113,16 @@ class PiperActor:
         # Suppress the spurious stream-mismatch warning.
         set_warn_on_accumulate_grad_stream_mismatch(False)
 
-
-        if memory_profile:
-            torch.cuda.memory._record_memory_history(
-                enabled="all", context="all", stacks="all", max_entries=5_000_000,
-            )
-
         self.pp_rank = pp_rank
         self.optim_class = optim_class
-        self.naive_gradient_sync = naive_gradient_sync
-        self.zero_stage = int(zero_stage)
         self.no_nvtx = no_nvtx
         self.use_inductor = bool(use_inductor)
-        self.ar_a2a_same_stream = bool(ar_a2a_same_stream)
 
         self.dp_rank = dp_rank
         self.dp_degree = dp_degree
         self.pp_degree = pp_degree
         self.world_size = world_size
 
-        self.num_mbs = num_mbs
-        self.num_stages = num_stages
-        self.stage_to_device = stage_to_device or {}
         self.dp_group = None
         self.ep_group = None  # separate NCCL communicator for expert-parallel (all2all) ops
         # Per-direction communicators: (src_global_rank, dst_global_rank) -> ProcessGroup
@@ -184,15 +140,7 @@ class PiperActor:
         self.input = None
         self.labels = None
 
-        self.comp_stream = torch.cuda.Stream()
-        self.overlapped_comp_stream = torch.cuda.Stream()
-        self.ar_stream = torch.cuda.Stream()
-        if self.ar_a2a_same_stream:
-            self.a2a_stream = self.ar_stream
-        else:
-            self.a2a_stream = torch.cuda.Stream()
-        self.p2p_send_stream = torch.cuda.Stream()
-        self.p2p_recv_stream = torch.cuda.Stream()
+        self.streams: dict[str, torch.cuda.Stream] = {}
 
         # map stage id -> original GraphModule (for hook registration)
         self.graph_modules = dict()
@@ -203,13 +151,13 @@ class PiperActor:
         # accumuate loss for each microbatch
         self.loss = []
 
-        self.tracing = False
-        self._pending_timing_events: list = []  # (label, start_event, stop_event)
-        self.trace_data = defaultdict(list)
-        self.memory_tracing_enabled = False
         # DAG execution state
         self.dag = None
         self.sorted_dag_nodes = None
+
+        # PyTorch profiler state (enabled on demand via start_pytorch_profiler).
+        self._pytorch_profiler_enabled = False
+        self._torch_profiler = None
 
         # Unified inter-task buffer.  Keyed by task.uid (int), storing whatever
         # data the task produced for downstream consumers.
@@ -220,12 +168,12 @@ class PiperActor:
         # CUDA events for synchronisation between streams
         self.recv_events: dict = {}   # task_uid -> cuda.Event (for RECV tasks)
         self.a2a_events: dict = {}    # task_uid -> cuda.Event (for FWD_A2A/BWD_A2A tasks)
-        self.ar_events: dict = {}     # unique_bucket_id -> cuda.Event (for ALL_REDUCE tasks)
-        self.rs_events: dict = {}     # unique_bucket_id -> cuda.Event (for REDUCE_SCATTER tasks)
+        self.ar_events: dict = {}     # task_uid -> cuda.Event (for ALL_REDUCE tasks)
+        self.rs_events: dict = {}     # task_uid -> cuda.Event (for REDUCE_SCATTER tasks)
         self.ag_events: dict = {}     # ALL_GATHER task_uid -> cuda.Event
-        self.bwd_events: dict = {}    # unique_bucket_id -> cuda.Event (for BWD/BWD_I/BWD_W tasks)
+        self.bwd_events: dict = {}    # bucket_key -> cuda.Event (for BWD/BWD_I/BWD_W tasks)
 
-        # Per-bucket data keyed by unique_bucket_id (populated by _load_stage).
+        # Per-bucket data keyed by bucket_key (populated by _load_stage).
         # "Bucket" here is a globally unique unit of computation; each stage may
         # contribute one or more buckets.  The actor is agnostic to which stage
         # owns a bucket.
@@ -237,29 +185,26 @@ class PiperActor:
         self.bucket_optims: dict = {}           # ubid -> optimizer (or None)
         self.bucket_trainable_param_idxs: dict = {}  # ubid -> list of trainable param slot indices
         self.bucket_ac_subgraph_counts: dict = {}    # ubid -> number of sequential AC subgraphs
-        self.bucket_flat_params: dict = {}       # ubid -> flat param tensor for ZeRO
-        self.bucket_flat_grads: dict = {}        # ubid -> flat grad tensor for ZeRO
-        self.bucket_shard_params: dict = {}      # ubid -> shard param tensor for ZeRO
-        self.bucket_shard_optims: dict = {}      # ubid -> shard optimizer for ZeRO
-        self.bucket_rs_grads: dict = {}          # ubid -> reduced shard grad tensor for ZeRO-2/3
-        self.zero_grad_dtype = torch.float32     # ZeRO gradient buffers stay fp32
+        self.bucket_flat_params: dict = {}       # ubid -> full flat param tensor for sharded params
+        self.bucket_flat_grads: dict = {}        # ubid -> flat grad tensor for sharded grads
+        self.bucket_shard_params: dict = {}      # ubid -> local optimizer shard param tensor
+        self.bucket_shard_optims: dict = {}      # ubid -> local shard optimizer
+        self.bucket_rs_grads: dict = {}          # ubid -> reduced local shard grad tensor
+        self.grad_buffer_dtype = torch.float32   # sharded gradient buffers stay fp32
         self.param_shard_info: dict = {}         # ubid -> (shard_start, shard_size, orig_numel)
         self.bucket_param_view_specs: dict = {}  # ubid -> [(param, offset, numel, shape)]
-        self.zero3_full_params_fresh: dict = {}  # ubid -> bool
-        self.bucket_param_locks: dict = {}       # ubid -> threading.Lock for full-param alloc/free
-        self.bucket_grad_locks: dict = {}        # ubid -> threading.Lock for full-grad alloc/free
-        self._logged_bucket_forward_info: set = set()
+        self.full_params_fresh: dict = {}        # ubid -> bool
+        self.param_sharded_ubids: set = set()
+        self.grad_sharded_ubids: set = set()
+        self.zero_managed_ubids: set = set()
+        self.cleanup_executor = ThreadPoolExecutor(max_workers=1)
+        self.pending_param_frees: dict[Any, Future] = {}
+        self.pending_grad_frees: dict[Any, Future] = {}
 
         # Non-trainable constant tensor attributes (e.g. freqs_cis, mask) pushed
         # from the coordinator before compilation so _load_stage can fill them in
         # instead of zero-initializing.  Keyed by bare attribute name (e.g. "freqs_cis").
         self.model_const_attrs: dict = {}
-
-        from .piper_utils import piper_metadata
-        piper_metadata.actor_self = self
-
-    def get_trace_data(self) -> dict:
-        return self.global_rank, self.trace_data
 
     def get_and_reset_peak_memory_stats(self) -> tuple:
         """Return (global_rank, max_memory_allocated_bytes) and reset peak stats."""
@@ -267,78 +212,8 @@ class PiperActor:
         torch.cuda.reset_peak_memory_stats()
         return self.global_rank, max_alloc
 
-    def clear_trace_data(self) -> None:
-        self.trace_data.clear()
-        self._pending_timing_events.clear()
-
-    def set_tracing(self, enabled: bool) -> None:
-        self.tracing = enabled
-        self.logger.info(
-            f"Actor {self.global_rank}: Tracing {'enabled' if enabled else 'disabled'}"
-        )
-
     def reset_peak_memory(self):
         torch.cuda.reset_peak_memory_stats()
-
-    def get_peak_memory(self):
-        return self.global_rank, torch.cuda.max_memory_allocated() / (1024**3)
-
-
-    def start_memory_recording(self, max_entries: int = 100000) -> None:
-        """Begin recording CUDA memory allocation history on this actor's GPU."""
-        torch.cuda.memory._record_memory_history(
-            enabled="all",
-            context="all",
-            stacks="all",
-            max_entries=max_entries,
-        )
-        self.logger.info(
-            f"Actor {self.global_rank}: started CUDA memory recording "
-            f"(max_entries={max_entries})"
-        )
-
-    def dump_memory_snapshot(self, path: str) -> str:
-        """Dump the recorded CUDA memory snapshot to a pickle file.
-
-        Returns the path to the written file.
-        """
-        os.makedirs(path, exist_ok=True)
-        filepath = os.path.join(path, f"rank{self.global_rank}_memory.pickle")
-        torch.cuda.memory._dump_snapshot(filepath)
-        torch.cuda.memory._record_memory_history(enabled=None)
-        self.logger.info(
-            f"Actor {self.global_rank}: dumped memory snapshot to {filepath}"
-        )
-        return filepath
-
-    def set_oom_snapshot_dir(self, path: str) -> None:
-        """Tell this actor where to drop a memory snapshot if run_dag hits a CUDA OOM."""
-        os.makedirs(path, exist_ok=True)
-        self._oom_snapshot_dir = path
-
-    def _log_mem(self, label: str, extra: str = "") -> None:
-        """Emit a single-line memory trajectory marker to the actor log.
-
-        Captures current/reserved/peak allocator stats plus retry/OOM counters.
-        Cheap: no CUDA sync, just reads allocator counters.
-        """
-        try:
-            alloc = torch.cuda.memory_allocated() / (1024 ** 3)
-            reserv = torch.cuda.memory_reserved() / (1024 ** 3)
-            max_a = torch.cuda.max_memory_allocated() / (1024 ** 3)
-            max_r = torch.cuda.max_memory_reserved() / (1024 ** 3)
-            stats = torch.cuda.memory_stats()
-            active = stats.get("active_bytes.all.current", 0) / (1024 ** 3)
-            retries = stats.get("num_alloc_retries", 0)
-            ooms = stats.get("num_ooms", 0)
-            self.logger.debug(
-                f"[mem] rank={self.global_rank} stage={getattr(self, 'pp_rank', '?')} "
-                f"label={label} allocated={alloc:.3f}GB reserved={reserv:.3f}GB "
-                f"max_alloc={max_a:.3f}GB max_res={max_r:.3f}GB active={active:.3f}GB "
-                f"retries={retries} ooms={ooms} {extra}"
-            )
-        except Exception as e:
-            self.logger.warning(f"[mem] log failed (label={label}): {e}")
 
     def _nvtx_push(self, label: str) -> None:
         if not self.no_nvtx:
@@ -347,6 +222,71 @@ class PiperActor:
     def _nvtx_pop(self) -> None:
         if not self.no_nvtx:
             torch.cuda.nvtx.range_pop()
+
+    def start_pytorch_profiler(self) -> None:
+        """Begin a torch.profiler session spanning the next run_dag iterations.
+
+        Each node's execution in _run_dag_body is wrapped in a record_function
+        labelled the same as its NVTX range, so the resulting trace identifies
+        per-node work.
+        """
+        self._torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+        )
+        self._torch_profiler.__enter__()
+        self._pytorch_profiler_enabled = True
+        self.logger.info(f"Actor {self.global_rank}: PyTorch profiler started")
+
+    def stop_pytorch_profiler(self, profile_dir: str) -> str:
+        """End the profiler session and export a chrome trace.
+
+        The file is named ``dp{dp_rank}_pp{pp_rank}.json`` inside *profile_dir*
+        so the harness can group same-dp-rank actors. Returns the written path.
+        """
+        self._pytorch_profiler_enabled = False
+        self._torch_profiler.__exit__(None, None, None)
+        os.makedirs(profile_dir, exist_ok=True)
+        filepath = os.path.join(
+            profile_dir, f"dp{self.dp_rank}_pp{self.pp_rank}.json"
+        )
+        self._torch_profiler.export_chrome_trace(filepath)
+        self._torch_profiler = None
+        self.logger.info(
+            f"Actor {self.global_rank}: PyTorch profiler trace written to {filepath}"
+        )
+        return filepath
+
+    def _rf_enter(self, label: str):
+        """Enter a profiler record_function for *label* (no-op unless profiling).
+
+        Returns the entered context (or None) to pass to _rf_exit, mirroring the
+        _nvtx_push/_nvtx_pop pattern so the large match block need not be
+        re-indented under a ``with``.
+
+        While profiling, we also disable multithreaded autograd for the duration
+        of the task. record_function pushes its range onto the *calling* thread's
+        thread-local stack, but the autograd engine normally runs backward on a
+        separate per-device worker thread, so kernels it launches fall outside the
+        label window and appear un-labelled on the GPU streams. Running backward on
+        the calling thread makes the label span every backward kernel. This perturbs
+        timing slightly, which is acceptable for a diagnostic profiling run.
+        """
+        if not self._pytorch_profiler_enabled:
+            return None
+        mt = torch.autograd.set_multithreading_enabled(False)
+        mt.__enter__()
+        rf = torch.profiler.record_function(label)
+        rf.__enter__()
+        return (rf, mt)
+
+    def _rf_exit(self, rf) -> None:
+        if rf is not None:
+            rf_ctx, mt = rf
+            rf_ctx.__exit__(None, None, None)
+            mt.__exit__(None, None, None)
 
     def load_input(self, inputs):
         self.inputs = [inp.to(self.device) for inp in inputs]
@@ -363,36 +303,6 @@ class PiperActor:
         the actor's device so ``_load_stage`` can copy them directly.
         """
         self.model_const_attrs = {k: v.to(self.device) for k, v in const_attrs.items()}
-        self.logger.log(VERBOSE,
-            f"Actor {self.global_rank} loaded {len(self.model_const_attrs)} "
-            f"constant attrs: {list(self.model_const_attrs.keys())}"
-        )
-
-    def _start_timing(self, stream, label):
-        if self.tracing:
-            start = torch.cuda.Event(enable_timing=True)
-            stop = torch.cuda.Event(enable_timing=True)
-            start.record(stream)
-            self._pending_timing_events.append((label, start, stop))
-
-    def _stop_timing(self, stream, label):
-        if self.tracing:
-            for i in range(len(self._pending_timing_events) - 1, -1, -1):
-                lbl, _start, stop = self._pending_timing_events[i]
-                if lbl == label:
-                    stop.record(stream)
-                    break
-
-    def flush_timing_events(self) -> None:
-        """Synchronize all pending timing events and accumulate elapsed times.
-        Call this once per iteration after GPU work completes, instead of
-        synchronizing in _stop_timing which would serialize GPU execution."""
-        if not self.tracing or not self._pending_timing_events:
-            return
-        torch.cuda.synchronize()
-        for label, start, stop in self._pending_timing_events:
-            self.trace_data[label].append(start.elapsed_time(stop))
-        self._pending_timing_events.clear()
 
     def get_node_ip_and_free_port(self):
         import socket
@@ -418,21 +328,11 @@ class PiperActor:
                 rank=self.global_rank,
                 world_size=self.world_size,
             )
-            self.logger.log(VERBOSE,
-                f"Actor {self.global_rank} has GPU {os.environ['CUDA_VISIBLE_DEVICES']}, joined the global process group"
-            )
 
             if self.dp_degree > 1:
                 self._join_dp_process_group()
             if self.pp_degree > 1:
                 self._join_pp_process_group()
-
-            # Force cuBLAS context initialization on both compute streams so the
-            # first backward pass does not encounter a "no current CUDA context" warning.
-            for compute_stream in (self.comp_stream, self.overlapped_comp_stream):
-                with torch.cuda.stream(compute_stream):
-                    _w = torch.zeros(4, 4, device=self.device)
-                    torch.mm(_w, _w)
 
             self.logger.info(f"Actor {self.global_rank} joined process groups")
 
@@ -450,9 +350,6 @@ class PiperActor:
             if self.global_rank % num_dp_groups == dp_group_id:
                 self.dp_group = process_group
                 self.ep_group = ep_process_group
-                self.logger.log(VERBOSE,
-                    f"Global rank {self.global_rank} joined its dp group {dp_group_id} along with ranks {group_ranks}"
-                )
 
     def _join_pp_process_group(self):
         num_pp_groups = self.world_size // self.pp_degree
@@ -468,247 +365,68 @@ class PiperActor:
                 self.pp_lo_hi = lo_hi_group
                 self.pp_hi_lo = hi_lo_group
 
-        self.logger.log(VERBOSE, f"Actor {self.global_rank} created PP communicators")
-
-    def shutdown(self):
-        dist.destroy_process_group()
-
+    def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
+        self.param_sharded_ubids = set()
+        self.grad_sharded_ubids = set()
+        for node in training_dag.nodes.values():
+            meta = getattr(node, "node_meta", {}) or {}
+            ubid = meta.get("bucket_key")
+            if ubid is None:
+                continue
+            if node.node_kind == "ALL_GATHER_COMM":
+                self.param_sharded_ubids.add(ubid)
+            elif node.node_kind == "REDUCE_SCATTER_COMM":
+                self.grad_sharded_ubids.add(ubid)
+        self.zero_managed_ubids = self.param_sharded_ubids | self.grad_sharded_ubids
 
     @staticmethod
-    def _replace_meta_constants(gm, device):
-        """Replace any constants on meta device with tensors on the actual device."""
+    def _node_meta(node: Any) -> dict:
+        meta = getattr(node, "node_meta", None)
+        return meta if isinstance(meta, dict) else {}
+
+    def _node_bucket_key(self, node: Any) -> Any | None:
+        return self._node_meta(node).get("bucket_key")
+
+    def _relocate_meta_devices(self, gm) -> None:
+        """Rewrite baked ``torch.device('meta')`` literals to the actor device.
+
+        Meta-device compilation captures whatever device was current at trace
+        time (inside ``type_as`` / ``.to(device=x.device)`` / device-aware
+        factory ops like ``torch.zeros(..., device=...)``). That literal
+        round-trips through serialization as ``meta`` and would otherwise make
+        those ops emit meta tensors at runtime, mismatching the CUDA inputs.
+        Lifted params/buffers/inputs are unaffected (placed on device directly),
+        so this only touches device literals embedded in node args/kwargs.
+        """
         import torch.fx as fx
-        from .piper_utils import create_logger, LOG_LEVEL
-        from torch._subclasses.fake_tensor import FakeTensor
-        logger = create_logger("piper_actor", LOG_LEVEL)
 
-        replaced_count = 0
-        params_count = 0
-        buffers_count = 0
-        get_attr_count = 0
-        constants_count = 0
-        attrs_count = 0
-        node_args_count = 0
-        node_meta_count = 0
-        submodule_count = 0
+        device = self.device
+        replaced = 0
 
-        def is_meta_or_fake(t):
-            """Check if tensor is on meta device or is a FakeTensor."""
-            if isinstance(t, FakeTensor):
-                return True
-            if isinstance(t, torch.Tensor):
-                return t.device.type == 'meta'
-            return False
+        def _fix(value):
+            nonlocal replaced
+            if isinstance(value, torch.device):
+                if value.type == "meta":
+                    replaced += 1
+                    return torch.device(device)
+                return value
+            if isinstance(value, tuple):
+                return tuple(_fix(v) for v in value)
+            if isinstance(value, list):
+                return [_fix(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _fix(v) for k, v in value.items()}
+            return value
 
-        def replace_meta_tensor(t):
-            if is_meta_or_fake(t):
-                return torch.empty_like(t, device=device)
-            return t
-
-        def replace_in_module(module, module_name=""):
-            """Recursively replace meta tensors in a module and all its submodules."""
-            nonlocal replaced_count, params_count, buffers_count, get_attr_count, constants_count, attrs_count, node_args_count, node_meta_count, submodule_count
-
-            # replace all parameters that are on meta device or FakeTensor
-            for name, param in module.named_parameters(recurse=False):
-                if is_meta_or_fake(param):
-                    full_name = f"{module_name}.{name}" if module_name else name
-                    logger.log(VERBOSE, f"Replacing parameter '{full_name}' from meta/fake to {device} (shape={param.shape}, dtype={param.dtype}, requires_grad={param.requires_grad})")
-                    new_param = torch.empty_like(param, device=device)
-                    new_param.requires_grad_(param.requires_grad)
-                    setattr(module, name, torch.nn.Parameter(new_param, requires_grad=param.requires_grad))
-                    params_count += 1
-                    replaced_count += 1
-
-            # replace all buffers that are on meta device or FakeTensor
-            for name, buffer in module.named_buffers(recurse=False):
-                if is_meta_or_fake(buffer):
-                    full_name = f"{module_name}.{name}" if module_name else name
-                    logger.log(VERBOSE, f"Replacing buffer '{full_name}' from meta/fake to {device} (shape={buffer.shape}, dtype={buffer.dtype})")
-                    new_buffer = torch.empty_like(buffer, device=device)
-                    setattr(module, name, new_buffer)
-                    buffers_count += 1
-                    replaced_count += 1
-
-            # check gm
-            if isinstance(module, fx.GraphModule):
-                # replace in get_attr nodes
-                for node in module.graph.nodes:
-                    if node.op == 'get_attr':
-                        try:
-                            attr_value = getattr(module, node.target)
-                            if is_meta_or_fake(attr_value):
-                                full_name = f"{module_name}.{node.target}" if module_name else node.target
-                                logger.log(VERBOSE, f"Replacing get_attr '{full_name}' from meta/fake to {device} (shape={attr_value.shape}, dtype={attr_value.dtype})")
-                                new_tensor = torch.empty_like(attr_value, device=device)
-                                setattr(module, node.target, new_tensor)
-                                get_attr_count += 1
-                                replaced_count += 1
-                        except AttributeError:
-                            pass
-
-                    # check node.meta for tensor values
-                    if hasattr(node, 'meta') and isinstance(node.meta, dict):
-                        for key, value in node.meta.items():
-                            if is_meta_or_fake(value):
-                                full_name = f"{module_name}.{node.name}.meta['{key}']" if module_name else f"{node.name}.meta['{key}']"
-                                logger.log(VERBOSE, f"Replacing node.meta['{key}'] for node '{node.name}' from meta/fake to {device} (shape={value.shape}, dtype={value.dtype})")
-                                node.meta[key] = torch.empty_like(value, device=device)
-                                node_meta_count += 1
-                                replaced_count += 1
-
-                # replace in constants dict if it exists
-                if hasattr(module, '_constants'):
-                    for key, value in module._constants.items():
-                        if is_meta_or_fake(value):
-                            full_name = f"{module_name}._constants['{key}']" if module_name else f"_constants['{key}']"
-                            logger.log(VERBOSE, f"Replacing constant '{full_name}' from meta/fake to {device} (shape={value.shape}, dtype={value.dtype})")
-                            module._constants[key] = torch.empty_like(value, device=device)
-                            constants_count += 1
-                            replaced_count += 1
-
-                # traverse all nodes and replace meta tensors in args/kwargs
-                for node in module.graph.nodes:
-                    # replace in args
-                    new_args = []
-                    for arg in node.args:
-                        if is_meta_or_fake(arg):
-                            full_name = f"{module_name}.{node.name}" if module_name else node.name
-                            logger.log(VERBOSE, f"Replacing meta/fake tensor in node '{full_name}' args (shape={arg.shape}, dtype={arg.dtype})")
-                            new_args.append(torch.empty_like(arg, device=device))
-                            node_args_count += 1
-                            replaced_count += 1
-                        elif isinstance(arg, torch.device) and arg.type == 'meta':
-                            # replace meta device objects with the actual device
-                            full_name = f"{module_name}.{node.name}" if module_name else node.name
-                            logger.log(VERBOSE, f"Replacing meta device object in node '{full_name}' args with {device}")
-                            new_args.append(torch.device(device))
-                            node_args_count += 1
-                            replaced_count += 1
-                        elif isinstance(arg, (list, tuple)):
-                            new_args.append(type(arg)(replace_meta_tensor(x) for x in arg))
-                        else:
-                            new_args.append(arg)
-                    node.args = tuple(new_args)
-
-                    # replace in kwargs
-                    new_kwargs = {}
-                    for key, value in node.kwargs.items():
-                        if is_meta_or_fake(value):
-                            full_name = f"{module_name}.{node.name}" if module_name else node.name
-                            logger.log(VERBOSE, f"Replacing meta/fake tensor in node '{full_name}' kwargs['{key}'] (shape={value.shape}, dtype={value.dtype})")
-                            new_kwargs[key] = torch.empty_like(value, device=device)
-                            node_args_count += 1
-                            replaced_count += 1
-                        elif isinstance(value, torch.device) and value.type == 'meta':
-                            # replace meta device objects with the actual device
-                            full_name = f"{module_name}.{node.name}" if module_name else node.name
-                            logger.log(VERBOSE, f"Replacing meta device object in node '{full_name}' kwargs['{key}'] with {device}")
-                            new_kwargs[key] = torch.device(device)
-                            node_args_count += 1
-                            replaced_count += 1
-                        elif isinstance(value, (list, tuple)):
-                            new_kwargs[key] = type(value)(replace_meta_tensor(x) for x in value)
-                        else:
-                            new_kwargs[key] = value
-                    node.kwargs = new_kwargs
-
-                # recompile the GraphModule after modifications
+        for module in gm.modules():
+            if not isinstance(module, fx.GraphModule):
+                continue
+            before = replaced
+            for node in module.graph.nodes:
+                node.args = _fix(node.args)
+                node.kwargs = _fix(node.kwargs)
+            if replaced != before:
                 module.recompile()
-
-            # recursively process all submodules
-            for name, submodule in module.named_children():
-                submodule_name = f"{module_name}.{name}" if module_name else name
-                replace_in_module(submodule, submodule_name)
-                submodule_count += 1
-
-        replace_in_module(gm)
-
-        if replaced_count > 0:
-            logger.log(VERBOSE,
-                f"_replace_meta_constants: Replaced {replaced_count} meta device tensors "
-                f"(params: {params_count}, buffers: {buffers_count}, get_attr: {get_attr_count}, "
-                f"constants: {constants_count}, attrs: {attrs_count}, node_args: {node_args_count}, "
-                f"node_meta: {node_meta_count}, checked {submodule_count} submodules)"
-            )
-        else:
-            logger.log(VERBOSE, f"_replace_meta_constants: No meta device tensors found to replace! (checked {submodule_count} submodules)")
-
-        return gm
-
-    def _load_stage_kernels(self):
-        try:
-            try:
-                import torchtitan.models.common.moe.kernels
-                import torchtitan.models.common.moe.utils
-                from torchtitan.models.common.moe.kernels import generate_permute_indices
-                from torchtitan.models.common.moe.kernels import fill_indices_wrapper
-            except ModuleNotFoundError:
-                import torchtitan.models.moe.kernels
-                import torchtitan.models.moe.utils
-                from torchtitan.models.moe.kernels import generate_permute_indices
-                from torchtitan.models.moe.kernels import fill_indices_wrapper
-            import torch._higher_order_ops.triton_kernel_wrap
-            self.logger.log(VERBOSE, f"Actor {self.global_rank} imported and initialized Triton kernel modules")
-        except ImportError as e:
-            self.logger.warning(
-                f"Actor {self.global_rank} failed to import Triton kernel modules: {e}. "
-                f"This may cause issues with Triton kernels in the graph."
-            )
-
-        # HACK: manually register Triton kernel in the side table
-        # the graph expects kernel_idx=0, so we need to register it at that index
-        self.logger.log(VERBOSE, f"Manually registering Triton kernel at index 0 on actor {self.global_rank}...")
-        try:
-            # Import the kernel wrapper
-            try:
-                from torchtitan.models.common.moe.kernels import fill_indices_wrapper
-            except ModuleNotFoundError:
-                from torchtitan.models.moe.kernels import fill_indices_wrapper
-
-            # create a dummy function that uses the Triton kernel
-            # This needs to be compiled with torch.compile to register the kernel
-            def dummy_kernel_user(tokens, starts, offsets):
-                return fill_indices_wrapper(
-                    tokens, starts, offsets,
-                    experts_per_rank=1, num_ranks=1, max_len=8, block_size=128
-                )
-
-            # Compile the function to trigger kernel registration
-            device_idx = int(self.device.split(":")[1]) if ":" in self.device else 0
-            with torch.cuda.device(device_idx):
-                # Create dummy inputs
-                dummy_tokens = torch.zeros(8, dtype=torch.int32, device=self.device)
-                dummy_start = torch.zeros(8, dtype=torch.int64, device=self.device)
-                dummy_offsets = torch.zeros(1, dtype=torch.int64, device=self.device)
-
-                # Compile and run to register the kernel
-                compiled_dummy = torch.compile(dummy_kernel_user, mode="reduce-overhead")
-                _ = compiled_dummy(dummy_tokens, dummy_start, dummy_offsets)
-
-            # Register the kernel at index 0 in id_to_kernel (kernel_idx=0 is baked into
-            # compiled graphs; constant_args are restored separately in _load_stage).
-            from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
-            if hasattr(kernel_side_table, 'id_to_kernel'):
-                registered_kernels = list(kernel_side_table.id_to_kernel.items())
-                if registered_kernels:
-                    max_idx, kernel = max(registered_kernels, key=lambda x: x[0])
-                    kernel_side_table.id_to_kernel[0] = kernel
-                    self.logger.log(VERBOSE,
-                        f"Actor {self.global_rank} registered kernel at id_to_kernel[0] "
-                        f"(copied from index {max_idx})"
-                    )
-                else:
-                    self.logger.warning(
-                        f"Actor {self.global_rank} no kernels found in side table after dummy compile"
-                    )
-        except Exception as e:
-            self.logger.warning(
-                f"Actor {self.global_rank} failed to manually register kernel: {e}. "
-                f"This may cause Triton kernel errors."
-            )
-            import traceback
-            self.logger.info(f"Traceback: {traceback.format_exc()}")
 
     def _load_stage(
         self,
@@ -720,12 +438,11 @@ class PiperActor:
         """Load a (possibly bucketed) stage.
 
         *modules_data* is a list of dicts, one per module/bucket, each with keys:
-        ``gm_data``, ``graphargs``, ``input_idxs``, ``param_idxs``, ``unique_bucket_id``.
+        ``gm_data``, ``graphargs``, ``input_idxs``, ``param_idxs``, ``bucket_key``.
 
         A non-bucketed stage is represented as a single-element list.
-        All per-bucket data structures are keyed by ``unique_bucket_id`` — the
-        globally unique bucket index assigned by piper.py — so that run_dag can
-        look up bucket data without knowing which stage owns a bucket.
+        All per-bucket data structures are keyed by ``bucket_key`` so run_dag
+        can look up bucket data without knowing which stage owns a bucket.
         """
         self.logger.debug(
             f"Loading stage {stage_id} ({len(modules_data)} module(s)) on actor {self.global_rank}"
@@ -734,55 +451,26 @@ class PiperActor:
         g = torch.Generator(device=self.device)
         g.manual_seed(1000 * self.global_rank + stage_id)
 
-        self._load_stage_kernels()
-
-        # Restore triton kernel constant_args that were captured at compile time.
-        try:
-            from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
-            for bd in modules_data:
-                if "triton_constant_args_list" in bd:
-                    const_arg_sets = bd.get("triton_constant_args_list", [])
-                else:
-                    const_arg_sets = [bd.get("triton_constant_args", {})]
-                for arg_set in const_arg_sets:
-                    for idx, args in arg_set.items():
-                        kernel_side_table.constant_args[int(idx)] = args
-        except Exception as e:
-            self.logger.warning(f"Actor {self.global_rank} failed to restore triton constant_args: {e}")
-
         first_gm = None
 
         for b_idx, bd in enumerate(modules_data):
-            ubid: int = bd["unique_bucket_id"]
+            ubid: Any = bd["bucket_key"]
             ac_num_subgraphs = int(bd.get("ac_num_subgraphs", 1))
             ac_requested_subgraphs = int(bd.get("ac_requested_subgraphs", ac_num_subgraphs))
             gms = [_deserialize_graphmodule(gm_data) for gm_data in bd["gm_data_list"]] if "gm_data_list" in bd else [_deserialize_graphmodule(bd["gm_data"])]
-            gms = [self._replace_meta_constants(gm, self.device) for gm in gms]
+            for gm in gms:
+                self._relocate_meta_devices(gm)
             if self.use_inductor:
                 compiled_gms = []
                 for subgraph_idx, gm in enumerate(gms):
-                    try:
-                        compiled_gm = torch.compile(gm)
-                        compiled_gms.append(compiled_gm)
-                        self.logger.debug(
-                            f"[load_stage_compile] rank={self.global_rank} stage={stage_id} "
-                            f"ubid={ubid} subgraph={subgraph_idx} compiled=True"
-                        )
-                    except Exception as exc:
-                        self.logger.warning(
-                            f"[load_stage_compile] rank={self.global_rank} stage={stage_id} "
-                            f"ubid={ubid} subgraph={subgraph_idx} compiled=False error={exc}"
-                        )
-                        compiled_gms.append(gm)
+                    compiled_gm = torch.compile(gm)
+                    compiled_gms.append(compiled_gm)
+                    self.logger.debug(
+                        f"[load_stage_compile] rank={self.global_rank} stage={stage_id} "
+                        f"ubid={ubid} subgraph={subgraph_idx} compiled=True"
+                    )
                 gms = compiled_gms
-            # if "gm_data_list" in bd:
-            #     gms = [
-            #         self._replace_meta_constants(_deserialize_graphmodule(gm_data), self.device)
-            #         for gm_data in bd["gm_data_list"]
-            #     ]
-            # else:
-            #     gms = [self._replace_meta_constants(_deserialize_graphmodule(bd["gm_data"]), self.device)]
-            
+
             if b_idx == 0:
                 first_gm = gms[0]
 
@@ -793,30 +481,11 @@ class PiperActor:
             shared_placeholder_names = list(
                 bd.get("shared_placeholder_names", bd.get("placeholder_names", []))
             )
-            input_placeholder_names = [
-                shared_placeholder_names[i] if 0 <= i < len(shared_placeholder_names) else f"<missing:{i}>"
-                for i in b_input_idxs
-            ]
-            param_placeholder_names = [
-                shared_placeholder_names[i] if 0 <= i < len(shared_placeholder_names) else f"<missing:{i}>"
-                for i in b_param_idxs
-            ]
-            self.logger.log(VERBOSE,
-                f"[load_stage_bucket] rank={self.global_rank} stage={stage_id} "
-                f"ubid={ubid} shared_placeholders={shared_placeholder_names} "
-                f"input_idxs={b_input_idxs} input_placeholders={input_placeholder_names} "
-                f"param_idxs={b_param_idxs} param_placeholders={param_placeholder_names}"
-            )
-
             # Extract FX placeholder names for each param index.
             self.bucket_param_names[ubid] = [
                 shared_placeholder_names[i] if i < len(shared_placeholder_names) else f"ubid{ubid}_p{i}"
                 for i in b_param_idxs
             ]
-
-            self.logger.log(VERBOSE,
-                f"Stage {stage_id} bucket {b_idx} (ubid={ubid}) input indices: {b_input_idxs}"
-            )
 
             # Save input tensor metadata for pre-allocating FWD recv buffers.
             # Stored as a list of (shape, dtype, requires_grad) in input-slot order.
@@ -910,33 +579,6 @@ class PiperActor:
                             call_args.append(dynamic_name_to_value[name])
                         else:
                             call_args.append(shared_args[_name_to_idx[name]])
-                    try:
-                        self.logger.debug(
-                            f"[bucket_fwd_call] rank={self.global_rank} stage={_stage_id} "
-                            f"ubid={_ubid} subgraph={subgraph_idx} "
-                            f"shared_placeholders={list(_shared_placeholder_names)} "
-                            f"placeholders={placeholder_names} "
-                            f"dynamic_names={dynamic_names}"
-                        )
-                        zero_storage = []
-                        for name, arg in zip(placeholder_names, call_args):
-                            if not isinstance(arg, torch.Tensor):
-                                continue
-                            storage = arg.untyped_storage()
-                            storage_size = storage.size()
-                            if storage_size == 0:
-                                zero_storage.append(
-                                    f"{name}: shape={tuple(arg.shape)} stride={tuple(arg.stride())} "
-                                    f"requires_grad={arg.requires_grad} dtype={arg.dtype} "
-                                    f"device={arg.device} storage_offset={arg.storage_offset()}"
-                                )
-                        if zero_storage:
-                            self.logger.error(
-                                f"[bucket_fwd_zero_storage] rank={self.global_rank} stage={_stage_id} "
-                                f"ubid={_ubid} subgraph={subgraph_idx}: " + " | ".join(zero_storage)
-                            )
-                    except Exception:
-                        self.logger.debug("bucket forward pre-call logging failed", exc_info=True)
                     if _use_ac:
                         out = torch.utils.checkpoint.checkpoint(
                             forward_impl,
@@ -944,32 +586,7 @@ class PiperActor:
                             use_reentrant=False,
                         )
                     else:
-                        try:
-                            out = forward_impl(*call_args)
-                        except Exception as exc:
-                            tensor_summaries = []
-                            for name, arg in zip(placeholder_names, call_args):
-                                if isinstance(arg, torch.Tensor):
-                                    storage = arg.untyped_storage()
-                                    tensor_summaries.append(
-                                        f"{name}: shape={tuple(arg.shape)} stride={tuple(arg.stride())} "
-                                        f"requires_grad={arg.requires_grad} dtype={arg.dtype} "
-                                        f"device={arg.device} storage_size={storage.size()} "
-                                        f"storage_offset={arg.storage_offset()}"
-                                    )
-                                else:
-                                    tensor_summaries.append(f"{name}: type={type(arg).__name__}")
-                            self.logger.error(
-                                f"[bucket_fwd_exception] rank={self.global_rank} stage={_stage_id} "
-                                f"ubid={_ubid} subgraph={subgraph_idx} "
-                                f"shared_placeholders={list(_shared_placeholder_names)} "
-                                f"placeholders={placeholder_names} "
-                                f"dynamic_names={dynamic_names} "
-                                f"exc_type={type(exc).__name__} exc={exc} "
-                                f"args={' | '.join(tensor_summaries)}",
-                                exc_info=True,
-                            )
-                            raise
+                        out = forward_impl(*call_args)
                 return out
 
             self.bucket_fwd_fns[ubid] = _bucket_forward_runner
@@ -982,7 +599,16 @@ class PiperActor:
             ]
             self.bucket_trainable_param_idxs[ubid] = trainable_idxs
 
-            if self.zero_stage > 0 and self.dp_degree > 1 and apply_zero and trainable_idxs:
+            zero_managed = (
+                self.dp_degree > 1
+                and apply_zero
+                and bool(trainable_idxs)
+                and ubid in self.zero_managed_ubids
+            )
+            params_sharded = ubid in self.param_sharded_ubids
+            grads_sharded = ubid in self.grad_sharded_ubids
+
+            if zero_managed:
                 trainable = [realized[i] for i in trainable_idxs]
                 flat_params = torch.cat([p.detach().view(-1) for p in trainable]).contiguous()
                 flat_params.requires_grad_(False)
@@ -1002,12 +628,12 @@ class PiperActor:
                     realized[idx] = realized[idx].detach()
                     realized[idx].data = flat_params[offset:offset + numel].view(p.shape)
                     realized[idx].requires_grad_(True)
-                    realized[idx].grad_dtype = self.zero_grad_dtype
+                    realized[idx].grad_dtype = self.grad_buffer_dtype
                     view_specs.append((realized[idx], offset, numel, tuple(p.shape)))
                     offset += numel
 
                 shard_start = self.dp_rank * shard_size
-                if self.zero_stage == 3:
+                if params_sharded:
                     shard_param = flat_params[shard_start:shard_start + shard_size].detach().clone()
                 else:
                     shard_param = flat_params[shard_start:shard_start + shard_size]
@@ -1019,21 +645,21 @@ class PiperActor:
                 self.bucket_flat_params[ubid] = flat_params
                 self.bucket_flat_grads[ubid] = (
                     None
-                    if self.zero_stage in (2, 3)
-                    else torch.zeros(padded_numel, dtype=self.zero_grad_dtype, device=self.device)
+                    if grads_sharded
+                    else torch.zeros(padded_numel, dtype=self.grad_buffer_dtype, device=self.device)
                 )
                 self.bucket_shard_params[ubid] = shard_param
                 self.bucket_shard_optims[ubid] = self.optim_class([shard_param])
-                self.bucket_rs_grads[ubid] = torch.zeros(
-                    shard_size, dtype=self.zero_grad_dtype, device=self.device
+                self.bucket_rs_grads[ubid] = (
+                    torch.zeros(shard_size, dtype=self.grad_buffer_dtype, device=self.device)
+                    if grads_sharded
+                    else None
                 )
                 self.param_shard_info[ubid] = (shard_start, shard_size, orig_numel)
                 self.bucket_param_view_specs[ubid] = view_specs
-                self.zero3_full_params_fresh[ubid] = False
-                # self.bucket_param_locks[ubid] = threading.Lock()
-                # self.bucket_grad_locks[ubid] = threading.Lock()
+                self.full_params_fresh[ubid] = False
 
-                if self.zero_stage == 3:
+                if params_sharded:
                     storage = flat_params.untyped_storage()
                     if storage.size() != 0:
                         storage.resize_(0)
@@ -1044,112 +670,183 @@ class PiperActor:
                 self.bucket_param_view_specs[ubid] = []
                 self.bucket_flat_params[ubid] = None
                 self.bucket_flat_grads[ubid] = None
-                self.bucket_param_locks.pop(ubid, None)
-                self.bucket_grad_locks.pop(ubid, None)
                 trainable_for_optim = [realized[i] for i in trainable_idxs]
                 optim = self.optim_class(trainable_for_optim, fused=True) if trainable_for_optim else None
             self.bucket_optims[ubid] = optim
 
-            self.logger.log(VERBOSE,
-                f"[ac_bucket] rank={self.global_rank} stage={stage_id} bucket={b_idx} "
-                f"ubid={ubid}: ac_enabled={use_activation_checkpointing} "
-                f"requested_subgraphs={ac_requested_subgraphs} "
-                f"actual_subgraphs={ac_num_subgraphs} inputs={len(b_input_idxs)} "
-                f"params={len(b_param_idxs)} trainable_params={len(trainable_idxs)} "
-                f"apply_zero={apply_zero}"
-            )
-
-
         # Keep first GraphModule for compatibility with external inspection tools.
         self.graph_modules[stage_id] = first_gm
-
-        # self._log_mem(f"post_load_stage_{stage_id}")
 
     # -----------------------------------------------------------------------
     # DAG-based execution
     # -----------------------------------------------------------------------
 
-    def load_dag(self, dag: TaskDAG) -> None:
-        """Store the per-rank TaskDAG for subsequent run_dag() calls."""
-        self.dag = dag
-        self.sorted_dag_nodes = sorted(dag.nodes, key=runtime_sort_key)
+    def _stream_id(self, node_or_stream: Any) -> str:
+        if isinstance(node_or_stream, str):
+            return node_or_stream
+        return str(getattr(node_or_stream, "stream", "default_stream"))
 
-    def get_all_params(self) -> dict:
-        """Return {unique_bucket_id: flat_cpu_tensor} for every trainable bucket."""
-        result: dict = {}
-        for ubid, trainable_idxs in self.bucket_trainable_param_idxs.items():
-            params = []
-            bucket_args = self.bucket_fwd_args.get(ubid, [])
-            for idx in trainable_idxs:
-                tensor = bucket_args[idx]
-                if tensor is not None:
-                    params.append(tensor.detach().cpu().view(-1))
-            if params:
-                result[ubid] = torch.cat(params).clone()
-        return result
-
-    def get_named_params(self) -> dict:
-        """Return {fx_placeholder_name: cpu_float32_tensor} for all trainable params."""
-        result: dict = {}
-        for ubid, b_fwd_args in self.bucket_fwd_args.items():
-            b_param_idxs = self.bucket_param_idxs[ubid]
-            names = self.bucket_param_names.get(ubid, [])
-            for i, idx in enumerate(b_param_idxs):
-                p = b_fwd_args[idx]
-                if p is not None and p.requires_grad:
-                    name = names[i] if i < len(names) else f"ubid{ubid}_p{i}"
-                    result[name] = p.detach().cpu().clone().float()
-        return result
-
-    def set_named_params(self, named_params: dict) -> None:
-        """Load parameter values from ``{fx_placeholder_name: tensor}`` dict."""
-        for ubid, b_fwd_args in self.bucket_fwd_args.items():
-            b_param_idxs = self.bucket_param_idxs[ubid]
-            names = self.bucket_param_names.get(ubid, [])
-            for i, idx in enumerate(b_param_idxs):
-                p = b_fwd_args[idx]
-                if p is not None and p.requires_grad:
-                    name = names[i] if i < len(names) else None
-                    if name and name in named_params:
-                        with torch.no_grad():
-                            p.data.copy_(named_params[name].to(p.device, p.dtype))
-
-    def get_bucket_fwd_counts(self) -> dict:
-        """Return the set of unique_bucket_ids loaded on this actor."""
-        return list(self.bucket_fwd_fns.keys())
-
-    def _compute_stream_for_id(self, compute_stream_id: str) -> "torch.cuda.Stream":
-        if compute_stream_id == "overlapped_comp_stream":
-            return self.overlapped_comp_stream
-        return self.comp_stream
-
-    def _compute_stream_for_task(self, task: Task) -> "torch.cuda.Stream":
-        return self._compute_stream_for_id(task.compute_stream_id)
-
-    def _timing_stream(self, task) -> "torch.cuda.Stream":
-        """Return the CUDA stream that drives work for the given task type."""
-        task_type = task.task_type
-        if task_type == TaskType.SEND:
-            return self.p2p_send_stream
-        if task_type == TaskType.RECV:
-            return self.p2p_recv_stream
-        if task_type in (TaskType.FWD_A2A, TaskType.BWD_A2A):
-            return self.a2a_stream
-        if task_type in (TaskType.ALL_REDUCE, TaskType.REDUCE_SCATTER, TaskType.ALL_GATHER):
-            return self.ar_stream
-        return self._compute_stream_for_task(task)
-
-    def get_node_runtimes(self) -> dict:
-        """Return ``{uid: profiling_measurements}`` for every profiled DAG node.
-
-        Only nodes that have at least one measurement are included.  Call this
-        after one or more ``run_dag(profiling=True)`` iterations.
-        """
-        return {
-            node.uid: list(node.profiling_measurements)
-            for node in self.dag.nodes
-            if node.profiling_measurements
+    def _initialize_streams_for_training_dag(self, training_dag: Any) -> None:
+        stream_ids = {
+            self._stream_id(n)
+            for n in training_dag.nodes.values()
+            if getattr(n, "stream", None) is not None
         }
+        stream_ids.add("default_stream")
+        self.streams = {
+            stream_id: torch.cuda.Stream(device=self.device)
+            for stream_id in sorted(stream_ids)
+        }
+
+        # Force cuBLAS context initialization on every logical stream used by
+        # this DAG so the first backward pass does not hit lazy CUDA warnings.
+        for stream in self.streams.values():
+            with torch.cuda.stream(stream):
+                _w = torch.zeros(4, 4, device=self.device)
+                torch.mm(_w, _w)
+
+    def _stream_for_id(self, stream_id: str) -> "torch.cuda.Stream":
+        assert stream_id in self.streams, (
+            f"TrainingDAG referenced stream={stream_id!r}, but load_training_dag "
+            f"initialized only {sorted(self.streams)}"
+        )
+        return self.streams[stream_id]
+
+    def _stream_for_task(self, task: Any) -> "torch.cuda.Stream":
+        return self._stream_for_id(self._stream_id(task))
+
+    def _default_stream(self) -> "torch.cuda.Stream":
+        return self._stream_for_id("default_stream")
+
+    def load_training_dag(self, training_dag: Any) -> None:
+        """Load per-PP-rank TrainingDAG compute nodes using existing _load_stage logic.
+
+        This is an adapter for the new TrainingDAG representation where each
+        COMPUTE/FWD node with ``node_meta['gm']`` is equivalent to one bucket/module.
+        The runtime executes TrainingDAG nodes via ``run_dag``; this method
+        only populates actor-side bucket/module state.
+        """
+        if training_dag is None:
+            raise ValueError("load_training_dag requires non-None training_dag")
+        if not hasattr(training_dag, "nodes"):
+            raise TypeError("load_training_dag expected object with 'nodes' field")
+
+        self._derive_dag_bucket_modes(training_dag)
+        self._initialize_streams_for_training_dag(training_dag)
+
+        # Clear any prior module state before loading a new training DAG.
+        self.graph_modules.clear()
+        self.forward_args.clear()
+        self.forward_input_meta.clear()
+
+        stage_to_modules: dict[int, list[dict]] = defaultdict(list)
+
+        # Deterministic order by stage/segment then uid.
+        compute_nodes = [
+            n for n in training_dag.nodes.values()
+            if getattr(n, "node_kind", None) == "COMPUTE"
+            and getattr(n, "compute_subkind", None) == "FWD"
+        ]
+        compute_nodes.sort(
+            key=lambda n: (
+                int(getattr(n, "node_meta", {}).get("stage_id", 10**9)),
+                int(getattr(n, "node_meta", {}).get("segment_id", 10**9)),
+                str(getattr(n, "uid", "")),
+            )
+        )
+
+        seen_bucket_keys: set[Any] = set()
+        skipped_dupe_fwd_nodes = 0
+        for node in compute_nodes:
+            meta = getattr(node, "node_meta", {}) or {}
+            bucket_key = meta.get("bucket_key", getattr(node, "uid", None))
+            if bucket_key in seen_bucket_keys:
+                skipped_dupe_fwd_nodes += 1
+                continue
+            seen_bucket_keys.add(bucket_key)
+            gm = meta.get("gm")
+            gm_data = meta.get("gm_data")
+            stage_id = meta.get("stage_id")
+            input_idxs = meta.get("input_idxs")
+            param_idxs = meta.get("param_idxs")
+            graphargs = meta.get("graphargs")
+            input_names = meta.get("input_names", [])
+            output_names = meta.get("output_names", [])
+
+            if gm_data is None and gm is None:
+                raise ValueError(
+                    f"load_training_dag: compute node {getattr(node, 'uid', '<unknown>')} "
+                    f"is missing required metadata field 'gm_data' (or fallback 'gm')"
+                )
+            if stage_id is None or input_idxs is None or param_idxs is None or graphargs is None:
+                raise ValueError(
+                    f"load_training_dag: compute node {getattr(node, 'uid', '<unknown>')} "
+                    f"is missing required metadata fields"
+                )
+
+            module_data = {
+                "gm_data": gm_data if gm_data is not None else _serialize_graphmodule(gm),
+                "graphargs": list(graphargs),
+                "input_idxs": list(input_idxs),
+                "param_idxs": list(param_idxs),
+                "placeholder_names": list(input_names),
+                "output_names": list(output_names),
+                "shared_placeholder_names": list(input_names),
+                "bucket_key": bucket_key,
+                "ac_num_subgraphs": 1,
+                "ac_requested_subgraphs": 1,
+                "apply_zero": bool(meta.get("apply_zero", True)),
+                "training_dag_uid": getattr(node, "uid", None),
+                "triton_constant_args": dict(meta.get("triton_constant_args", {})),
+            }
+            stage_to_modules[int(stage_id)].append(module_data)
+
+        assert stage_to_modules, (
+            "load_training_dag: no FWD compute nodes with gm metadata found"
+        )
+
+        for stage_id in sorted(stage_to_modules.keys()):
+            self._load_stage(
+                stage_id=stage_id,
+                modules_data=stage_to_modules[stage_id],
+                a2a_boundaries={},
+                use_activation_checkpointing=False,
+            )
+
+        # Build runtime adjacency on TrainingDAG nodes so run_dag can execute directly.
+        for n in training_dag.nodes.values():
+            n.data_preds = []
+            n.data_succs = []
+            n.temporal_preds = []
+            n.temporal_succs = []
+            if n.node_kind == "SEND_COMM":
+                n.peer_pp_rank = n.node_meta.get("peer_pp_rank")
+            elif n.node_kind == "RECV_COMM":
+                n.peer_pp_rank = n.node_meta.get("peer_pp_rank")
+            else:
+                n.peer_pp_rank = None
+        for e in training_dag.edges:
+            if e.src_uid not in training_dag.nodes or e.dst_uid not in training_dag.nodes:
+                continue
+            src = training_dag.nodes[e.src_uid]
+            dst = training_dag.nodes[e.dst_uid]
+            if e.dep_kind == "temporal":
+                src.temporal_succs.append(dst)
+                dst.temporal_preds.append(src)
+            else:
+                src.data_succs.append(dst)
+                dst.data_preds.append(src)
+
+        for n in training_dag.nodes.values():
+            n.task_type = _training_dag_task_type(n)
+            mb = n.tag.get("MB", 0)
+            st = n.tag.get("PP", 0)
+            n.batches = [type("RuntimeBatch", (), {"stage_id": st, "mb_idx": mb})()]
+
+        self.dag = training_dag
+        self.sorted_dag_nodes = [
+            training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
+        ]
 
     def _clear_param_grads(self) -> None:
         """Restore standard PyTorch semantics: inactive params keep grad=None."""
@@ -1159,237 +856,102 @@ class PiperActor:
                 t = args[idx]
                 if t is not None:
                     t.grad = None
-    def _param_has_effective_grad(self, param: torch.Tensor | None) -> bool:
-        """Return True when a param carries a materialized gradient."""
-        return param is not None and param.grad is not None
 
-    def _accumulate_zero_param_grads_to_flat(self, ubid: int | None) -> None:
+    def _accumulate_zero_param_grads_to_flat(
+        self, ubid: Any | None, stream: "torch.cuda.Stream"
+    ) -> None:
         """Accumulate ZeRO-managed param grads into the fp32 flat grad buffer."""
-        if ubid is None or self.zero_stage <= 0 or self.dp_degree <= 1:
+        if ubid is None or ubid not in self.zero_managed_ubids or self.dp_degree <= 1:
             return
+        if ubid in self.grad_sharded_ubids:
+            self._wait_pending_free(self.pending_grad_frees, ubid)
         specs = self.bucket_param_view_specs.get(ubid, [])
         if not specs:
             return
-        flat_grads = self.bucket_flat_grads.get(ubid)
-        if flat_grads is None:
-            shard_info = self.param_shard_info.get(ubid)
-            if shard_info is None:
-                return
-            _shard_start, shard_size, _orig_numel = shard_info
-            flat_grads = torch.zeros(
-                shard_size * self.dp_degree,
-                dtype=self.zero_grad_dtype,
-                device=self.device,
-            )
-            self.bucket_flat_grads[ubid] = flat_grads
-        for param, offset, numel, _shape in specs:
-            grad = param.grad
-            if grad is None:
-                continue
-            flat_grads[offset:offset + numel].add_(grad.detach().reshape(-1).to(flat_grads.dtype))
-            param.grad = None
+        with torch.cuda.stream(stream):
+            flat_grads = self.bucket_flat_grads.get(ubid)
+            if flat_grads is None:
+                shard_info = self.param_shard_info.get(ubid)
+                if shard_info is None:
+                    return
+                _shard_start, shard_size, _orig_numel = shard_info
+                flat_grads = torch.zeros(
+                    shard_size * self.dp_degree,
+                    dtype=self.grad_buffer_dtype,
+                    device=self.device,
+                )
+                self.bucket_flat_grads[ubid] = flat_grads
+            for param, offset, numel, _shape in specs:
+                grad = param.grad
+                if grad is None:
+                    continue
+                flat_grads[offset:offset + numel].add_(grad.detach().reshape(-1).to(flat_grads.dtype))
+                param.grad = None
 
-    def _sync_payload_ubid(self, node: Task) -> int | None:
-        if node.unique_bucket_id is not None:
-            return node.unique_bucket_id
+    def _sync_payload_ubid(self, node: Any) -> Any | None:
+        bk = self._node_bucket_key(node)
+        if bk is not None:
+            return bk
         if node.data_preds:
-            return node.data_preds[0].unique_bucket_id
+            pred_bk = self._node_bucket_key(node.data_preds[0])
+            if pred_bk is not None:
+                return pred_bk
         return None
 
-    def _sync_payload_ubids(self, node: Task) -> list[int]:
-        sync_ubids = node.custom_metadata.get("sync_ubids")
+    def _sync_payload_ubids(self, node: Any) -> list[Any]:
+        sync_ubids = self._node_meta(node).get("sync_ubids")
         if sync_ubids:
             return list(sync_ubids)
         ubid = self._sync_payload_ubid(node)
         return [ubid] if ubid is not None else []
 
-    def _collect_saved_tensors(
-        self,
-        obj: Any,
-        seen_objs: set[int],
-        seen_tensors: set[int],
-        tensors: list[torch.Tensor],
-    ) -> None:
-        obj_id = id(obj)
-        if obj_id in seen_objs:
+    def _wait_pending_free(self, pending: dict[Any, Future], ubid: Any | None) -> None:
+        if ubid is None:
             return
-        seen_objs.add(obj_id)
+        fut = pending.pop(ubid, None)
+        if fut is not None:
+            fut.result()
 
-        if isinstance(obj, torch.Tensor):
-            tensor_id = id(obj)
-            if tensor_id not in seen_tensors:
-                seen_tensors.add(tensor_id)
-                tensors.append(obj)
+    def _drain_pending_frees(self) -> None:
+        for pending in (self.pending_param_frees, self.pending_grad_frees):
+            futures = list(pending.values())
+            pending.clear()
+            for fut in futures:
+                fut.result()
+
+    def _defer_free_full_params(self, ubid: Any | None, evt: torch.cuda.Event) -> None:
+        if ubid is None or ubid not in self.param_sharded_ubids:
             return
+        self._wait_pending_free(self.pending_param_frees, ubid)
+        self.pending_param_frees[ubid] = self.cleanup_executor.submit(
+            self._wait_then_free_full_params,
+            ubid,
+            evt,
+        )
 
-        if isinstance(obj, dict):
-            for v in obj.values():
-                self._collect_saved_tensors(v, seen_objs, seen_tensors, tensors)
+    def _defer_free_full_grads(self, ubid: Any | None, evt: torch.cuda.Event) -> None:
+        if ubid is None or ubid not in self.grad_sharded_ubids:
             return
+        self._wait_pending_free(self.pending_grad_frees, ubid)
+        self.pending_grad_frees[ubid] = self.cleanup_executor.submit(
+            self._wait_then_free_full_grads,
+            ubid,
+            evt,
+        )
 
-        if isinstance(obj, (list, tuple, set)):
-            for v in obj:
-                self._collect_saved_tensors(v, seen_objs, seen_tensors, tensors)
-            return
+    def _wait_then_free_full_params(self, ubid: Any, evt: torch.cuda.Event) -> None:
+        evt.synchronize()
+        self._free_full_params(ubid)
 
-        if isinstance(obj, Node):
-            for name in dir(obj):
-                if not name.startswith("_saved_"):
-                    continue
-                try:
-                    value = getattr(obj, name)
-                except Exception:
-                    continue
-                self._collect_saved_tensors(value, seen_objs, seen_tensors, tensors)
+    def _wait_then_free_full_grads(self, ubid: Any, evt: torch.cuda.Event) -> None:
+        evt.synchronize()
+        self._free_full_grads(ubid)
 
-    def _summarize_param_groups(self, param_groups: list[dict[str, Any]]) -> dict[str, int]:
-        grad_tensor_count = 0
-        grad_numel = 0
-        grad_bytes = 0
-        intermediate_count = 0
-        param_count = 0
-        saved_tensors: list[torch.Tensor] = []
-        seen_objs: set[int] = set()
-        seen_tensors: set[int] = set()
-
-        for param_group in param_groups:
-            intermediates = param_group.get("intermediates", [])
-            grads = param_group.get("grads", [])
-            params = param_group.get("params", [])
-            intermediate_count += len(intermediates)
-            param_count += len(params)
-
-            for grads_tuple in grads:
-                if grads_tuple is None:
-                    continue
-                for grad in grads_tuple:
-                    if grad is None:
-                        continue
-                    grad_tensor_count += 1
-                    grad_numel += grad.numel()
-                    grad_bytes += grad.numel() * grad.element_size()
-
-            for intermediate in intermediates:
-                self._collect_saved_tensors(intermediate, seen_objs, seen_tensors, saved_tensors)
-
-        saved_numel = sum(t.numel() for t in saved_tensors)
-        saved_bytes = sum(t.numel() * t.element_size() for t in saved_tensors)
-
-        return {
-            "groups": len(param_groups),
-            "intermediates": intermediate_count,
-            "params": param_count,
-            "grad_tensors": grad_tensor_count,
-            "grad_numel": grad_numel,
-            "grad_bytes": grad_bytes,
-            "saved_tensors": len(saved_tensors),
-            "saved_numel": saved_numel,
-            "saved_bytes": saved_bytes,
-        }
-
-    def _summarize_outstanding_bwdi(self) -> dict[str, int]:
-        buffers = 0
-        groups = 0
-        params = 0
-        intermediates = 0
-        grad_tensors = 0
-        grad_bytes = 0
-        saved_tensors = 0
-        saved_bytes = 0
-
-        for value in self.task_buffer.values():
-            if not isinstance(value, dict):
-                continue
-            param_groups = value.get("param_groups")
-            if param_groups is None:
-                continue
-            buffers += 1
-            summary = self._summarize_param_groups(param_groups)
-            groups += summary["groups"]
-            params += summary["params"]
-            intermediates += summary["intermediates"]
-            grad_tensors += summary["grad_tensors"]
-            grad_bytes += summary["grad_bytes"]
-            saved_tensors += summary["saved_tensors"]
-            saved_bytes += summary["saved_bytes"]
-
-        return {
-            "buffers": buffers,
-            "groups": groups,
-            "params": params,
-            "intermediates": intermediates,
-            "grad_tensors": grad_tensors,
-            "grad_bytes": grad_bytes,
-            "saved_tensors": saved_tensors,
-            "saved_bytes": saved_bytes,
-        }
-
-    def _accumulate_tensor_bytes(self, obj: Any, seen: set[int]) -> int:
-        if isinstance(obj, torch.Tensor):
-            obj_id = id(obj)
-            if obj_id in seen:
-                return 0
-            seen.add(obj_id)
-            return obj.numel() * obj.element_size()
-
-        if isinstance(obj, dict):
-            return sum(self._accumulate_tensor_bytes(v, seen) for v in obj.values())
-
-        if isinstance(obj, (list, tuple, set)):
-            return sum(self._accumulate_tensor_bytes(v, seen) for v in obj)
-
-        return 0
-
-    def _summarize_task_buffer(self) -> dict[str, float]:
-        categories = {
-            "fwd_mb": 0,
-            "shape_ref": 0,
-            "recv": 0,
-            "bwd_i": 0,
-            "bwd": 0,
-            "a2a": 0,
-            "other": 0,
-        }
-        counts = {k: 0 for k in categories}
-
-        for key, value in self.task_buffer.items():
-            seen: set[int] = set()
-            nbytes = self._accumulate_tensor_bytes(value, seen)
-
-            category = "other"
-            if isinstance(key, tuple) and len(key) == 2 and key[0] == "shape_ref":
-                category = "shape_ref"
-            elif isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], int):
-                category = "fwd_mb"
-            elif isinstance(value, list):
-                category = "recv"
-            elif isinstance(value, dict):
-                if "param_groups" in value:
-                    category = "bwd_i"
-                elif "inp_grads" in value:
-                    category = "bwd"
-                elif "detached_outs" in value:
-                    category = "a2a" if "pre_detach_outs" not in value else "other"
-
-            categories[category] += nbytes
-            counts[category] += 1
-
-        summary = {}
-        total_bytes = 0
-        total_entries = 0
-        for key, nbytes in categories.items():
-            summary[f"{key}_bytes"] = nbytes
-            summary[f"{key}_count"] = counts[key]
-            total_bytes += nbytes
-            total_entries += counts[key]
-        summary["total_bytes"] = total_bytes
-        summary["total_entries"] = total_entries
-        return summary
-
-    def _init_task_buffer_refcounts(self, dag: TaskDAG) -> None:
+    def _init_task_buffer_refcounts(self, dag: Any) -> None:
+        nodes_iter = dag.nodes.values() if isinstance(dag.nodes, dict) else dag.nodes
         self.task_buffer_refcounts = {
             node.uid: len(node.data_succs)
-            for node in dag.nodes
+            for node in nodes_iter
             if node.data_succs
         }
 
@@ -1405,50 +967,16 @@ class PiperActor:
         else:
             self.task_buffer_refcounts[uid] = remaining
 
-    def run_dag(self, loss_fn=None, profiling: bool = False):
-        """Thin wrapper around ``_run_dag_body`` that dumps a CUDA memory
-        snapshot if the body raises ``torch.cuda.OutOfMemoryError``.
-
-        The dump is written to ``self._oom_snapshot_dir`` (set via
-        ``set_oom_snapshot_dir``) or ``/tmp/piper_oom_snapshots`` as a fallback.
-        The original exception is re-raised after the snapshot attempt so the
-        caller (driver) still sees the OOM.
-        """
-        # Mark the entire iteration boundary for the memory-viz timeline.
+    def run_dag(self, loss_fn=None):
+        # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
         self._nvtx_push(f"iter_{iter_idx}_rank_{self.global_rank}")
-        try:
-            # self._log_mem(f"iter_{iter_idx}_start")
-            return self._run_dag_body(loss_fn=loss_fn, profiling=profiling)
-        except torch.cuda.OutOfMemoryError as oom_exc:
-            oom_dir = getattr(self, "_oom_snapshot_dir", None) or "/tmp/piper_oom_snapshots"
-            try:
-                os.makedirs(oom_dir, exist_ok=True)
-                filepath = os.path.join(
-                    oom_dir, f"oom_rank{self.global_rank}_memory.pickle"
-                )
-                torch.cuda.memory._dump_snapshot(filepath)
-                self.logger.error(
-                    f"[OOM] rank={self.global_rank} iter={iter_idx} "
-                    f"dumped snapshot to {filepath}: {oom_exc}"
-                )
-            except Exception as dump_exc:
-                self.logger.error(
-                    f"[OOM] rank={self.global_rank} iter={iter_idx} "
-                    f"snapshot dump FAILED: {dump_exc} (original OOM: {oom_exc})"
-                )
-            try:
-                torch.cuda.memory._record_memory_history(enabled=None)
-            except Exception:
-                pass
-            # self._log_mem(f"iter_{iter_idx}_oom")
-            raise
-        finally:
-            self._nvtx_pop()
+        self._run_dag_body(loss_fn=loss_fn)
+        self._nvtx_pop()
 
-    def _run_dag_body(self, loss_fn=None, profiling: bool = False):
-        """Execute the loaded TaskDAG in topological order.
+    def _run_dag_body(self, loss_fn=None):
+        """Execute the loaded TrainingDAG in topological order.
 
         All inter-task data is routed through ``task_buffer``, keyed by the
         producing task's ``uid``.  Each task method receives its inputs as
@@ -1456,16 +984,16 @@ class PiperActor:
         reads from and writes to ``task_buffer``.
 
         Synchronisation contract:
-        - Before a SEND node: p2p_send_stream waits on the compute event so the
+        - Before a SEND node: the node's stream waits on the compute event so the
           activation / gradient tensor is fully computed before the send begins.
-        - Before a compute node that has a RECV predecessor: comp_stream waits
-          on the recv_event so the recv buffer is populated before compute reads it.
+        - Before a compute node that has a RECV predecessor: the compute stream
+          waits on the recv_event so the recv buffer is populated before compute reads it.
         - RECV records a recv_event after the dist.recv completes.
         """
-        assert self.dag is not None, "load_dag() must be called before run_dag()"
-        assert self.sorted_dag_nodes is not None, "load_dag() must initialize sorted node order"
+        assert self.dag is not None, "load_training_dag() must be called before run_dag()"
+        assert self.sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
+        self._drain_pending_frees()
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
-        verbose_enabled = self.logger.isEnabledFor(VERBOSE)
         # Reset per-iteration state
         self.task_buffer = {}
         self.task_buffer_refcounts = {}
@@ -1473,130 +1001,70 @@ class PiperActor:
         self.a2a_events = {}
         self.ar_events = {}
         self.rs_events = {}
-        if self.zero_stage == 3:
-            self.ag_events = {}
+        self.ag_events = {}
         self.bwd_events = {}
         self._clear_param_grads()
-        if self.zero_stage >= 1:
-            with torch.cuda.stream(self.comp_stream):
-                for buf in self.bucket_flat_grads.values():
-                    if buf is not None:
-                        buf.zero_()
-        if self.zero_stage >= 2:
-            with torch.cuda.stream(self.comp_stream):
-                for buf in self.bucket_rs_grads.values():
-                    if buf is not None:
-                        buf.zero_()
+        default_stream = self._default_stream()
+        with torch.cuda.stream(default_stream):
+            for buf in self.bucket_flat_grads.values():
+                if buf is not None:
+                    buf.zero_()
+            for buf in self.bucket_rs_grads.values():
+                if buf is not None:
+                    buf.zero_()
+        zero_evt = torch.cuda.Event()
+        zero_evt.record(default_stream)
+        for stream in self.streams.values():
+            if stream is not default_stream:
+                stream.wait_event(zero_evt)
         comp_events: dict = {}  # task_uid -> cuda.Event for compute tasks
-        # profiling: list of (node, start_evt, end_evt, mem_before_bytes)
-        # populated during the loop; elapsed_time() is only called after the
-        # final synchronize() so we never block the CPU mid-dispatch.
-        self._prof_records: list = []
 
         self._init_task_buffer_refcounts(self.dag)
         last_comp_event_by_stream: dict[str, torch.cuda.Event] = {}
+        def _node_tag_str(node: Any) -> str:
+            tag = getattr(node, "tag", None)
+            if not isinstance(tag, dict) or not tag:
+                return "{}"
+            items = sorted(tag.items(), key=lambda kv: kv[0])
+            return "{" + ",".join(f"{k}={v}" for k, v in items) + "}"
 
-        def _wait_for_all_gather(compute_node: Task) -> None:
-            compute_stream = self._compute_stream_for_task(compute_node)
+        def _wait_for_all_gather(compute_node: Any) -> None:
+            compute_stream = self._stream_for_task(compute_node)
             for pred in compute_node.data_preds:
                 if pred.task_type == TaskType.ALL_GATHER:
                     ag_evt = self.ag_events.get(pred.uid)
                     if ag_evt is not None:
                         compute_stream.wait_event(ag_evt)
 
-        def _metadata_ubids(node: Task, key: str) -> list[int]:
-            value = node.custom_metadata.get(key)
-            if value is True:
-                sync_ubids = self._sync_payload_ubids(node)
-                if sync_ubids:
-                    return sync_ubids
-                return [node.unique_bucket_id] if node.unique_bucket_id is not None else []
-            if isinstance(value, (list, tuple)):
-                return [int(ubid) for ubid in value]
-            return []
-
-        def _run_free_full_grads(free_node: Task) -> None:
-            self._nvtx_push(f"free_full_grads_ubid{free_node.unique_bucket_id}")
-            try:
-                for pred in free_node.data_preds:
-                    if pred.task_type == TaskType.REDUCE_SCATTER:
-                        rs_evt = self.rs_events.get(pred.uid)
-                        if rs_evt is not None:
-                            self.comp_stream.wait_event(rs_evt)
-                            # self.logger.info("synchronizing free_full_grads on thread_id=%s", threading.get_ident())
-                            rs_evt.synchronize()
-                    elif pred.task_type == TaskType.ALL_REDUCE:
-                        ar_evt = self.ar_events.get(pred.uid)
-                        if ar_evt is not None:
-                            self.comp_stream.wait_event(ar_evt)
-                            # self.logger.info("synchronizing free_full_grads on thread_id=%s", threading.get_ident())
-                            ar_evt.synchronize()
-                self._free_full_grads(free_node.unique_bucket_id)
-            finally:
-                self._nvtx_pop()
-
-        def _run_free_full_params(free_node: Task) -> None:
-            self._nvtx_push(f"free_full_params_ubid{free_node.unique_bucket_id}")
-            try:
-                for pred in free_node.data_preds:
-                    if pred.uid in comp_events:
-                        # _free_full_params resizes CUDA storage from the host.
-                        # Stream waits are not enough here: the CPU must not
-                        # release the full ZeRO-3 buffer while a compute kernel
-                        # launched on comp_stream may still be reading it.
-                        comp_events[pred.uid].synchronize()
-                self._free_full_params(free_node.unique_bucket_id)
-            finally:
-                self._nvtx_pop()
-
         for node in self.sorted_dag_nodes:
 
             task_type = node.task_type
             batch = node.batches[0]
             mb_idx = batch.mb_idx
-            ubid = node.unique_bucket_id  # None for non-compute nodes
-            node_comp_stream = self._compute_stream_for_task(node)
+            ubid = self._node_bucket_key(node)  # None for non-compute nodes
+            node_stream = self._stream_for_task(node)
+            node_stream_id = self._stream_id(node)
+            node_tag = _node_tag_str(node)
 
             if debug_enabled:
                 self.logger.debug(
-                    f"run_dag dispatch (time {node.time_step}): {task_type.value} "
-                    f"mb{mb_idx} ubid={ubid}"
+                    f"run_dag dispatch: {task_type.value} "
+                    f"tag={node_tag}"
                 )
 
-            # Timeline marker visible in NVTX traces & PyTorch memory-viz.
-            _task_label = f"{task_type.value}_mb{mb_idx}_ubid{ubid}_t{node.time_step}"
+            # Timeline marker visible in NVTX traces / PyTorch profiler.
+            _task_label = f"{task_type.value}:{node_tag}:uid{node.uid}"
             self._nvtx_push(_task_label)
-            _log_heavy_task = task_type in (
-                TaskType.FWD,
-                TaskType.BWD,
-                TaskType.BWD_I,
-                TaskType.BWD_W,
-                TaskType.FWD_BWD,
-                TaskType.UPD,
-                TaskType.ALLOC_FULL_PARAMS,
-                TaskType.FREE_FULL_PARAMS,
-                TaskType.ALLOC_FULL_GRADS,
-                TaskType.FREE_FULL_GRADS,
-            )
-            # if _log_heavy_task:
-                # self._log_mem(f"before_{_task_label}")
-
-            if profiling:
-                _stream = self._timing_stream(node)
-                _start_evt = torch.cuda.Event(enable_timing=True)
-                _start_evt.record(_stream)
-                _mem_before = torch.cuda.memory_allocated()
+            _rf = self._rf_enter(_task_label)
 
             match task_type:
 
                 case TaskType.SEND:
                     # data_preds[0] is the compute task whose output we send.
                     compute_node = node.data_preds[0]
-                    self.p2p_send_stream.wait_event(comp_events[compute_node.uid])
+                    node_stream.wait_event(comp_events[compute_node.uid])
                     send_data = self.task_buffer[compute_node.uid]["send_output"]
-                    self._start_timing(self.p2p_send_stream, "p2p_send")
-                    self._exec_send(send_data, node.peer_pp_rank)
-                    self._stop_timing(self.p2p_send_stream, "p2p_send")
+                    self._exec_send(send_data, node.peer_pp_rank, stream=node_stream)
                     # Free the send buffer.  For FWD/FWD_A2A the whole entry is stale
                     # after the send (task_buffer[(ubid,mb)] is the BWD consumer).
                     # For BWD/BWD_I/BWD_A2A keep the dict but drop the send tensor —
@@ -1610,141 +1078,112 @@ class PiperActor:
                 case TaskType.RECV:
                     # data_succs[0] is the downstream compute task.
                     compute_node = node.data_succs[0]
-                    comp_evt = last_comp_event_by_stream.get(node.compute_stream_id)
+                    comp_evt = last_comp_event_by_stream.get(self._stream_id(compute_node))
                     if comp_evt is not None:
-                        self.p2p_recv_stream.wait_event(comp_evt)
+                        node_stream.wait_event(comp_evt)
                     if compute_node.task_type == TaskType.FWD:
                         # FWD recv: pre-allocate based on target bucket's input metadata.
-                        recv_ubid = compute_node.unique_bucket_id
-                        self._start_timing(self.p2p_recv_stream, "p2p_recv")
-                        recv_tensors = self._exec_recv_fwd(recv_ubid, node.peer_pp_rank)
-                        self._stop_timing(self.p2p_recv_stream, "p2p_recv")
+                        recv_ubid = self._node_bucket_key(compute_node)
+                        recv_tensors = self._exec_recv_fwd(
+                            recv_ubid, node.peer_pp_rank, stream=node_stream
+                        )
                     else:
                         # BWD recv: pre-allocate based on FWD output shapes.
-                        fwd_ubid = node.custom_metadata["fwd_ubid"]
-                        shape_meta = self.task_buffer[("shape_ref", fwd_ubid)]
-                        self._start_timing(self.p2p_recv_stream, "p2p_recv")
-                        recv_tensors = self._exec_recv_bwd(shape_meta, node.peer_pp_rank)
-                        self._stop_timing(self.p2p_recv_stream, "p2p_recv")
+                        fwd_uid = compute_node.node_meta.get("fwd_uid")
+                        fwd_key = (compute_node.node_meta.get("bucket_key"), fwd_uid)
+                        shape_meta = self.task_buffer[("shape_ref",) + fwd_key]
+                        recv_tensors = self._exec_recv_bwd(
+                            shape_meta, node.peer_pp_rank, stream=node_stream
+                        )
                     self.task_buffer[node.uid] = recv_tensors
                     recv_evt = torch.cuda.Event()
-                    recv_evt.record(self.p2p_recv_stream)
+                    recv_evt.record(node_stream)
                     self.recv_events[node.uid] = recv_evt
 
                 case TaskType.FWD_A2A:
                     fwd_pred = next(p for p in node.data_preds if p.task_type == TaskType.FWD)
-                    self.a2a_stream.wait_event(comp_events[fwd_pred.uid])
-                    tensor_idx = node.custom_metadata["a2a_tensor_idx"]
+                    node_stream.wait_event(comp_events[fwd_pred.uid])
+                    tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     # Pass-through: copy upstream FWD task_buffer, apply A2A only at tensor_idx.
                     fwd_buf = dict(self.task_buffer[fwd_pred.uid])
                     # FWD_A2A now owns the copy; release predecessor after consuming it.
                     self._release_task_buffer_uid(fwd_pred.uid)
                     detached_outs = list(fwd_buf["detached_outs"])
-                    self._nvtx_push(f"fwd_a2a_ubid{fwd_pred.unique_bucket_id}_mb{mb_idx}")
-                    self._start_timing(self.a2a_stream, "fwd_a2a")
-                    detached_outs[tensor_idx] = self._exec_a2a(detached_outs[tensor_idx]).requires_grad_(True)
-                    self._stop_timing(self.a2a_stream, "fwd_a2a")
-                    self._nvtx_pop()
+                    detached_outs[tensor_idx] = self._exec_a2a(
+                        detached_outs[tensor_idx], stream=node_stream
+                    ).requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs
                     self.task_buffer[node.uid] = fwd_buf
                     a2a_evt = torch.cuda.Event()
-                    a2a_evt.record(self.a2a_stream)
+                    a2a_evt.record(node_stream)
                     self.a2a_events[node.uid] = a2a_evt
-                    node_comp_stream.wait_event(a2a_evt)
+                    # node_stream.wait_event(a2a_evt)
 
                 case TaskType.BWD_A2A:
                     bwd_pred = next(
                         p for p in node.data_preds
                         if p.task_type in (TaskType.BWD, TaskType.BWD_I)
                     )
-                    self.a2a_stream.wait_event(comp_events[bwd_pred.uid])
-                    tensor_idx = node.custom_metadata["a2a_tensor_idx"]
+                    node_stream.wait_event(comp_events[bwd_pred.uid])
+                    tensor_idx = self._node_meta(node)["a2a_tensor_idx"]
                     # Pass-through: copy upstream BWD/BWD_I task_buffer, apply reversed A2A only at tensor_idx.
                     bwd_buf = dict(self.task_buffer[bwd_pred.uid])
                     self._release_task_buffer_uid(bwd_pred.uid)
                     inp_grads = list(bwd_buf["inp_grads"])
                     grad_a2a_out = inp_grads[tensor_idx]
                     assert grad_a2a_out is not None, (
-                        f"BWD_A2A mb={mb_idx}: grad at a2a_tensor_idx={tensor_idx} is None"
+                        f"BWD_A2A tag={node_tag}: grad at a2a_tensor_idx={tensor_idx} is None"
                     )
                     if not grad_a2a_out.is_contiguous():
                         grad_a2a_out = grad_a2a_out.contiguous()
-                    self._nvtx_push(f"bwd_a2a_ubid{bwd_pred.unique_bucket_id}_mb{mb_idx}")
-                    self._start_timing(self.a2a_stream, "bwd_a2a")
-                    inp_grads[tensor_idx] = self._exec_a2a(grad_a2a_out)
-                    self._stop_timing(self.a2a_stream, "bwd_a2a")
-                    self._nvtx_pop()
+                    inp_grads[tensor_idx] = self._exec_a2a(grad_a2a_out, stream=node_stream)
                     bwd_buf["inp_grads"] = inp_grads
                     self.task_buffer[node.uid] = bwd_buf
                     a2a_evt = torch.cuda.Event()
-                    a2a_evt.record(self.a2a_stream)
+                    a2a_evt.record(node_stream)
                     self.a2a_events[node.uid] = a2a_evt
-                    node_comp_stream.wait_event(a2a_evt)
+                    # node_stream.wait_event(a2a_evt)
 
                 case TaskType.ALL_REDUCE:
                     bwd_node = node.data_preds[0]
                     ar_ubids = self._sync_payload_ubids(node)
-                    ar_ubid = ar_ubids[0] if ar_ubids else bwd_node.unique_bucket_id
-                    self._nvtx_push(f"all_reduce_ubid{ar_ubid}")
-                    self.ar_stream.wait_event(comp_events[bwd_node.uid])
-                    self._start_timing(self.ar_stream, "all_reduce")
-                    runtime_bytes = sum(self._exec_all_reduce_grads(ubid) for ubid in ar_ubids)
-                    self._stop_timing(self.ar_stream, "all_reduce")
-                    if runtime_bytes > 0:
-                        ar_evt = torch.cuda.Event()
-                        ar_evt.record(self.ar_stream)
-                        self.ar_events[node.uid] = ar_evt
-                        for free_ubid in _metadata_ubids(node, "zero_free_full_grads_after_ubids"):
-                            ar_evt.synchronize()
-                            self._free_full_grads(free_ubid)
-                    self._nvtx_pop()
+                    assert ar_ubids, (
+                        f"ALL_REDUCE node uid={node.uid} has no sync_payload_ubids"
+                    )
+                    node_stream.wait_event(comp_events[bwd_node.uid])
+                    for ubid in ar_ubids:
+                        self._exec_all_reduce_grads(ubid, stream=node_stream)
+                    ar_evt = torch.cuda.Event()
+                    ar_evt.record(node_stream)
+                    self.ar_events[node.uid] = ar_evt
                     self._release_task_buffer_uid(bwd_node.uid)
 
                 case TaskType.REDUCE_SCATTER:
                     bwd_node = node.data_preds[0]
-                    rs_ubid = node.unique_bucket_id if node.unique_bucket_id is not None else bwd_node.unique_bucket_id
-                    self._nvtx_push(f"reduce_scatter_ubid{rs_ubid}")
-                    self.ar_stream.wait_event(comp_events[bwd_node.uid])
-                    self._start_timing(self.ar_stream, "reduce_scatter")
-                    self._exec_reduce_scatter(rs_ubid)
-                    self._stop_timing(self.ar_stream, "reduce_scatter")
+                    rs_ubid = self._node_bucket_key(node)
+                    assert rs_ubid is not None, (
+                        f"REDUCE_SCATTER node uid={node.uid} has no bucket_key"
+                    )
+                    node_stream.wait_event(comp_events[bwd_node.uid])
+                    rs_bytes = self._exec_reduce_scatter(rs_ubid, stream=node_stream)
                     rs_evt = torch.cuda.Event()
-                    rs_evt.record(self.ar_stream)
+                    rs_evt.record(node_stream)
                     self.rs_events[node.uid] = rs_evt
-                    for free_ubid in _metadata_ubids(node, "zero_free_full_grads_after_ubids"):
-                        rs_evt.synchronize()
-                        self._free_full_grads(free_ubid)
-                    self._nvtx_pop()
+                    if rs_bytes:
+                        self._defer_free_full_grads(rs_ubid, rs_evt)
+                    if self._node_meta(node).get("zero_free_full_params_after"):
+                        assert False and "Param free should happen after a compute node"
                     self._release_task_buffer_uid(bwd_node.uid)
 
                 case TaskType.ALL_GATHER:
-                    for alloc_ubid in _metadata_ubids(node, "zero_alloc_full_params_before"):
-                        self._alloc_full_params(alloc_ubid)
-                    self._nvtx_push(f"all_gather_s{batch.stage_id}_b{node.bucket_id}")
-                    self._start_timing(self.ar_stream, "all_gather")
-                    ag_launched = self._exec_all_gather(node.unique_bucket_id)
-                    self._stop_timing(self.ar_stream, "all_gather")
-                    if ag_launched:
-                        ag_evt = torch.cuda.Event()
-                        ag_evt.record(self.ar_stream)
-                        self.ag_events[node.uid] = ag_evt
-                    self._nvtx_pop()
-
-                case TaskType.ALLOC_FULL_GRADS:
-                    self._nvtx_push(f"alloc_full_grads_ubid{node.unique_bucket_id}")
-                    self._alloc_full_grads(node.unique_bucket_id)
-                    self._nvtx_pop()
-
-                case TaskType.FREE_FULL_GRADS:
-                    _run_free_full_grads(node)
-
-                case TaskType.ALLOC_FULL_PARAMS:
-                    self._nvtx_push(f"alloc_full_params_ubid{node.unique_bucket_id}")
-                    self._alloc_full_params(node.unique_bucket_id)
-                    self._nvtx_pop()
-
-                case TaskType.FREE_FULL_PARAMS:
-                    _run_free_full_params(node)
+                    ag_ubid = self._node_bucket_key(node)
+                    assert ag_ubid is not None, (
+                        f"ALL_GATHER node uid={node.uid} has no bucket_key"
+                    )
+                    self._exec_all_gather(ag_ubid, stream=node_stream)
+                    ag_evt = torch.cuda.Event()
+                    ag_evt.record(node_stream)
+                    self.ag_events[node.uid] = ag_evt
 
                 case TaskType.FWD:
                     # Wait on any RECV predecessor.
@@ -1752,7 +1191,14 @@ class PiperActor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.recv_events:
-                        node_comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
+                        node_stream.wait_event(self.recv_events.pop(recv_pred.uid))
+
+                    # Wait on any FWD_A2A predecessor.
+                    a2a_pred = next(
+                        (p for p in node.data_preds if p.task_type == TaskType.FWD_A2A), None
+                    )
+                    if a2a_pred is not None and a2a_pred.uid in self.a2a_events:
+                        node_stream.wait_event(self.a2a_events.pop(a2a_pred.uid))
 
                     # Gather input tensors from task_buffer.
                     # FWD(bkt=0 of first stage): inputs come from self.inputs.
@@ -1774,23 +1220,20 @@ class PiperActor:
 
                     _wait_for_all_gather(node)
 
-                    self._nvtx_push(f"forward_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(node_comp_stream, "forward")
-                    fwd_out = self._forward_dag(ubid, mb_idx, input_tensors, node_comp_stream)
-                    self._stop_timing(node_comp_stream, "forward")
-                    self._nvtx_pop()
+                    fwd_out = self._forward_dag(ubid, mb_idx, input_tensors, node_stream)
                     self.task_buffer[node.uid] = fwd_out
                     # Shape ref for BWD RECV: store lightweight metadata (shape, dtype) so
                     # _exec_recv_bwd can pre-allocate receive buffers without holding live tensors.
-                    self.task_buffer[("shape_ref", ubid)] = [(t.shape, t.dtype) for t in fwd_out["out_with_grad"]]
-                    self.task_buffer[(ubid, mb_idx)] = fwd_out  # per-mb FWD data for BWD
+                    bkey = node.node_meta.get("bucket_key")
+                    fwd_key = (bkey, node.uid)
+                    self.task_buffer[("shape_ref",) + fwd_key] = [(t.shape, t.dtype) for t in fwd_out["out_with_grad"]]
+                    self.task_buffer[fwd_key] = fwd_out  # per-node FWD data for BWD
                     evt = torch.cuda.Event()
-                    evt.record(node_comp_stream)
+                    evt.record(node_stream)
                     comp_events[node.uid] = evt
-                    last_comp_event_by_stream[node.compute_stream_id] = evt
-                    if node.custom_metadata.get("zero_free_full_params_after"):
-                        evt.synchronize()
-                        self._free_full_params(ubid)
+                    last_comp_event_by_stream[node_stream_id] = evt
+                    if self._node_meta(node).get("zero_free_full_params_after"):
+                        self._defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD:
                     # Wait on upstream grad RECV if present.
@@ -1798,15 +1241,26 @@ class PiperActor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.recv_events:
-                        node_comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
+                        node_stream.wait_event(self.recv_events.pop(recv_pred.uid))
                     _wait_for_all_gather(node)
 
-                    # Resolve outputs and upstream grads via per-mb ubid lookup.
-                    fwd_out = self.task_buffer[(ubid, mb_idx)]
+                    # Wait on any BWD_A2A predecessor.
+                    a2a_pred = next(
+                        (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
+                    )
+                    if a2a_pred is not None and a2a_pred.uid in self.a2a_events:
+                        node_stream.wait_event(self.a2a_events.pop(a2a_pred.uid))
 
-                    if node.compute_loss:
+                    # Resolve outputs and upstream grads via per-mb ubid lookup.
+                    fwd_uid = node.node_meta.get("fwd_uid")
+                    fwd_key = (node.node_meta.get("bucket_key"), fwd_uid)
+                    fwd_out = self.task_buffer[fwd_key]
+
+                    if self._node_meta(node).get("compute_loss", False):
                         assert loss_fn is not None
-                        with torch.cuda.stream(node_comp_stream):
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self._log_compute_loss_inputs(node, fwd_key, fwd_out)
+                        with torch.cuda.stream(node_stream):
                             outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
                         upstream_grads = None
                     elif recv_pred is not None:
@@ -1820,11 +1274,8 @@ class PiperActor:
                         outputs_or_loss = fwd_out["out_with_grad"]
                         upstream_grads = None  # last stage, no recv
 
-                    bwd_a2a_pred = next(
-                        (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
-                    )
-                    if bwd_a2a_pred is not None:
-                        a2a_buf = self.task_buffer[bwd_a2a_pred.uid]
+                    if a2a_pred is not None:
+                        a2a_buf = self.task_buffer[a2a_pred.uid]
                         pre_detach_outs = fwd_out["pre_detach_outs"]
                         detached_outs = fwd_out["detached_outs"]
                         # Set .grad for ALL requires_grad detached boundary tensors from
@@ -1835,7 +1286,7 @@ class PiperActor:
                         for i, (d, g) in enumerate(zip(detached_outs, a2a_buf["inp_grads"])):
                             if d is not None and isinstance(d, torch.Tensor) and d.requires_grad and g is not None:
                                 d.grad = g
-                        self._release_task_buffer_uid(bwd_a2a_pred.uid)
+                        self._release_task_buffer_uid(a2a_pred.uid)
                     else:
                         bwd_pred = next(
                             (p for p in node.data_preds
@@ -1863,19 +1314,15 @@ class PiperActor:
                             detached_outs = None
 
                     inp_with_grad = fwd_out.get("inp_with_grad")
-                    if node.custom_metadata.get("zero_alloc_full_grads_before"):
-                        self._alloc_full_grads(ubid)
+                    if self._node_meta(node).get("zero_alloc_full_grads_before"):
+                        self._alloc_full_grads(ubid, node_stream)
 
-                    self._nvtx_push(f"backward_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(node_comp_stream, "backward")
                     bwd_out = self._backward_dag(
                         ubid, mb_idx, outputs_or_loss, upstream_grads,
                         pre_detach_outs, detached_outs, inp_with_grad,
                         fwd_out.get("out_with_grad"),
-                        node_comp_stream,
+                        node_stream,
                     )
-                    self._stop_timing(node_comp_stream, "backward")
-                    self._nvtx_pop()
                     buf = bwd_out if bwd_out is not None else {}
                     # Full-length inp_grads parallel to fwd_inputs / detached_outs so
                     # BWD_A2A can index with a2a_tensor_idx without filtering offset.
@@ -1886,21 +1333,20 @@ class PiperActor:
                         if fwd_inputs_full is not None
                         else [t.grad for t in (inp_with_grad or [])]
                     )
-                    self._accumulate_zero_param_grads_to_flat(ubid)
+                    self._accumulate_zero_param_grads_to_flat(ubid, node_stream)
                     self.task_buffer[node.uid] = buf
                     # FWD stored the same dict under both node.uid and (ubid, mb_idx).
                     # Clear the dict in-place so any remaining alias stops keeping
                     # activations and autograd edges alive through the optimizer step.
                     fwd_out.clear()
-                    del self.task_buffer[(ubid, mb_idx)]
+                    del self.task_buffer[fwd_key]
                     evt = torch.cuda.Event()
-                    evt.record(node_comp_stream)
+                    evt.record(node_stream)
                     comp_events[node.uid] = evt
                     self.bwd_events[ubid] = evt
-                    last_comp_event_by_stream[node.compute_stream_id] = evt
-                    if node.custom_metadata.get("zero_free_full_params_after"):
-                        evt.synchronize()
-                        self._free_full_params(ubid)
+                    last_comp_event_by_stream[node_stream_id] = evt
+                    if self._node_meta(node).get("zero_free_full_params_after"):
+                        self._defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD_I:
                     # Wait on upstream grad RECV if present.
@@ -1908,15 +1354,19 @@ class PiperActor:
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )
                     if recv_pred is not None and recv_pred.uid in self.recv_events:
-                        node_comp_stream.wait_event(self.recv_events.pop(recv_pred.uid))
+                        node_stream.wait_event(self.recv_events.pop(recv_pred.uid))
                     _wait_for_all_gather(node)
 
                     # Resolve stage_outputs_or_loss and output_grads.
-                    fwd_out = self.task_buffer[(ubid, mb_idx)]
+                    fwd_uid = node.node_meta.get("fwd_uid")
+                    fwd_key = (node.node_meta.get("bucket_key"), fwd_uid)
+                    fwd_out = self.task_buffer[fwd_key]
 
-                    if node.compute_loss:
+                    if self._node_meta(node).get("compute_loss", False):
                         assert loss_fn is not None
-                        with torch.cuda.stream(node_comp_stream):
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self._log_compute_loss_inputs(node, fwd_key, fwd_out)
+                        with torch.cuda.stream(node_stream):
                             stage_outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], self.labels)]
                         output_grads = None
                     elif recv_pred is not None:
@@ -1935,7 +1385,11 @@ class PiperActor:
                     bwd_a2a_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.BWD_A2A), None
                     )
-                    if bwd_a2a_pred is not None and not node.compute_loss and recv_pred is None:
+                    if (
+                        bwd_a2a_pred is not None
+                        and not self._node_meta(node).get("compute_loss", False)
+                        and recv_pred is None
+                    ):
                         a2a_buf = self.task_buffer[bwd_a2a_pred.uid]
                         # BWD_A2A passes through BWD_I(bkt+1)'s task_buffer with
                         # inp_grads[tensor_idx] replaced by the reversed A2A gradient.
@@ -1962,14 +1416,10 @@ class PiperActor:
                     weights = [b_fwd_args[i] for i in self.bucket_param_idxs[ubid]
                                if b_fwd_args[i] is not None]
 
-                    self._nvtx_push(f"backward_input_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(node_comp_stream, "backward_input")
-                    with torch.cuda.stream(node_comp_stream):
+                    with torch.cuda.stream(node_stream):
                         dinputs, param_groups = self._bucket_backward_input(
                             stage_outputs_or_loss, output_grads, input_values, iter(weights)
                         )
-                    self._stop_timing(node_comp_stream, "backward_input")
-                    self._nvtx_pop()
                     # Full-length inp_grads parallel to fwd_inputs / detached_outs.
                     fwd_inputs_full = fwd_out.get("fwd_inputs")
                     if fwd_inputs_full is not None:
@@ -1984,24 +1434,6 @@ class PiperActor:
                         "inp_grads": inp_grads_full,
                         "param_groups": param_groups,
                     }
-                    if verbose_enabled:
-                        pg_summary = self._summarize_param_groups(param_groups)
-                        outstanding = self._summarize_outstanding_bwdi()
-                        self.logger.log(VERBOSE,
-                            f"[bwd_i_retain] rank={self.global_rank} ubid={ubid} mb={mb_idx}: "
-                            f"groups={pg_summary['groups']} "
-                            f"params={pg_summary['params']} "
-                            f"intermediates={pg_summary['intermediates']} "
-                            f"grad_tensors={pg_summary['grad_tensors']} "
-                            f"grad_bytes_gb={pg_summary['grad_bytes'] / (1024 ** 3):.2f} "
-                            f"saved_tensors={pg_summary['saved_tensors']} "
-                            f"saved_bytes_gb={pg_summary['saved_bytes'] / (1024 ** 3):.2f} "
-                            f"outstanding_buffers={outstanding['buffers']} "
-                            f"outstanding_grad_bytes_gb={outstanding['grad_bytes'] / (1024 ** 3):.2f} "
-                            f"outstanding_saved_bytes_gb={outstanding['saved_bytes'] / (1024 ** 3):.2f} "
-                            f"alloc_gb={torch.cuda.memory_allocated(self.device) / (1024 ** 3):.2f} "
-                            f"reserved_gb={torch.cuda.memory_reserved(self.device) / (1024 ** 3):.2f}"
-                        )
                     # Propagate input grad to SEND (if this is the first bucket and has predecessors).
                     if dinputs:
                         self.task_buffer[node.uid]["send_output"] = list(dinputs)
@@ -2010,148 +1442,117 @@ class PiperActor:
                     # activations and autograd edges alive through the optimizer step.
                     fwd_out.clear()
                     del stage_outputs_or_loss, fwd_out
-                    del self.task_buffer[(ubid, mb_idx)]
+                    del self.task_buffer[fwd_key]
                     evt = torch.cuda.Event()
-                    evt.record(node_comp_stream)
+                    evt.record(node_stream)
                     comp_events[node.uid] = evt
                     self.bwd_events[ubid] = evt
-                    last_comp_event_by_stream[node.compute_stream_id] = evt
-                    if node.custom_metadata.get("zero_free_full_params_after"):
-                        evt.synchronize()
-                        self._free_full_params(ubid)
+                    last_comp_event_by_stream[node_stream_id] = evt
+                    if self._node_meta(node).get("zero_free_full_params_after"):
+                        self._defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD_W:
                     _wait_for_all_gather(node)
-                    if node.custom_metadata.get("zero_alloc_full_grads_before"):
-                        self._alloc_full_grads(ubid)
+                    if self._node_meta(node).get("zero_alloc_full_grads_before"):
+                        self._alloc_full_grads(ubid, node_stream)
                     # data_preds[0] is the BWD_I task for bkt=K-1 (head of chain).
                     # For bkt<K-1 the chain-link edge (BWD_W predecessor) is prepended
                     # before Pass 2 appends the BWD_I edge, so data_preds[0] would be
                     # the wrong task.  Find BWD_I explicitly by type to be safe.
                     bwdi_node = next(p for p in node.data_preds if p.task_type == TaskType.BWD_I)
                     param_groups = self.task_buffer[bwdi_node.uid]["param_groups"]
-                    if verbose_enabled:
-                        pg_summary = self._summarize_param_groups(param_groups)
-                        outstanding = self._summarize_outstanding_bwdi()
-                        self.logger.log(VERBOSE,
-                            f"[bwd_w_begin] rank={self.global_rank} ubid={ubid} mb={mb_idx}: "
-                            f"groups={pg_summary['groups']} "
-                            f"params={pg_summary['params']} "
-                            f"intermediates={pg_summary['intermediates']} "
-                            f"grad_tensors={pg_summary['grad_tensors']} "
-                            f"grad_bytes_gb={pg_summary['grad_bytes'] / (1024 ** 3):.2f} "
-                            f"saved_tensors={pg_summary['saved_tensors']} "
-                            f"saved_bytes_gb={pg_summary['saved_bytes'] / (1024 ** 3):.2f} "
-                            f"outstanding_buffers={outstanding['buffers']} "
-                            f"outstanding_grad_bytes_gb={outstanding['grad_bytes'] / (1024 ** 3):.2f} "
-                            f"outstanding_saved_bytes_gb={outstanding['saved_bytes'] / (1024 ** 3):.2f} "
-                            f"alloc_gb={torch.cuda.memory_allocated(self.device) / (1024 ** 3):.2f} "
-                            f"reserved_gb={torch.cuda.memory_reserved(self.device) / (1024 ** 3):.2f}"
-                        )
                     b_fwd_args = self.bucket_fwd_args[ubid]
                     weights = [b_fwd_args[i] for i in self.bucket_param_idxs[ubid]
                                if b_fwd_args[i] is not None]
-                    self._nvtx_push(f"backward_weight_ubid{ubid}_mb{mb_idx}")
-                    self._start_timing(node_comp_stream, "backward_weight")
-                    with torch.cuda.stream(node_comp_stream):
+                    with torch.cuda.stream(node_stream):
                         self._bucket_backward_weight(iter(weights), param_groups, ubid=ubid, mb_idx=mb_idx)
-                    self._stop_timing(node_comp_stream, "backward_weight")
-                    self._nvtx_pop()
-                    self._accumulate_zero_param_grads_to_flat(ubid)
+                    self._accumulate_zero_param_grads_to_flat(ubid, node_stream)
                     self.task_buffer[node.uid] = {}
                     # BWD_I buffer is no longer needed: _bucket_backward_weight already
                     # deleted param_groups["intermediates"] and param_groups["grads"] and
                     # the autograd graph was freed by retain_graph=False.  Drop the shell.
                     self._release_task_buffer_uid(bwdi_node.uid)
                     evt = torch.cuda.Event()
-                    evt.record(node_comp_stream)
+                    evt.record(node_stream)
                     comp_events[node.uid] = evt
                     self.bwd_events[ubid] = evt
-                    last_comp_event_by_stream[node.compute_stream_id] = evt
-                    if node.custom_metadata.get("zero_free_full_params_after"):
-                        evt.synchronize()
-                        self._free_full_params(ubid)
+                    last_comp_event_by_stream[node_stream_id] = evt
+                    if self._node_meta(node).get("zero_free_full_params_after"):
+                        self._defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._nvtx_push("update")
-                    self._start_timing(self.comp_stream, "optim_step")
-                    self._update()
-                    self._stop_timing(self.comp_stream, "optim_step")
-                    self._nvtx_pop()
+                    self._update(node_stream)
 
-            if profiling:
-                _end_evt = torch.cuda.Event(enable_timing=True)
-                _end_evt.record(_stream)
-                _mem_after = torch.cuda.memory_allocated()
-                self._prof_records.append((node, mb_idx, ubid, _start_evt, _end_evt, _mem_before))
-                self.logger.info(f"Rank {self.global_rank} task {node.task_type.value} (time {node.time_step}) mem before {_mem_before / 1024 ** 3:.2f} GB after {_mem_after / 1024 ** 3:.2f} GB")
+                case TaskType.ORDER_DUMMY:
+                    pass
 
-            # if _log_heavy_task:
-                # self._log_mem(f"after_{_task_label}")
+            self._rf_exit(_rf)
             self._nvtx_pop()
 
-            if verbose_enabled:
-                tb_summary = self._summarize_task_buffer()
-                self.logger.log(VERBOSE,
-                    f"[task_mem] rank={self.global_rank} time={node.time_step} "
-                    f"task={node.task_type.value} mb={mb_idx} ubid={ubid}: "
-                    f"alloc_gb={torch.cuda.memory_allocated(self.device) / (1024 ** 3):.2f} "
-                    f"reserved_gb={torch.cuda.memory_reserved(self.device) / (1024 ** 3):.2f} "
-                    f"tb_entries={tb_summary['total_entries']} "
-                    f"tb_total_gb={tb_summary['total_bytes'] / (1024 ** 3):.2f} "
-                    f"fwd_mb_count={tb_summary['fwd_mb_count']} "
-                    f"fwd_mb_gb={tb_summary['fwd_mb_bytes'] / (1024 ** 3):.2f} "
-                    f"recv_count={tb_summary['recv_count']} "
-                    f"recv_gb={tb_summary['recv_bytes'] / (1024 ** 3):.2f} "
-                    f"bwd_i_count={tb_summary['bwd_i_count']} "
-                    f"bwd_i_gb={tb_summary['bwd_i_bytes'] / (1024 ** 3):.2f} "
-                    f"bwd_count={tb_summary['bwd_count']} "
-                    f"bwd_gb={tb_summary['bwd_bytes'] / (1024 ** 3):.2f} "
-                    f"shape_ref_count={tb_summary['shape_ref_count']} "
-                    f"shape_ref_gb={tb_summary['shape_ref_bytes'] / (1024 ** 3):.2f} "
-                    f"a2a_count={tb_summary['a2a_count']} "
-                    f"a2a_gb={tb_summary['a2a_bytes'] / (1024 ** 3):.2f} "
-                    f"other_count={tb_summary['other_count']} "
-                    f"other_gb={tb_summary['other_bytes'] / (1024 ** 3):.2f}"
+    def _log_compute_loss_inputs(self, node: Any, fwd_key: Any, fwd_out: dict) -> None:
+        def _summarize_value(value: Any) -> str:
+            if isinstance(value, torch.Tensor):
+                return (
+                    f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+                    f"requires_grad={value.requires_grad}, device={value.device})"
                 )
+            if isinstance(value, (list, tuple)):
+                return "[" + ", ".join(_summarize_value(v) for v in value) + "]"
+            if value is None:
+                return "None"
+            return type(value).__name__
 
-    def _exec_send(self, send_data, peer_pp_rank: int) -> None:
-        """Send tensors to peer_pp_rank on p2p_send_stream.
+        self.logger.debug(
+            "compute_loss inputs: rank=%s node_uid=%s node_type=%s tag=%s "
+            "fwd_key=%s labels=%s out_with_grad=%s pre_detach_outs=%s "
+            "detached_outs=%s send_output=%s",
+            self.global_rank,
+            getattr(node, "uid", None),
+            getattr(getattr(node, "task_type", None), "value", None),
+            getattr(node, "tag", None),
+            fwd_key,
+            _summarize_value(self.labels),
+            _summarize_value(fwd_out.get("out_with_grad")),
+            _summarize_value(fwd_out.get("pre_detach_outs")),
+            _summarize_value(fwd_out.get("detached_outs")),
+            _summarize_value(fwd_out.get("send_output")),
+        )
 
-        The caller (run_dag) must have already made p2p_send_stream wait on the
+    def _exec_send(self, send_data, peer_pp_rank: int, stream) -> None:
+        """Send tensors to peer_pp_rank on the stream assigned to the SEND node.
+
+        The caller (run_dag) must have already made the node stream wait on the
         compute event before calling this method.
         """
         global_dst_rank = _get_rank(peer_pp_rank, self.dp_rank, self.pp_degree)
-        if self.logger.isEnabledFor(VERBOSE):
-            self.logger.log(VERBOSE, f"exec_send to global rank {global_dst_rank}")
 
-        with torch.cuda.stream(self.p2p_send_stream):
+        with torch.cuda.stream(stream):
             tensors = send_data if isinstance(send_data, (list, tuple)) else [send_data]
-            pp_group = self.pp_lo_hi if global_dst_rank > self.global_rank else self.pp_hi_lo
+            use_lo_hi = global_dst_rank > self.global_rank
+            pp_group = self.pp_lo_hi if use_lo_hi else self.pp_hi_lo
             for tensor in tensors:
                 dist.send(tensor, dst=global_dst_rank, group=pp_group)
 
-    def _exec_recv_fwd(self, recv_ubid: int, peer_pp_rank: int) -> list:
+    def _exec_recv_fwd(self, recv_ubid: Any, peer_pp_rank: int, stream) -> list:
         """Receive FWD activations from peer_pp_rank into pre-allocated buffers.
 
         Buffer shapes are derived from the target bucket's stored input metadata.
         Returns the received tensor list (stored in task_buffer by run_dag).
         """
         global_src_rank = _get_rank(peer_pp_rank, self.dp_rank, self.pp_degree)
-        if self.logger.isEnabledFor(VERBOSE):
-            self.logger.log(VERBOSE, f"exec_recv_fwd ubid={recv_ubid} from global rank {global_src_rank}")
 
         buf = [
             torch.empty(shape, dtype=dtype, requires_grad=requires_grad, device=self.device)
             for shape, dtype, requires_grad in self.forward_input_meta[recv_ubid]
         ]
-        with torch.cuda.stream(self.p2p_recv_stream):
-            pp_group = self.pp_hi_lo if global_src_rank > self.global_rank else self.pp_lo_hi
+        with torch.cuda.stream(stream):
+            use_hi_lo = global_src_rank > self.global_rank
+            pp_group = self.pp_hi_lo if use_hi_lo else self.pp_lo_hi
             for tensor in buf:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
 
-    def _exec_recv_bwd(self, shape_meta: list, peer_pp_rank: int) -> list:
+    def _exec_recv_bwd(self, shape_meta: list, peer_pp_rank: int, stream) -> list:
         """Receive BWD upstream gradients from peer_pp_rank.
 
         Buffer shapes are derived from shape_meta, a list of (shape, dtype) tuples
@@ -2159,28 +1560,27 @@ class PiperActor:
         Returns the received gradient list (stored in task_buffer by run_dag).
         """
         global_src_rank = _get_rank(peer_pp_rank, self.dp_rank, self.pp_degree)
-        if self.logger.isEnabledFor(VERBOSE):
-            self.logger.log(VERBOSE, f"exec_recv_bwd from global rank {global_src_rank}")
 
         buf = [torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in shape_meta]
-        with torch.cuda.stream(self.p2p_recv_stream):
-            pp_group = self.pp_hi_lo if global_src_rank > self.global_rank else self.pp_lo_hi
+        with torch.cuda.stream(stream):
+            use_hi_lo = global_src_rank > self.global_rank
+            pp_group = self.pp_hi_lo if use_hi_lo else self.pp_lo_hi
             for tensor in buf:
                 dist.recv(tensor, src=global_src_rank, group=pp_group)
         return buf
 
-    def _exec_a2a(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        """Apply dist.all_to_all_single on a2a_stream and return the output tensor.
+    def _exec_a2a(self, input_tensor: torch.Tensor, stream) -> torch.Tensor:
+        """Apply dist.all_to_all_single on the node stream and return the output tensor.
 
         Used for both FWD_A2A and BWD_A2A — the operation is symmetric.
         Stream waits and event recording are handled by run_dag.
         """
         output_buf = torch.empty_like(input_tensor, device=self.device)
-        with torch.cuda.stream(self.a2a_stream):
+        with torch.cuda.stream(stream):
             dist.all_to_all_single(output_buf, input_tensor, group=self.ep_group)
         return output_buf
 
-    def _forward_dag(self, ubid: int, mb_idx: int, input_tensors, compute_stream) -> dict:
+    def _forward_dag(self, ubid: Any, mb_idx: int, input_tensors, compute_stream) -> dict:
         """Run the forward function for bucket *ubid* and return a result dict.
 
         The result dict always contains:
@@ -2219,14 +1619,6 @@ class PiperActor:
 
         inp_with_grad = [t for t in fwd_inputs if t is not None and t.requires_grad]
 
-        if ubid not in self._logged_bucket_forward_info:
-            self._logged_bucket_forward_info.add(ubid)
-            self.logger.log(VERBOSE,
-                f"[ac_forward] rank={self.global_rank} ubid={ubid}: "
-                f"ac_subgraphs={self.bucket_ac_subgraph_counts.get(ubid, 1)} "
-                f"inputs={len(input_idxs)}"
-            )
-
         # Run the forward function.
         with torch.cuda.stream(compute_stream):
             output = fwd_fn(fwd_args)
@@ -2259,7 +1651,7 @@ class PiperActor:
 
     def _backward_dag(
         self,
-        ubid: int,
+        ubid: Any,
         mb_idx: int,
         outputs_or_loss: list,
         upstream_grads,
@@ -2311,6 +1703,62 @@ class PiperActor:
                 return {"send_output": output_grads}
         return None
 
+    @staticmethod
+    def _grad_with_param_layout(weight: Parameter, grad: torch.Tensor) -> torch.Tensor:
+        if (
+            grad.dtype == weight.dtype
+            and grad.device == weight.device
+            and grad.layout == weight.layout
+            and tuple(grad.stride()) == tuple(weight.stride())
+        ):
+            return grad
+        if weight.layout == torch.strided and grad.layout != torch.strided:
+            grad = grad.to_dense()
+        out = torch.empty_strided(
+            tuple(weight.shape),
+            tuple(weight.stride()),
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        out.copy_(grad)
+        return out
+
+    def _fused_backward(self, stage_outputs_or_loss: list, output_grads, weights: list) -> None:
+        """Fused backward writing weight grads directly into ``weight.grad``.
+
+        Used for the first pipeline stage, whose inputs (token ids) do not
+        require grad. The split B/W path relies on input-grad prehooks firing to
+        capture intermediate grads, but with no input grads to compute those
+        prehooks never run and stage 0 would never accumulate weight gradients.
+        Computing dW in one pass here (and no-opping the paired BWD_W) keeps the
+        first stage training without redundant work.
+        """
+        wts = [w for w in weights if w.requires_grad]
+        if not wts:
+            return
+        dweights = torch.autograd.grad(
+            stage_outputs_or_loss,
+            inputs=wts,
+            grad_outputs=output_grads,
+            retain_graph=False,
+            allow_unused=True,
+        )
+        for w, dw in zip(wts, dweights):
+            if dw is None:
+                continue
+            dw = self._grad_with_param_layout(w, dw)
+            if w.grad is None:
+                w.grad = dw
+            else:
+                if (
+                    w.grad.dtype != w.dtype
+                    or w.grad.device != w.device
+                    or w.grad.layout != w.layout
+                    or tuple(w.grad.stride()) != tuple(w.stride())
+                ):
+                    w.grad = self._grad_with_param_layout(w, w.grad)
+                w.grad += dw
+
     def _bucket_backward_input(
         self,
         stage_outputs_or_loss: list,
@@ -2324,6 +1772,24 @@ class PiperActor:
         with "stage" replaced by "bucket".  Returns ``(dinputs, param_groups)``.
         """
         from .backward_utils import get_param_groups, construct_reverse_graph, _get_grad_fn_or_grad_acc
+
+        weights = list(weights)
+
+        if output_grads is None:
+            output_grads = [torch.ones_like(o) for o in stage_outputs_or_loss]
+
+        input_values = [inp for inp in input_values if inp.requires_grad]
+        if not input_values:
+            # First pipeline stage: no input gradient to compute or send. The
+            # split B/W mechanism would never fire its prehooks here, so compute
+            # weight grads in a single fused backward and return empty
+            # param_groups so the paired BWD_W is a no-op.
+            self._fused_backward(stage_outputs_or_loss, output_grads, weights)
+            for i, t in enumerate(stage_outputs_or_loss):
+                if not isinstance(t, torch.Tensor):
+                    continue
+                stage_outputs_or_loss[i] = t.detach()
+            return (), []
 
         stage_output_grad_fns = list(filter(None, map(_get_grad_fn_or_grad_acc, stage_outputs_or_loss)))
         stage_input_grad_fns = list(filter(None, map(_get_grad_fn_or_grad_acc, input_values)))
@@ -2343,25 +1809,18 @@ class PiperActor:
                     return hook
                 handles.append(intermediate.register_prehook(get_hook(param_group, i)))
 
-        if output_grads is None:
-            output_grads = [torch.ones_like(o) for o in stage_outputs_or_loss]
-
-        input_values = [inp for inp in input_values if inp.requires_grad]
-        if input_values:
-            dinputs = torch.autograd.grad(
-                stage_outputs_or_loss,
-                inputs=input_values,
-                grad_outputs=output_grads,
-                retain_graph=True,
-                allow_unused=True,
-            )
-            for inp, dinput in zip(input_values, dinputs):
-                if inp.grad is None:
-                    inp.grad = dinput
-                else:
-                    inp.grad += dinput
-        else:
-            dinputs = ()
+        dinputs = torch.autograd.grad(
+            stage_outputs_or_loss,
+            inputs=input_values,
+            grad_outputs=output_grads,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        for inp, dinput in zip(input_values, dinputs):
+            if inp.grad is None:
+                inp.grad = dinput
+            else:
+                inp.grad += dinput
 
         # Match torch.distributed.pipelining.stage_backward_input(): once dinputs
         # are computed, these outputs are no longer needed by the later weight
@@ -2369,25 +1828,28 @@ class PiperActor:
         for i, t in enumerate(stage_outputs_or_loss):
             if not isinstance(t, torch.Tensor):
                 continue
-            try:
-                t.detach_()
-            except RuntimeError:
-                # Some tensors may be views; replace the list entry so the original
-                # graph-carrying tensor can be released once local refs are dropped.
-                stage_outputs_or_loss[i] = t.detach()
+            stage_outputs_or_loss[i] = t.detach()
 
         for handle in handles:
             handle.remove()
 
         return dinputs, param_groups
 
-    def _bucket_backward_weight(self, weights, param_groups: list, ubid: int | None = None, mb_idx: int | None = None) -> None:
+    def _bucket_backward_weight(self, weights, param_groups: list, ubid: Any | None = None, mb_idx: int | None = None) -> None:
         """Compute weight gradients for a single bucket (BWD_W).
 
         Matches ``torch.distributed.pipelining.stage_backward_weight`` exactly,
         with "stage" replaced by "bucket".  Accumulates gradients into param.grad.
         """
+        if not param_groups:
+            # First-stage BWD_W is a no-op: BWD_I already ran the fused backward and
+            # wrote weight.grad directly, so there are no param_groups to consume.
+            # Skip the grad-accumulator preamble (one throwaway view per weight).
+            return
+
         grad_acc_to_weight: Dict[Node, Parameter] = {}
+        _grad_with_param_layout = self._grad_with_param_layout
+
         for weight in weights:
             grad_acc = _get_grad_fn_or_grad_acc(weight)
             grad_acc_to_weight[grad_acc] = weight
@@ -2415,23 +1877,12 @@ class PiperActor:
             if not weight_edges:
                 continue
 
-            try:
-                dweights = torch.autograd.grad(
-                    valid_edges,
-                    weight_edges,
-                    grad_outputs=valid_grad_outputs,
-                    retain_graph=False,
-                )
-            except torch.OutOfMemoryError:
-                self.logger.error(
-                    f"[bwd_w_oom] rank={self.global_rank} ubid={ubid} mb={mb_idx}: "
-                    f"group_params={len(param_group['params'])} "
-                    f"group_valid_edges={len(valid_edges)} "
-                    f"group_grad_outputs={len(valid_grad_outputs)} "
-                    f"alloc_gb={torch.cuda.memory_allocated(self.device) / (1024 ** 3):.2f} "
-                    f"reserved_gb={torch.cuda.memory_reserved(self.device) / (1024 ** 3):.2f}"
-                )
-                raise
+            dweights = torch.autograd.grad(
+                valid_edges,
+                weight_edges,
+                grad_outputs=valid_grad_outputs,
+                retain_graph=False,
+            )
 
             del param_group["grads"]
 
@@ -2439,404 +1890,261 @@ class PiperActor:
                 if dw is None or grad_acc not in grad_acc_to_weight:
                     continue
                 weight = grad_acc_to_weight[grad_acc]
+                dw = _grad_with_param_layout(weight, dw)
                 if weight.grad is None:
                     weight.grad = dw
                 else:
+                    if (
+                        weight.grad.dtype != weight.dtype
+                        or weight.grad.device != weight.device
+                        or weight.grad.layout != weight.layout
+                        or tuple(weight.grad.stride()) != tuple(weight.stride())
+                    ):
+                        weight.grad = _grad_with_param_layout(weight, weight.grad)
                     weight.grad += dw
 
-    def _exec_all_reduce_grads(self, ubid: int) -> int:
-        """All-reduce each materialized parameter grad for *ubid* on ar_stream.
+    def _exec_all_reduce_grads(self, ubid: Any, stream) -> int:
+        """All-reduce each materialized parameter grad for *ubid* on *stream*.
 
         Returns the total payload bytes actually dispatched at runtime.
         """
-        if self.zero_stage == 1 and ubid in self.bucket_flat_grads:
-            flat_grads = self.bucket_flat_grads.get(ubid)
-            if flat_grads is None:
-                self.logger.log(VERBOSE,
-                    f"[all_reduce_bucket] rank={self.global_rank} ubid={ubid}: "
-                    "skipped no ZeRO flat grad buffer"
-                )
-                return 0
-            total_bytes = flat_grads.numel() * flat_grads.element_size()
-            self.logger.log(VERBOSE,
-                f"[collective_payload] op=all_reduce rank={self.global_rank} "
-                f"ubid={ubid} mode=flat numel={flat_grads.numel()} "
-                f"element_size={flat_grads.element_size()} dtype={flat_grads.dtype} "
-                f"payload_bytes={total_bytes}"
-            )
-            with torch.cuda.stream(self.ar_stream):
-                dist.all_reduce(flat_grads, group=self.dp_group)
-            return total_bytes
-
+        assert ubid is not None, "_exec_all_reduce_grads requires a non-None ubid"
+        if not self._has_trainable_params_for_collective(ubid, "_exec_all_reduce_grads"):
+            return 0
         args = self.bucket_fwd_args.get(ubid, [])
         trainable_idxs = self.bucket_trainable_param_idxs.get(ubid, [])
         grad_tensors = []
         for idx in trainable_idxs:
             param = args[idx]
-            if param is not None and param.grad is not None:
-                grad_tensors.append((idx, param.grad))
-
-        if not grad_tensors:
-            self.logger.log(VERBOSE,
-                f"[all_reduce_bucket] rank={self.global_rank} ubid={ubid}: "
-                "skipped no materialized grads"
+            assert param is not None, (
+                f"_exec_all_reduce_grads: ubid={ubid} idx={idx} param is None"
             )
-            return 0
+            assert param.grad is not None, (
+                f"_exec_all_reduce_grads: ubid={ubid} idx={idx} param.grad is None"
+            )
+            grad_tensors.append((idx, param.grad))
 
-        total_numel = sum(grad.numel() for _, grad in grad_tensors)
         total_bytes = sum(grad.numel() * grad.element_size() for _, grad in grad_tensors)
-        largest_idx, largest_grad = max(grad_tensors, key=lambda item: item[1].numel())
-        largest_bytes = largest_grad.numel() * largest_grad.element_size()
-        dtype_summary = ",".join(sorted({str(grad.dtype) for _, grad in grad_tensors}))
-        self.logger.log(VERBOSE,
-            f"[collective_payload] op=all_reduce rank={self.global_rank} "
-            f"ubid={ubid} mode=per_param grad_tensors={len(grad_tensors)} "
-            f"numel={total_numel} payload_bytes={total_bytes} dtypes={dtype_summary}"
-        )
-        self.logger.log(VERBOSE,
-            f"[all_reduce_bucket] rank={self.global_rank} ubid={ubid}: "
-            f"mode=per_param grad_tensors={len(grad_tensors)} "
-            f"grad_numel={total_numel} "
-            f"grad_gb={total_bytes / (1024 ** 3):.4f} "
-            f"largest_idx={largest_idx} "
-            f"largest_numel={largest_grad.numel()} "
-            f"largest_gb={largest_bytes / (1024 ** 3):.4f} "
-            f"grad_dtype={largest_grad.dtype} "
-            f"dp_degree={self.dp_degree}"
-        )
-        for grad_order, (idx, grad) in enumerate(grad_tensors):
-            grad_bytes = grad.numel() * grad.element_size()
-            data_ptr_mod_256 = grad.data_ptr() % 256 if grad.is_cuda else -1
-            self.logger.log(VERBOSE,
-                f"[all_reduce_grad] rank={self.global_rank} ubid={ubid} "
-                f"order={grad_order} idx={idx}: "
-                f"shape={tuple(grad.shape)} stride={tuple(grad.stride())} "
-                f"numel={grad.numel()} gb={grad_bytes / (1024 ** 3):.4f} "
-                f"dtype={grad.dtype} device={grad.device} "
-                f"contiguous={grad.is_contiguous()} "
-                f"storage_offset={grad.storage_offset()} "
-                f"data_ptr_mod_256={data_ptr_mod_256}"
-            )
-        with torch.cuda.stream(self.ar_stream):
+        with torch.cuda.stream(stream):
             for _, grad in grad_tensors:
                 dist.all_reduce(grad, group=self.dp_group)
         return total_bytes
 
-    def _alloc_full_params(self, ubid: int | None) -> None:
-        if self.zero_stage != 3:
-            return
-        if ubid is None:
-            return
-        shard_info = self.param_shard_info.get(ubid)
-        if shard_info is None:
-            return
-        _shard_start, shard_size, _orig_numel = shard_info
+    def _has_trainable_params_for_collective(self, ubid: Any, op_name: str) -> bool:
+        trainable_idxs = self.bucket_trainable_param_idxs.get(ubid, [])
+        if trainable_idxs:
+            return True
+        self.logger.warning(
+            "%s: skipping collective for ubid=%s because it has no trainable param indices",
+            op_name,
+            ubid,
+        )
+        return False
+
+    def _alloc_full_params(self, ubid: Any) -> None:
+        assert ubid is not None, "_alloc_full_params requires a non-None ubid"
+        assert ubid in self.param_sharded_ubids, (
+            f"_alloc_full_params: ubid={ubid} is not in param_sharded_ubids={self.param_sharded_ubids}"
+        )
+        self._wait_pending_free(self.pending_param_frees, ubid)
+        assert self.param_shard_info.get(ubid) is not None, (
+            f"_alloc_full_params: missing param_shard_info for ubid={ubid}"
+        )
         full = self.bucket_flat_params.get(ubid)
-        if full is None:
-            full = self.bucket_shard_params[ubid].new_empty(shard_size * self.dp_degree)
-            self.bucket_flat_params[ubid] = full
+        assert full is not None, (
+            f"_alloc_full_params: missing bucket_flat_params buffer for ubid={ubid}"
+        )
+        specs = self.bucket_param_view_specs.get(ubid, [])
+        assert specs, f"_alloc_full_params: missing bucket_param_view_specs for ubid={ubid}"
         storage = full.untyped_storage()
         required_bytes = full.numel() * full.element_size()
-        if storage.size() != required_bytes:
-            storage.resize_(required_bytes)
+        storage.resize_(required_bytes)
         self.logger.debug(
-            f"[zero3_alloc_full_params] rank={self.global_rank} ubid={ubid}: "
+            f"[alloc_full_params] rank={self.global_rank} ubid={ubid}: "
             f"numel={full.numel()} required_bytes={required_bytes} "
-            f"storage_size={storage.size()} fresh={self.zero3_full_params_fresh.get(ubid, False)}"
+            f"storage_size={storage.size()} fresh={self.full_params_fresh.get(ubid, False)}"
         )
-        for param, offset, numel, shape in self.bucket_param_view_specs.get(ubid, []):
+        for param, offset, numel, shape in specs:
             param.data = full[offset:offset + numel].view(shape)
             param.requires_grad_(True)
         param_names = self.bucket_param_names.get(ubid, [])
         zero_storage = []
-        for i, (param, offset, numel, shape) in enumerate(self.bucket_param_view_specs.get(ubid, [])):
+        for i, (param, offset, numel, shape) in enumerate(specs):
             p_storage = param.untyped_storage()
             if p_storage.size() == 0:
                 name = param_names[i] if i < len(param_names) else f"param{i}"
                 zero_storage.append(
                     f"{name}: offset={offset} numel={numel} shape={shape} stride={tuple(param.stride())}"
                 )
-        if zero_storage:
-            self.logger.error(
-                f"[zero3_alloc_full_params_zero_storage] rank={self.global_rank} ubid={ubid}: "
-                + " | ".join(zero_storage)
-            )
+        assert not zero_storage, (
+            f"[alloc_full_params_zero_storage] rank={self.global_rank} ubid={ubid}: "
+            + " | ".join(zero_storage)
+        )
 
-    def _free_full_params(self, ubid: int | None) -> None:
-        if self.zero_stage != 3:
-            return
+    def _free_full_params(self, ubid: Any) -> None:
+        assert ubid is not None, "_free_full_params requires a non-None ubid"
+        assert ubid in self.param_sharded_ubids, (
+            f"_free_full_params: ubid={ubid} is not in param_sharded_ubids={self.param_sharded_ubids}"
+        )
         full = self.bucket_flat_params.get(ubid)
-        if full is None:
-            return
+        assert full is not None, (
+            f"_free_full_params: missing bucket_flat_params buffer for ubid={ubid}"
+        )
         storage = full.untyped_storage()
         self.logger.debug(
-            f"[zero3_free_full_params] rank={self.global_rank} ubid={ubid}: "
-            f"storage_size_before={storage.size()} fresh_before={self.zero3_full_params_fresh.get(ubid, False)}"
+            f"[free_full_params] rank={self.global_rank} ubid={ubid}: "
+            f"storage_size_before={storage.size()} fresh_before={self.full_params_fresh.get(ubid, False)}"
         )
-        if storage.size() != 0:
-            storage.resize_(0)
-        self.zero3_full_params_fresh[ubid] = False
+        storage.resize_(0)
+        self.full_params_fresh[ubid] = False
 
-    def _alloc_full_grads(self, ubid: int | None) -> None:
+    def _alloc_full_grads(self, ubid: Any, stream: "torch.cuda.Stream") -> None:
+        assert ubid is not None, "_alloc_full_grads requires a non-None ubid"
+        assert ubid in self.grad_sharded_ubids, (
+            f"_alloc_full_grads: ubid={ubid} is not in grad_sharded_ubids={self.grad_sharded_ubids}"
+        )
+        self._wait_pending_free(self.pending_grad_frees, ubid)
         specs = self.bucket_param_view_specs.get(ubid, [])
-        assert specs, f"Expected param view specs for ubid={ubid}"
-        flat_grads = self.bucket_flat_grads.get(ubid)
-        if flat_grads is None:
-            shard_info = self.param_shard_info.get(ubid)
-            if shard_info is None:
-                return
-            _shard_start, shard_size, _orig_numel = shard_info
-            flat_grads = torch.zeros(
-                shard_size * self.dp_degree,
-                dtype=self.zero_grad_dtype,
-                device=self.device,
-            )
-            self.bucket_flat_grads[ubid] = flat_grads
-        else:
-            flat_grads.zero_()
-        if self.zero_stage in (2, 3) and self.bucket_rs_grads.get(ubid) is None:
-            shard_info = self.param_shard_info.get(ubid)
-            if shard_info is None:
-                return
-            _shard_start, shard_size, _orig_numel = shard_info
-            self.bucket_rs_grads[ubid] = torch.zeros(
-                shard_size, dtype=self.zero_grad_dtype, device=self.device
-            )
+        assert specs, f"_alloc_full_grads: missing bucket_param_view_specs for ubid={ubid}"
+        shard_info = self.param_shard_info.get(ubid)
+        assert shard_info is not None, (
+            f"_alloc_full_grads: missing param_shard_info for ubid={ubid}"
+        )
+        shard_size = shard_info[1]
+        with torch.cuda.stream(stream):
+            if self.bucket_flat_grads.get(ubid) is None:
+                self.bucket_flat_grads[ubid] = torch.zeros(
+                    shard_size * self.dp_degree,
+                    dtype=self.grad_buffer_dtype,
+                    device=self.device,
+                )
+            if self.bucket_rs_grads.get(ubid) is None:
+                self.bucket_rs_grads[ubid] = torch.zeros(
+                    shard_size, dtype=self.grad_buffer_dtype, device=self.device
+                )
 
-    def _free_full_grads(self, ubid: int | None) -> None:
-        for param, *_ in self.bucket_param_view_specs.get(ubid, []):
+    def _free_full_grads(self, ubid: Any) -> None:
+        assert ubid is not None, "_free_full_grads requires a non-None ubid"
+        assert ubid in self.grad_sharded_ubids, (
+            f"_free_full_grads: ubid={ubid} is not in grad_sharded_ubids={self.grad_sharded_ubids}"
+        )
+        specs = self.bucket_param_view_specs.get(ubid, [])
+        assert specs, f"_free_full_grads: missing bucket_param_view_specs for ubid={ubid}"
+        for param, *_ in specs:
             param.grad = None
-        if self.zero_stage in (2, 3):
-            self.bucket_flat_grads[ubid] = None
+        self.bucket_flat_grads[ubid] = None
 
-    def _exec_reduce_scatter(self, ubid: int) -> int:
-        with torch.cuda.stream(self.ar_stream):
-            flat_grads = self.bucket_flat_grads.get(ubid)
-            _shard_start, shard_size, _orig_numel = self.param_shard_info.get(ubid)
-            # add logging here
-            rs_out = self.bucket_rs_grads.get(ubid)
-            if flat_grads is None or rs_out is None:
-                if flat_grads is None:
-                    self.logger.warning(f"[reduce_scatter_alloc] rank={self.global_rank} ubid={ubid}: Found no flat grad buffer")
-                    flat_grads = torch.zeros(
-                        shard_size * self.dp_degree,
-                        dtype=self.zero_grad_dtype,
-                        device=self.device,
-                    )
-                    self.bucket_flat_grads[ubid] = flat_grads
-                if rs_out is None:
-                    rs_out = torch.zeros(
-                        shard_size, dtype=self.zero_grad_dtype, device=self.device
-                    )
-                    self.bucket_rs_grads[ubid] = rs_out
-            assert flat_grads is not None and rs_out is not None, (
-                f"REDUCE_SCATTER dispatched for ubid={ubid} without allocated gradient buffers"
-            )
+    def _exec_reduce_scatter(self, ubid: Any, stream) -> int:
+        assert ubid is not None, "_exec_reduce_scatter requires a non-None ubid"
+        if not self._has_trainable_params_for_collective(ubid, "_exec_reduce_scatter"):
+            return 0
+        assert ubid in self.grad_sharded_ubids, (
+            f"_exec_reduce_scatter: ubid={ubid} is not in grad_sharded_ubids={self.grad_sharded_ubids}"
+        )
+        assert self.param_shard_info.get(ubid) is not None, (
+            f"_exec_reduce_scatter: missing param_shard_info for ubid={ubid}"
+        )
+        flat_grads = self.bucket_flat_grads.get(ubid)
+        rs_out = self.bucket_rs_grads.get(ubid)
+        assert flat_grads is not None, (
+            f"_exec_reduce_scatter: missing bucket_flat_grads buffer for ubid={ubid}"
+        )
+        assert rs_out is not None, (
+            f"_exec_reduce_scatter: missing bucket_rs_grads buffer for ubid={ubid}"
+        )
+        with torch.cuda.stream(stream):
             total_bytes = flat_grads.numel() * flat_grads.element_size()
-            self.logger.log(VERBOSE,
-                f"[collective_payload] op=reduce_scatter rank={self.global_rank} "
-                f"ubid={ubid} input_numel={flat_grads.numel()} "
-                f"input_element_size={flat_grads.element_size()} input_dtype={flat_grads.dtype} "
-                f"payload_bytes={total_bytes} output_numel={rs_out.numel()} "
-                f"output_element_size={rs_out.element_size()} output_dtype={rs_out.dtype}"
-            )
             tmp = torch.empty_like(rs_out)
-            flat_grads[_shard_start:_shard_start + shard_size].add_(rs_out)
-            dist.reduce_scatter_tensor(rs_out, flat_grads, group=self.dp_group)
+            dist.reduce_scatter_tensor(tmp, flat_grads, group=self.dp_group)
             rs_out.add_(tmp)
             return total_bytes
 
     def _exec_all_gather(
         self,
-        ubid: int | None,
-    ):
-        if ubid is None:
-            return False
-        with torch.cuda.stream(self.ar_stream):
-            flat_params = self.bucket_flat_params.get(ubid)
-            shard_in = self.bucket_shard_params.get(ubid)
-            if flat_params is None or shard_in is None:
-                return False
-            if self.zero_stage == 3 and self.zero3_full_params_fresh.get(ubid, False):
-                self.logger.debug(
-                    f"[zero3_all_gather_skip] rank={self.global_rank} ubid={ubid}: "
-                    f"storage_size={flat_params.untyped_storage().size()} fresh=True"
-                )
-                return False
+        ubid: Any,
+        stream,
+    ) -> int:
+        assert ubid is not None, "_exec_all_gather requires a non-None ubid"
+        if not self._has_trainable_params_for_collective(ubid, "_exec_all_gather"):
+            return 0
+        assert ubid in self.param_sharded_ubids, (
+            f"_exec_all_gather: ubid={ubid} is not in param_sharded_ubids={self.param_sharded_ubids}"
+        )
+        self._alloc_full_params(ubid)
+        flat_params = self.bucket_flat_params.get(ubid)
+        shard_in = self.bucket_shard_params.get(ubid)
+        assert flat_params is not None, (
+            f"_exec_all_gather: missing bucket_flat_params buffer for ubid={ubid}"
+        )
+        assert shard_in is not None, (
+            f"_exec_all_gather: missing bucket_shard_params buffer for ubid={ubid}"
+        )
+        assert not self.full_params_fresh.get(ubid, False), (
+            f"_exec_all_gather: ubid={ubid} dispatched but full params are already fresh; "
+            "DAG is constructing a redundant ALL_GATHER"
+        )
+        with torch.cuda.stream(stream):
             self.logger.debug(
-                f"[zero3_all_gather_begin] rank={self.global_rank} ubid={ubid}: "
+                f"[all_gather_begin] rank={self.global_rank} ubid={ubid}: "
                 f"flat_numel={flat_params.numel()} flat_storage={flat_params.untyped_storage().size()} "
-                f"shard_numel={shard_in.numel()} shard_storage={shard_in.untyped_storage().size()} "
-                f"fresh={self.zero3_full_params_fresh.get(ubid, False)}"
+                f"shard_numel={shard_in.numel()} shard_storage={shard_in.untyped_storage().size()}"
             )
             dist.all_gather_into_tensor(flat_params, shard_in, group=self.dp_group)
-            if self.zero_stage == 3:
-                self.zero3_full_params_fresh[ubid] = True
+            self.full_params_fresh[ubid] = True
             self.logger.debug(
-                f"[zero3_all_gather_end] rank={self.global_rank} ubid={ubid}: "
-                f"flat_storage={flat_params.untyped_storage().size()} fresh={self.zero3_full_params_fresh.get(ubid, False)}"
+                f"[all_gather_end] rank={self.global_rank} ubid={ubid}: "
+                f"flat_storage={flat_params.untyped_storage().size()}"
             )
-        return True
+            return flat_params.numel() * flat_params.element_size()
 
-    def _update(self, *deps):
-        if self.zero_stage > 0:
-            sync_events = self.ar_events if self.zero_stage == 1 else self.rs_events
-            for evt in sync_events.values():
-                self.comp_stream.wait_event(evt)
+    def _update(self, stream, *deps):
+        self._drain_pending_frees()
+        if self.bucket_shard_optims:
+            for evt in self.rs_events.values():
+                stream.wait_event(evt)
 
             for ubid, shard_optim in self.bucket_shard_optims.items():
                 shard_param = self.bucket_shard_params[ubid]
-                shard_start, shard_size, _orig_numel = self.param_shard_info[ubid]
-                if self.zero_stage == 1:
-                    flat_grads = self.bucket_flat_grads.get(ubid)
-                    if flat_grads is None:
-                        continue
-                    shard_param.grad = flat_grads[shard_start:shard_start + shard_size].to(shard_param.dtype)
-                else:
-                    rs_grad = self.bucket_rs_grads.get(ubid)
-                    if rs_grad is None:
-                        continue
+                rs_grad = self.bucket_rs_grads.get(ubid)
+                if rs_grad is None:
+                    continue
+                with torch.cuda.stream(stream):
                     shard_param.grad = rs_grad.to(shard_param.dtype)
-                with torch.cuda.stream(self.comp_stream):
                     shard_optim.step()
                 shard_param.grad = None
 
-            if self.zero_stage == 3:
-                for ubid, specs in self.bucket_param_view_specs.items():
-                    for param, *_ in specs:
-                        param.grad = None
-                    full = self.bucket_flat_params.get(ubid)
-                    if full is not None:
-                        storage = full.untyped_storage()
-                        if storage.size() != 0:
-                            storage.resize_(0)
-                    self.zero3_full_params_fresh[ubid] = False
+            for ubid in self.param_sharded_ubids:
+                for param, *_ in self.bucket_param_view_specs.get(ubid, []):
+                    param.grad = None
+                full = self.bucket_flat_params.get(ubid)
+                if full is not None:
+                    storage = full.untyped_storage()
+                    if storage.size() != 0:
+                        storage.resize_(0)
+                self.full_params_fresh[ubid] = False
 
             losses = self.loss
             self.loss.clear()
             torch.cuda.synchronize()
             return losses
 
-        pre_step_mem: dict = {}
-        grad_debug: dict = {}
-
         for ar_evt in self.ar_events.values():
-            self.comp_stream.wait_event(ar_evt)
+            stream.wait_event(ar_evt)
 
         for ubid, optim in self.bucket_optims.items():
             if optim is None:
                 continue
             bwd_evt = self.bwd_events.get(ubid)
             if bwd_evt is not None:
-                self.comp_stream.wait_event(bwd_evt)
+                stream.wait_event(bwd_evt)
 
-            params = self.bucket_fwd_args.get(ubid, [])
-            trainable_idxs = self.bucket_trainable_param_idxs.get(ubid, [])
-
-            params_with_grad = 0
-            total_trainable_params = 0
-            total_grad_elems = 0
-            for idx in trainable_idxs:
-                p = params[idx]
-                if p is None:
-                    continue
-                total_trainable_params += p.numel()
-                if p.grad is not None:
-                    params_with_grad += 1
-                    total_grad_elems += p.grad.numel()
-
-            # Exact zero-gradient detection requires scanning each grad tensor and
-            # can allocate a large temporary near peak memory. Treat materialized
-            # grads as active here; structural sparse expert metadata would be
-            # needed to preserve skip-zero semantics without a dense value scan.
-            nonzero_grad_params = params_with_grad
-            nonzero_grad_elems = total_grad_elems
-            zero_grad_params = 0
-
-            state_entries_before = sum(len(optim.state[p]) > 0 for p in optim.param_groups[0]["params"])
-            pre_step_mem[ubid] = (
-                torch.cuda.memory_allocated(self.device),
-                torch.cuda.memory_reserved(self.device),
-            )
-            grad_debug[ubid] = {
-                "num_params": len(trainable_idxs),
-                "params_with_grad": params_with_grad,
-                "nonzero_grad_params": nonzero_grad_params,
-                "total_trainable_params": total_trainable_params,
-                "total_grad_elems": total_grad_elems,
-                "nonzero_grad_elems": nonzero_grad_elems,
-                "zero_grad_params": zero_grad_params,
-                "state_entries_before": state_entries_before,
-            }
-            self.logger.log(VERBOSE,
-                f"[optim_debug_pre] rank={self.global_rank} ubid={ubid}: "
-                f"params={len(trainable_idxs)} "
-                f"params_with_grad={params_with_grad} "
-                f"nonzero_grad_params={nonzero_grad_params} "
-                f"zero_grad_params={zero_grad_params} "
-                f"trainable_elems={total_trainable_params} "
-                f"grad_elems={total_grad_elems} "
-                f"nonzero_grad_elems={nonzero_grad_elems} "
-                f"state_entries_before={state_entries_before} "
-                f"alloc_before_gb={pre_step_mem[ubid][0] / (1024 ** 3):.2f} "
-                f"reserved_before_gb={pre_step_mem[ubid][1] / (1024 ** 3):.2f}"
-            )
-            try:
-                with torch.cuda.stream(self.comp_stream):
-                    optim.step()
-            except torch.OutOfMemoryError:
-                alloc_now = torch.cuda.memory_allocated(self.device)
-                reserv_now = torch.cuda.memory_reserved(self.device)
-                self.logger.error(
-                    f"[optim_debug_oom] rank={self.global_rank} ubid={ubid}: "
-                    f"state_entries_before={state_entries_before} "
-                    f"alloc_now_gb={alloc_now / (1024 ** 3):.2f} "
-                    f"reserved_now_gb={reserv_now / (1024 ** 3):.2f}"
-                )
-                raise
+            with torch.cuda.stream(stream):
+                optim.step()
 
         losses = self.loss
         self.loss.clear()
 
         torch.cuda.synchronize()
-
-        for ubid, optim in self.bucket_optims.items():
-            if optim is None or ubid not in grad_debug:
-                continue
-            alloc_before, reserv_before = pre_step_mem[ubid]
-            alloc_after = torch.cuda.memory_allocated(self.device)
-            reserv_after = torch.cuda.memory_reserved(self.device)
-            state_entries_after = sum(len(optim.state[p]) > 0 for p in optim.param_groups[0]["params"])
-            dbg = grad_debug[ubid]
-            self.logger.log(VERBOSE,
-                f"[optim_debug] rank={self.global_rank} ubid={ubid}: "
-                f"params={dbg['num_params']} "
-                f"params_with_grad={dbg['params_with_grad']} "
-                f"nonzero_grad_params={dbg['nonzero_grad_params']} "
-                f"zero_grad_params={dbg['zero_grad_params']} "
-                f"trainable_elems={dbg['total_trainable_params']} "
-                f"grad_elems={dbg['total_grad_elems']} "
-                f"nonzero_grad_elems={dbg['nonzero_grad_elems']} "
-                f"state_entries_before={dbg['state_entries_before']} "
-                f"state_entries_after={state_entries_after} "
-                f"alloc_before_gb={alloc_before / (1024 ** 3):.2f} "
-                f"alloc_after_gb={alloc_after / (1024 ** 3):.2f} "
-                f"reserved_before_gb={reserv_before / (1024 ** 3):.2f} "
-                f"reserved_after_gb={reserv_after / (1024 ** 3):.2f}"
-            )
-
-        # Process deferred profiling records now that all GPU work is complete.
-        # elapsed_time() is safe to call after synchronize().
-        if self._prof_records:
-            for node, mb_idx, ubid, start_evt, end_evt, mem_before in self._prof_records:
-                t_ms = start_evt.elapsed_time(end_evt)
-                node.profiling_measurements.append(t_ms)
-                self.logger.info(
-                    f"[profiling] rank {self.global_rank} "
-                    f"{node.task_type.value} mb{mb_idx} ubid{ubid} "
-                    f"(time step {node.time_step}): time={t_ms:.3f}ms "
-                    f"mem_before={mem_before/1e9:.3f}GB"
-                )
 
         return {
             "losses": losses,

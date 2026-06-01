@@ -43,11 +43,7 @@ else:
 ```
 
 ## Training Llama in Piper
-The llama test program `test/test_llama.py` supports GPipe, 1F1B and interleaved 1F1B schedules for 2 or 4 devices.
-The `test/models/llama.py` file has example `forward` methods for one stage, two stage, and four stage partitions. 
-Ensure that the correct `forward` method is uncommented for the desired schedule (e.g. two stage for 1F1B on 2 devices, four stage for interleaved 1F1B on two devices). 
-DP training can also be turned on with the `dp_degree` flag.
-Run the Llama test program for the 1F1B schedule for two devices:
+The llama test program `test/test_llama.py` uses JSON schedule directives.
 ```
-python3 -m test.test_llama --model LLAMA_DEBUG --schedule 1f1b --num_stages 2 --pp_degree 2 --dp_degree 1
+python3 -m test.test_llama --model debug --schedule-directives-file test/schedules/llama_pp_only.json
 ```

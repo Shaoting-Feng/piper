@@ -1,49 +1,17 @@
 import sys
-import queue
-import ray
 import torch
 import inspect
 import logging
 import json, importlib, operator
 import torch.fx as fx
-from collections import defaultdict
-from dataclasses import dataclass
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-from typing import Any, Optional
+from typing import Optional
 
 LOG_LEVEL = "INFO"
-
-""" 
-Print the backward graph of a tensor
-"""
-
-def print_backward_graph(printer, tensor, prefix=""):
-    seen = set()
-    def _print(t, indent=0):
-        fn = t.grad_fn if hasattr(t, 'grad_fn') and t.grad_fn is not None else None
-        if fn is None:
-            printer(" " * indent + f"{prefix}Tensor: no grad_fn")
-            return
-        if fn in seen:
-            printer(" " * indent + f"{prefix}{type(fn).__name__} (recursive/ref)")
-            return
-        seen.add(fn)
-        printer(" " * indent + f"{prefix}{type(fn).__name__}")
-        for next_fn, _ in fn.next_functions:
-            if next_fn is not None and hasattr(next_fn, 'variable'):
-                printer(" " * (indent + 2) + f"{prefix}Variable: {type(next_fn.variable).__name__}")
-            elif next_fn is not None:
-                _print(type('Dummy', (), {'grad_fn': next_fn})(), indent + 2)
-            else:
-                printer(" " * (indent + 2) + f"{prefix}None")
-    _print(tensor, 0)
-
 
 """
 Logger utility
 """
 
-VERBOSE = 5
 def create_logger(name: str, log_level: str):
     match log_level:
         case "DEBUG":
@@ -54,8 +22,6 @@ def create_logger(name: str, log_level: str):
             log_level = logging.WARNING
         case "ERROR":
             log_level = logging.ERROR
-        case "VERBOSE":
-            log_level = VERBOSE
 
     logger = logging.getLogger(name)
     logger.setLevel(log_level)
@@ -70,264 +36,6 @@ def create_logger(name: str, log_level: str):
     return logger
 
 
-_CRITICAL_OPS     = frozenset({"fwd_p2p_recv", "fwd_p2p_send", "bwd_p2p_recv", "bwd_p2p_send", "fwd_a2a", "bwd_a2a"})
-_NON_CRITICAL_OPS = frozenset({"grad_allreduce", "grad_allreduce_naive"})
-
-_nccl_log = logging.getLogger("piper_nccl")
-
-
-class _DepGate:
-    """One-shot handoff of a CUDA end-event from a critical op to a non-critical op.
-
-    signal() is called by the critical op's after_kernel.
-    wait()   is called by the non-critical op's before_kernel.
-
-    wait() is intentionally non-blocking: if the critical op hasn't fired yet
-    (e.g. both are dispatched from the same CPU thread and the critical op comes
-    later in the schedule), enforcement is skipped rather than deadlocking.
-    Unmatched signals are drained by NcclOverlapDetector.reset_iteration().
-    """
-    __slots__ = ("_q",)
-
-    def __init__(self):
-        self._q: queue.Queue = queue.Queue()
-
-    def signal(self, end_event: "torch.cuda.Event") -> None:
-        self._q.put(end_event)
-
-    def wait(self, stream: "torch.cuda.Stream") -> None:
-        try:
-            event = self._q.get_nowait()
-            stream.wait_event(event)    # GPU-side dependency
-        except queue.Empty:
-            pass  # critical op not yet dispatched; skip enforcement for this call
-
-    def drain(self) -> None:
-        """Discard any unmatched signals left over from the previous iteration."""
-        while True:
-            try:
-                self._q.get_nowait()
-            except queue.Empty:
-                break
-
-
-@dataclass
-class _NcclKernelRecord:
-    kernel_name: str
-    stream_label: str
-    start_event: "torch.cuda.Event"
-    end_event: Optional["torch.cuda.Event"] = None
-    # GPU-side timestamps (ms from reference event); populated by find_overlaps()
-    t_start_ms: Optional[float] = None
-    t_end_ms: Optional[float] = None
-    # Position of this kernel in dispatch order on its stream; set by build_enforcement
-    stream_instance_idx: Optional[int] = None
-
-
-class NcclOverlapDetector:
-    """
-    Passively records GPU-side start/end events for every NCCL kernel while
-    monitoring is enabled, then performs a single retrospective overlap analysis
-    after the iteration completes.
-
-    No callbacks, no host functions, no GPU stalls.
-
-    Typical usage in a training loop:
-
-        # After warmup, enable monitoring for one iteration:
-        actor.enable_nccl_monitoring.remote()
-        losses = piper.step(batch)
-        actor.print_nccl_overlaps.remote()   # syncs GPU, analyses, prints, then disables
-
-    At each NCCL launch site (AFTER any stream.wait_stream / wait_event):
-        token = detector.before_kernel(cuda_stream, kernel_name, stream_label)
-        # ... launch the NCCL kernel ...
-        detector.after_kernel(cuda_stream, token)
-
-    reset_iteration() is called automatically at the end of every training iteration.
-    It clears records only when monitoring is disabled, so a monitored iteration's
-    records survive until print_nccl_overlaps() consumes them.
-    """
-
-    def __init__(self):
-        self._records: list[_NcclKernelRecord] = []
-        self._ref_event: Optional["torch.cuda.Event"] = None
-        self.enabled: bool = False
-        # Enforcement — keyed by (stream_label, stream_instance_idx)
-        self._signal_gates: dict[tuple[str, int], list[_DepGate]] = {}
-        self._wait_gates:   dict[tuple[str, int], list[_DepGate]] = {}
-        self._per_stream_counter: dict[str, int] = {}  # reset each iteration
-        self._enforcement_active: bool = False
-
-    def enable(self) -> None:
-        """Enable monitoring and reset any previous records."""
-        self._records.clear()
-        self._ref_event = torch.cuda.Event(enable_timing=True)
-        self._ref_event.record()
-        self.enabled = True
-
-    def disable(self) -> None:
-        self.enabled = False
-
-    def before_kernel(
-        self,
-        cuda_stream: "torch.cuda.Stream",
-        kernel_name: str,
-        stream_label: str,
-    ) -> str:
-        """Record start_event on cuda_stream and return an opaque token.
-
-        Must be called AFTER any stream.wait_stream() / stream.wait_event() so the
-        event is enqueued only once GPU-side dependencies have resolved, giving an
-        accurate kernel-start timestamp.
-        """
-        # Enforcement: compute per-stream instance index and wait on any gates for this slot
-        instance_idx = -1
-        if self._enforcement_active:
-            instance_idx = self._per_stream_counter.get(stream_label, 0)
-            for gate in self._wait_gates.get((stream_label, instance_idx), []):
-                gate.wait(cuda_stream)
-            self._per_stream_counter[stream_label] = instance_idx + 1
-
-        if not self.enabled:
-            # Enforcement-only: encode (stream_label, instance_idx) for after_kernel
-            return f"E:{stream_label}:{instance_idx}" if self._enforcement_active else ""
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        start_event.record(cuda_stream)
-        token = str(len(self._records))
-        self._records.append(_NcclKernelRecord(
-            kernel_name=kernel_name,
-            stream_label=stream_label,
-            start_event=start_event,
-            stream_instance_idx=instance_idx if self._enforcement_active else None,
-        ))
-        return token
-
-    def after_kernel(self, cuda_stream: "torch.cuda.Stream", token: str) -> None:
-        """Record end_event on cuda_stream. Call after the NCCL kernel."""
-        if not token:
-            return
-
-        if token.startswith("E:"):
-            # Enforcement-only mode: parse "E:{stream_label}:{instance_idx}"
-            _, stream_label, idx_str = token.split(":")
-            instance_idx = int(idx_str)
-            end_event = torch.cuda.Event(enable_timing=False)
-            end_event.record(cuda_stream)
-            for gate in self._signal_gates.get((stream_label, instance_idx), []):
-                gate.signal(end_event)
-            return
-
-        # Monitoring mode (with or without enforcement): token is a record index
-        record_idx = int(token)
-        record = self._records[record_idx]
-
-        end_event = None
-        if self.enabled:
-            end_event = torch.cuda.Event(enable_timing=True)
-            end_event.record(cuda_stream)
-            record.end_event = end_event
-
-        if self._enforcement_active and record.stream_instance_idx is not None:
-            if end_event is None:
-                end_event = torch.cuda.Event(enable_timing=False)
-                end_event.record(cuda_stream)
-            for gate in self._signal_gates.get(
-                (record.stream_label, record.stream_instance_idx), []
-            ):
-                gate.signal(end_event)
-
-    def build_enforcement(self, overlaps: list, logger) -> None:
-        """Build per-instance gate map from detected overlaps. Call after find_overlaps().
-
-        Assigns a stable stream_instance_idx to every record (= position in dispatch
-        order on that stream), then creates one _DepGate per detected overlap instance.
-        Gates are permanent — they are not rebuilt each iteration; only
-        _per_stream_counter is reset so the same indices are reproduced.
-        """
-        # Assign stream_instance_idx to every record in monitoring order
-        stream_counts: dict[str, int] = {}
-        for r in self._records:
-            r.stream_instance_idx = stream_counts.get(r.stream_label, 0)
-            stream_counts[r.stream_label] = r.stream_instance_idx + 1
-
-        # Build one gate per detected overlap instance
-        signal: dict[tuple[str, int], list[_DepGate]] = {}
-        wait:   dict[tuple[str, int], list[_DepGate]] = {}
-        n_pairs = 0
-        for a, b, _ in overlaps:
-            if a.kernel_name in _CRITICAL_OPS and b.kernel_name in _NON_CRITICAL_OPS:
-                crit, noncrit = a, b
-            elif b.kernel_name in _CRITICAL_OPS and a.kernel_name in _NON_CRITICAL_OPS:
-                crit, noncrit = b, a
-            else:
-                continue
-            logger.debug(f"Enforcing dependency between {crit} -> {noncrit} NCCL kernels")
-            gate = _DepGate()
-            signal.setdefault((crit.stream_label,    crit.stream_instance_idx),    []).append(gate)
-            wait.setdefault(  (noncrit.stream_label, noncrit.stream_instance_idx), []).append(gate)
-            n_pairs += 1
-
-        self._signal_gates = signal
-        self._wait_gates   = wait
-        self._enforcement_active = bool(n_pairs)
-        if self._enforcement_active:
-            _nccl_log.info(
-                "NcclOverlapDetector: enforcement active — %d instance-level gate(s)", n_pairs
-            )
-
-    def find_overlaps(self, logger) -> list[tuple["_NcclKernelRecord", "_NcclKernelRecord", float]]:
-        """Compute GPU-time intervals and return all overlapping cross-stream pairs.
-
-        Must be called after torch.cuda.synchronize() so all events are complete.
-        Returns a list of (record_a, record_b, overlap_ms) tuples.
-        """
-        if not self._records or self._ref_event is None:
-            return []
-
-        ref = self._ref_event
-        for r in self._records:
-            if r.end_event is None or r.t_start_ms is not None:
-                continue
-            try:
-                r.t_start_ms = ref.elapsed_time(r.start_event)
-                r.t_end_ms   = ref.elapsed_time(r.end_event)
-            except Exception:
-                pass
-
-        valid = [r for r in self._records if r.t_start_ms is not None and r.t_end_ms is not None]
-        overlaps = []
-        for i, a in enumerate(valid):
-            # logger.info(f"NCCL kernel '{a.kernel_name}' on stream '{a.stream_label}': {a.t_start_ms:.3f}-{a.t_end_ms:.3f} ms")
-            for b in valid[i + 1:]:
-                if a.stream_label == b.stream_label:
-                    continue
-                if a.t_start_ms < b.t_end_ms and b.t_start_ms < a.t_end_ms:
-                    overlap_ms = (min(a.t_end_ms, b.t_end_ms)
-                                  - max(a.t_start_ms, b.t_start_ms))
-                    overlaps.append((a, b, overlap_ms))
-        return overlaps
-
-    def reset_iteration(self) -> None:
-        """Called at the end of every training iteration (after streams are synced).
-
-        Clears records only when monitoring is disabled.  When monitoring is enabled,
-        records are preserved so that print_nccl_overlaps() can analyse them after
-        the iteration returns.  Gates are permanent and not rebuilt; only
-        _per_stream_counter is reset so each iteration reproduces the same
-        (stream_label, index) assignments as during monitoring.
-        """
-        if not self.enabled:
-            self._records.clear()
-            self._ref_event = None
-        if self._enforcement_active:
-            # Drain any unmatched signals (cases where the critical op fired after
-            # the non-critical op's non-blocking wait already returned empty).
-            for gates in self._signal_gates.values():
-                for gate in gates:
-                    gate.drain()
-            self._per_stream_counter.clear()
 
 
 """
@@ -336,114 +44,16 @@ Piper thread local storage for tracking Piper actors, stages, and microbatches
 
 class PiperMetadata:
     actors = dict()
-    dag = set()
-    stage_to_device = dict()
-    naive_gradient_sync = False
-    use_activation_checkpointing = False
-    activation_num_checkpoints = 1
-    bucketing = False  # Whether to split stages into per-param-bucket sub-modules
-    bucket_size: int = 25 * 1024 * 1024  # Target bucket size in bytes
-    a2a_ar_no_overlap = False  # Whether ALL_REDUCE tasks must wait for all same-rank A2A tasks
-    schedule = None   # PipelineSchedule set by piper_setup; used by the piper backend
-    task_dag = None   # TaskDAG built from schedule by the piper backend
-    full_dag_no_overlap = None  # Deep copy of the full DAG (pre-P2P-split, no overlap_a2a_tasks); used for profiling and critical-path analysis
-    per_rank_dags = None  # Per-rank TaskDAGs built by the piper backend
-    zero_stage: int = 0  # ZeRO stage: 0=disabled, 1=optim states, 2=+gradients, 3=+parameters
-    gradient_accumulation: bool = True  # Delay gradient sync to the last occurrence of each bucket
-    use_inductor: bool = False  # Whether actors should torch.compile stage GraphModules in _load_stage
-    enable_ep: bool = False  # Whether expert-parallel A2A graph splitting/tasks are enabled
-    ar_a2a_same_stream: bool = False  # Whether A2A ops should share the AR stream on actors
-    overlap_zero_ops: bool = False  # Whether to apply overlap_zero_ops to per-rank DAGs
-    overlap_chunks: bool = False  # Whether to apply the chunk-overlap transform to per-rank DAGs
-    schedule_name: str = ""  # Human-readable schedule name for debug artifacts
-    visualize_dag_render: bool = True  # If False, save Graphviz source only
-    stage_bucket_counts: dict = {}   # stage_id -> number of buckets (set by piper backend)
-    trainable_bucket_keys: set = set()  # (stage_id, bucket_id) pairs with trainable params
-    zero_bucket_keys: set = set()  # (stage_id, bucket_id) pairs that should receive ZeRO transforms
-    # Populated by the piper backend on dp_rank=0; broadcast to dp_rank>0 by piper_setup
-    # so they can skip torch.compile entirely.  Contains serialized graph + param metadata
-    # (no actual weight values) for all stages, plus the built per-rank TaskDAGs.
-    compiled_stage_data: dict = None
-    # MFU tracking: set by piper_setup when model_flops_per_token is provided
-    model_flops_per_token: Optional[float] = None  # FLOPs per token for forward+backward pass
-    tokens_per_step: Optional[int] = None           # Global batch tokens per training step
     visualize_dag: bool = True  # Whether to render per-rank DAG PNGs after compilation
     output_dir: str = "out"  # Base directory for debug artifacts emitted during runs
+    training_dag = None  # DAG of annotated model segments and transform-inserted nodes
+    per_pp_training_dags = None  # Per-PP-rank DAGs built by the TrainingDAG backend
+    compiled_data_store = None  # Ray actor used to share compiled DAGs across DP ranks
+    schedule_directives: list = []  # Program of DAG transform directives (e.g., place(...))
+    schedule_directives_file: Optional[str] = None  # JSON source for schedule_directives
+    schedule_info: dict = {}  # Derived schedule facts such as pp/dp/mbs
 
 piper_metadata = PiperMetadata()
-
-
-def should_enable_ep(dp_degree: int) -> bool:
-    return bool(piper_metadata.enable_ep) and dp_degree > 1
-
-
-# ---------------------------------------------------------------------------
-# GPU peak FLOPs lookup for MFU computation
-# ---------------------------------------------------------------------------
-
-# Theoretical peak BF16 tensor-core FLOPs/s for common GPUs.
-# Values are from official NVIDIA spec sheets.
-_GPU_PEAK_FLOPS_BF16: list[tuple[str, float]] = [
-    ("nvidia h200",      1979e12),
-    ("h100 sxm",   989e12),
-    ("h100 pcie",  756e12),
-    ("h100",       989e12),
-    ("a100",       312e12),
-    ("a6000 ada",  362e12),
-    ("rtx 4090",   165e12),
-    ("rtx 3090",   142e12),
-]
-
-
-def get_gpu_peak_flops_bf16() -> Optional[float]:
-    """Return theoretical peak BF16 FLOPs/s for the current CUDA device, or None if unknown."""
-    if not torch.cuda.is_available():
-        return None
-    name = torch.cuda.get_device_properties(torch.cuda.current_device()).name.lower()
-    for key, flops in _GPU_PEAK_FLOPS_BF16:
-        if key in name:
-            return flops
-    return 1979e12  # Default to H200-level FLOPs for unknown devices, since it's better to slightly overestimate than underestimate
-
-
-def compute_transformer_flops_per_token(
-    hidden_dim: int,
-    n_layers: int,
-    ffn_dim: int,
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    activation_checkpointing: bool = False,
-    moe_top_k: int = 1,
-) -> float:
-    """Estimate FLOPs per token for a forward+backward pass of a transformer.
-
-    Uses the standard approximation (sequence-length-independent terms only):
-    - Attention: Q/K/V projections + output projection per layer
-    - FFN (SwiGLU): gate + up + down projections × moe_top_k active experts
-    - Multiply by 3× for fwd+bwd (or 4× with full activation-checkpointing recompute)
-
-    Args:
-        hidden_dim: Model hidden dimension (H).
-        n_layers: Number of transformer layers.
-        ffn_dim: FFN intermediate dimension (per expert for MoE).
-        n_heads: Number of attention heads.
-        n_kv_heads: Number of key/value heads (GQA).
-        head_dim: Dimension per attention head.
-        activation_checkpointing: If True, use 4× multiplier (full recompute).
-        moe_top_k: Number of active experts per token (1 for dense).
-
-    Returns:
-        Estimated FLOPs per token (float).
-    """
-    kv_hidden = n_kv_heads * head_dim
-    # Q proj (H→H) + K proj (H→kv_hidden) + V proj (H→kv_hidden) + out proj (H→H)
-    attn_flops = 2 * hidden_dim * (2 * hidden_dim + 2 * kv_hidden)
-    # SwiGLU FFN: gate_proj + up_proj + down_proj (each H×ffn_dim), scaled by active experts
-    ffn_flops = 6 * hidden_dim * ffn_dim * moe_top_k
-    fwd_total = n_layers * (attn_flops + ffn_flops)
-    multiplier = 4 if activation_checkpointing else 3
-    return fwd_total * multiplier
 
 
 """

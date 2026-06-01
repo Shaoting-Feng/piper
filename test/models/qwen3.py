@@ -1,5 +1,7 @@
 from typing import Optional
 import torch
+import torch.nn.functional as F
+from torch import nn
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from torchtitan.models.qwen3 import Qwen3Model, Qwen3ModelArgs
@@ -7,6 +9,8 @@ from torchtitan.models.qwen3.model.model import TransformerBlock
 from torchtitan.models.moe import MoE, MoEArgs
 from torchtitan.protocols.model import AttentionMasksType
 
+PP_TAG = "PP"
+EP_TAG = "EP"
 
 def create_qwen3_config(name: str) -> Qwen3ModelArgs:
     """Create Qwen3 model config based on name."""
@@ -15,7 +19,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             return Qwen3ModelArgs(
                 vocab_size=2048,
                 dim=256,
-                n_layers=8,
+                n_layers=4,
                 n_heads=8,
                 n_kv_heads=4,
                 head_dim=32,
@@ -81,7 +85,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             return Qwen3ModelArgs(
                 vocab_size=151936,
                 dim=2048,
-                n_layers=24,
+                n_layers=4, #24,
                 n_heads=32,
                 n_kv_heads=8,
                 head_dim=64,
@@ -114,7 +118,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             return Qwen3ModelArgs(
                 vocab_size=151936,
                 dim=4096,
-                n_layers=32,
+                n_layers=4, #32,
                 n_heads=32,
                 n_kv_heads=8,
                 head_dim=128,
@@ -201,7 +205,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             return Qwen3ModelArgs(
                 vocab_size=152064,
                 dim=8192,
-                n_layers=80,
+                n_layers=4, #80,
                 n_heads=64,
                 n_kv_heads=8,
                 head_dim=128,
@@ -218,12 +222,40 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             raise ValueError(f"Unknown model config: {name}")
 
 
+class BmmExperts(nn.Module):
+    """Triton-free expert GEMM.
+
+    Mirrors torchtitan ``GroupedExperts`` parameter shapes/names so the param
+    registry is unchanged, but runs the per-expert SwiGLU via batched matmul
+    instead of ``torch._grouped_mm`` (which pulls in Triton permute-index
+    kernels). Tokens are assumed evenly distributed across experts, matching the
+    fixed-capacity reshape the caller performs before dispatch.
+    """
+
+    def __init__(self, dim: int, hidden_dim: int, num_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+        self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
+        self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+
+    def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        dim = x.shape[-1]
+        # (num_experts * capacity, dim) -> (num_experts, capacity, dim)
+        x = x.reshape(self.num_experts, -1, dim)
+        h = F.silu(torch.bmm(x, self.w1.transpose(-2, -1)))
+        h = h * torch.bmm(x, self.w3.transpose(-2, -1))
+        out = torch.bmm(h, self.w2.transpose(-2, -1))
+        return out.reshape(-1, dim)
+
+
 class AnnotatedMoE(MoE):
-    def flush_tokens_per_expert(self) -> None:
-        if hasattr(self, '_tokens_per_expert_acc'):
-            with torch.no_grad():
-                self.tokens_per_expert.add_(self._tokens_per_expert_acc)
-                self._tokens_per_expert_acc.zero_()
+    def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
+        super().__init__(moe_args, dim=dim, hidden_dim=hidden_dim)
+        # Replace the grouped-mm (Triton) experts with a batched-matmul variant.
+        self.experts = BmmExperts(
+            dim=dim, hidden_dim=hidden_dim, num_experts=moe_args.num_experts
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs, slen, dim = x.shape
@@ -251,10 +283,11 @@ class AnnotatedMoE(MoE):
             ).to(x.dtype)
 
         routed_input = routed_input.reshape(
-            2, self.experts.num_experts, -1, dim)
+            self.experts.num_experts, -1, dim)
 
         # dispatch tokens to experts via all_to_all
         with torch.fx.traceback.annotate({
+            "name": EP_TAG,
             "collective": "all_to_all_single",
             "group": "ep",
         }):
@@ -266,6 +299,7 @@ class AnnotatedMoE(MoE):
 
         # gather expert outputs back via all_to_all
         with torch.fx.traceback.annotate({
+            "name": EP_TAG,
             "collective": "all_to_all_single",
             "group": "ep",
         }):
@@ -320,8 +354,13 @@ class PiperQwen3Model(Qwen3Model):
     annotations in the MoE layers.
     """
 
-    def __init__(self, config: Qwen3ModelArgs, num_stages: int = 2):
+    def __init__(self, config: Qwen3ModelArgs, num_stages: int):
         super().__init__(config)
+        if num_stages is None:
+            from src.piper_utils import piper_metadata
+
+            schedule_info = piper_metadata.schedule_info or {}
+            num_stages = int(schedule_info.get("num_stages", schedule_info.get("pp_degree", 2)))
         self.num_stages = num_stages
 
         # Replace TransformerBlock layers with AnnotatedQwen3TransformerBlock
@@ -365,7 +404,7 @@ class PiperQwen3Model(Qwen3Model):
         layers_per_stage = num_layers // self.num_stages
 
         for stage_id in range(self.num_stages):
-            with torch.fx.traceback.annotate({"stage": stage_id}):
+            with torch.fx.traceback.annotate({"name": PP_TAG, "stage": stage_id}):
                 if stage_id == 0:
                     h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
 
