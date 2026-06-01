@@ -69,9 +69,9 @@ def main():
     print("         'NET/OFI Initializing aws-ofi-nccl' and 'Using EFA' in the output.", flush=True)
 
     print("Piper imports", flush=True)
-    ok &= check("piper_compile", lambda: (__import__("src.piper_compile"), "ok")[1])
-    ok &= check("piper_exec", lambda: (__import__("src.piper_exec"), "ok")[1])
-    ok &= check("piper_actor", lambda: (__import__("src.piper_actor"), "ok")[1])
+    ok &= check("compile", lambda: (__import__("src.compile"), "ok")[1])
+    ok &= check("tasks", lambda: (__import__("src.tasks"), "ok")[1])
+    ok &= check("actor", lambda: (__import__("src.actor"), "ok")[1])
 
     print("Ray", flush=True)
     import ray

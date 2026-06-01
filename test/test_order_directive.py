@@ -1,14 +1,21 @@
+import pytest
+import torch.fx as fx
+
 from src.piper import (
     TrainingDAG,
     TrainingDAGEdge,
     TrainingDAGNode,
+    apply_schedule_directives,
     _apply_order_directive,
     _apply_split_backward_stencil,
     _apply_split_directive,
-    _normalize_order_directive,
+    _bucket_matched_fwd_nodes,
+    _parse_order_directive,
     _serial_topological_order,
+    _validate_schedule_tags_exist,
     _validate_split_backward_order_stencil,
 )
+import src.directives as directives
 
 
 def _compute(uid: str, tag: dict) -> TrainingDAGNode:
@@ -35,21 +42,28 @@ def _bwd(uid: str, fwd_uid: str, tag: dict) -> TrainingDAGNode:
     )
 
 
-def test_normalize_order_directive_accepts_nested_filter_groups() -> None:
+def _dummy_gm() -> fx.GraphModule:
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    graph.output(x)
+    return fx.GraphModule({}, graph)
+
+
+def test_parse_order_directive_accepts_nested_filter_groups() -> None:
     directive = {
         "op": "order",
         "filters": [
             [
-                [["PP", 0], ["MB", 0], ["PASS", "F"]],
-                [["PP", 0], ["MB", 1], ["PASS", "F"]],
+                {"PP": 0, "MB": 0, "PASS": "F"},
+                {"PP": 0, "MB": 1, "PASS": "F"},
             ],
             [
-                [["PP", 0], ["MB", 0], ["PASS", "B"]],
+                {"PP": 0, "MB": 0, "PASS": "B"},
             ],
         ],
     }
 
-    groups = _normalize_order_directive(directive)
+    groups = _parse_order_directive(directive)
 
     assert groups == [
         [
@@ -62,21 +76,17 @@ def test_normalize_order_directive_accepts_nested_filter_groups() -> None:
     ]
 
 
-def test_normalize_order_directive_wraps_legacy_flat_filters() -> None:
+def test_parse_order_directive_rejects_flat_filter_groups() -> None:
     directive = {
         "op": "order",
         "filters": [
-            [["PP", 0], ["MB", 0], ["PASS", "F"]],
-            [["PP", 0], ["MB", 0], ["PASS", "B"]],
+            {"PP": 0, "MB": 0, "PASS": "F"},
+            {"PP": 0, "MB": 0, "PASS": "B"},
         ],
     }
 
-    groups = _normalize_order_directive(directive)
-
-    assert groups == [
-        [{"PP": 0, "MB": 0, "PASS": "F"}],
-        [{"PP": 0, "MB": 0, "PASS": "B"}],
-    ]
+    with pytest.raises(ValueError, match="must be a non-empty list"):
+        _parse_order_directive(directive)
 
 
 def test_split_backward_stencil_handles_nested_filter_groups() -> None:
@@ -84,11 +94,11 @@ def test_split_backward_stencil_handles_nested_filter_groups() -> None:
         "op": "order",
         "filters": [
             [
-                [["PP", 0], ["MB", 0], ["PASS", "BI"]],
-                [["PP", 0], ["MB", 0], ["PASS", "BW"]],
+                {"PP": 0, "MB": 0, "PASS": "BI"},
+                {"PP": 0, "MB": 0, "PASS": "BW"},
             ],
             [
-                [["PP", 0], ["MB", 1], ["PASS", "F"]],
+                {"PP": 0, "MB": 1, "PASS": "F"},
             ],
         ],
     }
@@ -102,9 +112,9 @@ def test_split_backward_stencil_allows_mixed_fused_and_split_microbatches() -> N
     directive = {
         "op": "order",
         "filters": [
-            [[["PP", 0], ["MB", 0], ["PASS", "B"]]],
-            [[["PP", 0], ["MB", 1], ["PASS", "BI"]]],
-            [[["PP", 0], ["MB", 1], ["PASS", "BW"]]],
+            [{"PP": 0, "MB": 0, "PASS": "B"}],
+            [{"PP": 0, "MB": 1, "PASS": "BI"}],
+            [{"PP": 0, "MB": 1, "PASS": "BW"}],
         ],
     }
     dag = TrainingDAG()
@@ -122,6 +132,39 @@ def test_split_backward_stencil_allows_mixed_fused_and_split_microbatches() -> N
     assert dag.nodes[split_bwd_uid].compute_subkind == "BWD_I"
     assert dag.nodes[split_bwd_uid].tag["PASS"] == "BI"
     assert dag.nodes[f"{split_bwd_uid}.bw"].compute_subkind == "BWD_W"
+
+
+def test_bucket_rewrite_resolves_split_microbatch_bwd_by_metadata(monkeypatch) -> None:
+    dag = TrainingDAG()
+    fwd = _compute("fwd", {"PP": 0, "PASS": "F"})
+    fwd.node_meta.update({
+        "stage_id": 0,
+        "segment_id": 0,
+        "gm": _dummy_gm(),
+        "graphargs": [],
+        "input_idxs": [],
+        "param_idxs": [],
+    })
+    dag.add_node(fwd)
+    dag.add_node(_bwd("bwd", "fwd", {"PP": 0, "PASS": "B"}))
+    dag.add_edge(TrainingDAGEdge("fwd", "bwd", "data"))
+
+    _apply_split_directive(dag, {}, "MB", 2)
+
+    def fake_bucket_stage(*_args, **_kwargs):
+        return [
+            (_dummy_gm(), [], [], []),
+            (_dummy_gm(), [], [], []),
+        ]
+
+    monkeypatch.setattr(directives, "bucket_stage", fake_bucket_stage)
+
+    _bucket_matched_fwd_nodes(dag, [{"PP": 0}], 25)
+
+    assert "fwd.bucket0" in dag.nodes
+    assert "fwd.bucket0.bwd" in dag.nodes
+    assert "fwd.splitMB1.bucket0" in dag.nodes
+    assert "fwd.splitMB1.bucket0.bwd" in dag.nodes
 
 
 def test_apply_order_directive_groups_nested_subdags_with_dummy_source_sink() -> None:
@@ -172,3 +215,40 @@ def test_apply_order_directive_groups_nested_subdags_with_dummy_source_sink() ->
     assert topo.index("lane0.last") < topo.index(sink_uid)
     assert topo.index("lane1") < topo.index(sink_uid)
     assert topo.index(sink_uid) < topo.index("next")
+
+
+def test_validate_schedule_tags_exist_rejects_tags_missing_from_model() -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
+
+    directives = [
+        {"op": "place", "filter": {"TP": 0}, "devices": [0]},
+        {"op": "order", "filters": [[{"PP": 0, "MB": 0, "PASS": "F"}]]},
+    ]
+
+    with pytest.raises(ValueError, match="not found in model annotations"):
+        _validate_schedule_tags_exist(dag, directives)
+
+
+def test_validate_schedule_tags_exist_ignores_runtime_tags() -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
+
+    _validate_schedule_tags_exist(
+        dag,
+        [
+            {"op": "split", "filter": {}, "dim_name": "MB", "num_microbatches": 2},
+            {"op": "order", "filters": [[{"PP": 0, "MB": 0, "PASS": "F"}]]},
+        ],
+    )
+
+
+def test_apply_schedule_directives_rejects_unmatched_place_directive() -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))
+
+    with pytest.raises(ValueError, match="matched zero nodes"):
+        apply_schedule_directives(
+            dag,
+            [{"op": "place", "filter": {"PP": 1}, "devices": [0]}],
+        )

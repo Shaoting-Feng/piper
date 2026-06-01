@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piper"
+version = "0.1.0"
+description = "User-controllable distributed training schedules for large-scale ML models."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torchtitan",
+  "numpy",
+  "torch==2.10.0",
+  "ray==2.44.1",
+  "click<8.1",
+  "cupy-cuda12x",
+  "bitsandbytes",
+  "graphviz",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*", "test", "test.*", "examples", "examples.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
