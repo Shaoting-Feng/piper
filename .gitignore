@@ -10,5 +10,6 @@ figs/
 logs/
 .vscode/
 e2e-eval/
+artifact/ec2-scripts/
 .codex
 ec2-trust-policy.json

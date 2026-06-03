@@ -198,6 +198,14 @@ def _deserialize_target(payload):
     if kind == "torch_op":
         obj = torch.ops
         path = payload["path"]
+        if path == "piper_artifact.bmm_experts":
+            # The Qwen artifact model defines this model-specific custom op.
+            for module_name in ("models.qwen3", "examples.models.qwen3"):
+                try:
+                    importlib.import_module(module_name)
+                    break
+                except ImportError:
+                    pass
         try:
             for part in path.split("."):
                 obj = getattr(obj, part)

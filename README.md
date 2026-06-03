@@ -8,9 +8,22 @@ Piper is a user-controllable distributed training system that decouples distribu
 
 The following installation has been tested with Python 3.10 on Linux with CUDA 12.8 drivers. 
 
+### venv
+
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+### conda
+
+If you do not already have a local Python 3.10 interpreter, create one with conda:
+
+```bash
+conda create -n piper python=3.10 -y
+conda activate piper
 python -m pip install --upgrade pip
 python -m pip install -e .
 ```
