@@ -6,8 +6,8 @@ New distributed training strategies should not require new distributed runtimes;
 
 ## Updates
 
-* 2026-06 - Blog post: [User-Controlled Distributed Training for PyTorch](TODO).
-* 2025-10 - Paper released on arXiv: [Piper: Towards Flexible Pipeline Parallelism for PyTorch](TODO).
+* 2026-06 - Blog post: [A Programmable Distributed Training System](TODO).
+* 2025-10 - Paper released on arXiv: [DOI](TODO).
 
 ## Introduction
 
@@ -149,7 +149,7 @@ Supported directives:
   * Multiple filters in the same group permit Piper to interleave those sub-DAGs.
 
 In practice, base schedules under `examples/base-schedules/` describe model placement and composed parallelism choices, while `examples/test_harness.py` appends generated `split` and `order` directives for schedule families such as `1f1b`, `interleaved_1f1b`, `zerobubble`, and `dualpipev`.
-For more detail, see the blog walkthrough sections on [PP x DP x EP placement](https://github.com/uw-syfi/uw-syfi.github.io/blob/piper-blog/_posts/2026-06-05-piper.md#scheduling-dualpipe-like-pp-x-dp-x-ep-model-placement), [DualPipe-like pipeline scheduling](https://github.com/uw-syfi/uw-syfi.github.io/blob/piper-blog/_posts/2026-06-05-piper.md#scheduling-a-dualpipe-like-pipeline-schedule), and [schedule builders](https://github.com/uw-syfi/uw-syfi.github.io/blob/piper-blog/_posts/2026-06-05-piper.md#generating-directives-with-schedule-builders).
+For more detail, see the blog walkthrough sections on [PP x DP x EP placement](TODO), [DualPipe-like pipeline scheduling](TODO), and [schedule builders](TODO).
 
 ## Overview of Outputs
 
@@ -191,13 +191,5 @@ To run all Qwen example schedules, use `examples/run_qwen_examples.py`.
 If you use Piper in your research, please cite:
 
 ```bibtex
-@inproceedings{frisella2025piper,
-  title = {Piper: Towards Flexible Pipeline Parallelism for PyTorch},
-  author = {Frisella, Megan and Oentoro, Arvin and Gao, Xiangyu and Bernstein, Gilbert and Wang, Stephanie},
-  booktitle = {Proceedings of the 4th Workshop on Practical Adoption Challenges of ML for Systems},
-  year = {2025},
-  publisher = {Association for Computing Machinery},
-  doi = {10.1145/3766882.3767187},
-  url = {https://doi.org/10.1145/3766882.3767187}
-}
+TODO
 ```
