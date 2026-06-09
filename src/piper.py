@@ -1,183 +1,250 @@
-from . import piper_patches
+import time
+from contextlib import contextmanager
+from typing import Iterator
 
 import ray
-import torch
-import os
+import torch.fx as fx
 from torch._dynamo.backends.registry import register_backend
-from torch._dynamo.decorators import _disallow_in_graph_helper
 
-from .piper_utils import RemoteTensor, serialize_graphmodule, piper_metadata, create_logger, print_backward_graph, LOG_LEVEL
-from .piper_graph_transform import split_gm_by_experts
-from .piper_actor import get_actor
+from .fx import PIPER_ANNOTATIONS_META_KEY, split_gm_by_annotations
+from .dag import (
+    TrainingDAG,
+    TrainingDAGEdge,
+    TrainingDAGNode,
+    build_training_dag,
+)
+from .directives import (
+    _apply_order_directive,
+    _apply_split_backward_stencil,
+    _apply_split_directive,
+    _bucket_matched_fwd_nodes,
+    _parse_order_directive,
+    _validate_schedule_tags_exist,
+    _validate_split_backward_order_stencil,
+    apply_schedule_directives,
+)
+from .ordering import (
+    _serial_topological_order,
+    resolve_total_order_per_stream,
+)
+from .state import LOG_LEVEL, create_logger, piper_metadata
+from .visualization import (
+    log_training_dag_dependencies,
+    print_training_dag_order,
+    render_training_dag,
+)
+from .zero import _add_inter_chain_temporal_edges, _prune_zero_lifetime_metadata
 
 logger = create_logger("piper_backend", LOG_LEVEL)
+_ANNOTATION_STACK: list[dict[str, int]] = []
+_ANNOTATION_COUNTS: dict[str, int] = {}
+_ANNOTATION_UID = 0
 
 
-@torch.compiler.disable
-def distributed_stage(stage_id, actor_id=None):
+def _reset_annotation_state() -> None:
+    global _ANNOTATION_UID
+    _ANNOTATION_STACK.clear()
+    _ANNOTATION_COUNTS.clear()
+    _ANNOTATION_UID = 0
+
+
+@contextmanager
+def annotate(name: str) -> Iterator[dict[str, int]]:
+    """Annotate traced model code with a Piper schedule tag.
+
+    Piper assigns the integer index for each tag name automatically in the
+    order annotation scopes are entered during tracing.
     """
-    Annotation for stage boundaries, causes torch.compile graph break
-    and sets metadata appropriately at compile time
-    """
-    dp_rank = int(os.environ['PIPER_DP_RANK'])
-    world_size = int(os.environ['PIPER_WORLD_SIZE'])
-    dp_degree = int(os.environ['PIPER_DP_DEGREE'])
-    pp_degree = int(os.environ['PIPER_PP_DEGREE'])
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"piper.annotate requires a non-empty string tag name, got {name!r}")
 
-    if actor_id is None:
-        actor_id = stage_id
+    global _ANNOTATION_UID
+    index = _ANNOTATION_COUNTS.get(name, 0)
+    _ANNOTATION_COUNTS[name] = index + 1
+    uid = _ANNOTATION_UID
+    _ANNOTATION_UID += 1
 
-    piper_metadata.current_stage = stage_id
-    piper_metadata.current_actor = actor_id
-    piper_metadata.first_graph_of_stage = True
+    annotation = {"name": name, "index": int(index), "uid": int(uid)}
+    _ANNOTATION_STACK.append(annotation)
+    fx_metadata_stack = tuple(dict(item) for item in _ANNOTATION_STACK)
+    try:
+        with fx.traceback.annotate({
+            PIPER_ANNOTATIONS_META_KEY: fx_metadata_stack,
+            "name": name,
+            "index": int(index),
+        }):
+            yield annotation
+    finally:
+        popped = _ANNOTATION_STACK.pop()
+        if popped is not annotation:
+            raise RuntimeError("piper.annotate stack corrupted during tracing")
+
+
+
+def _split_global_training_dag_by_pp_rank(training_dag: TrainingDAG) -> list[TrainingDAG]:
+    """Split the global DAG into per-device-set disconnected DAGs."""
+    # SEND/RECV pairs intentionally have no edge between them, so cross-rank
+    # placement dependencies separate into disconnected local components here.
+    undirected: dict[str, set[str]] = {uid: set() for uid in training_dag.nodes}
+    for e in training_dag.edges:
+        if e.src_uid in undirected and e.dst_uid in undirected:
+            undirected[e.src_uid].add(e.dst_uid)
+            undirected[e.dst_uid].add(e.src_uid)
+
+    components: list[set[str]] = []
+    seen: set[str] = set()
+    for uid in training_dag.nodes:
+        if uid in seen:
+            continue
+        comp: set[str] = set()
+        stack = [uid]
+        seen.add(uid)
+        while stack:
+            cur = stack.pop()
+            comp.add(cur)
+            for nxt in undirected.get(cur, set()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        components.append(comp)
+
+    # Validate each component is device-homogeneous and component device-sets are distinct.
+    comp_device_keys: list[tuple[int, ...]] = []
+    for ci, comp in enumerate(components):
+        device_keys = {
+            tuple(sorted(node.device)) for uid in comp for node in [training_dag.nodes[uid]] if node.device is not None
+        }
+        if not device_keys:
+            raise ValueError(f"component[{ci}] has no device assignment after P2P split")
+        if len(device_keys) != 1:
+            raise ValueError(
+                f"component[{ci}] is not device-homogeneous; device sets present: {sorted(device_keys)}"
+            )
+        comp_device_keys.append(next(iter(device_keys)))
+    if len(set(comp_device_keys)) != len(comp_device_keys):
+        raise ValueError(
+            f"expected distinct device sets across split components, got {comp_device_keys}"
+        )
+
+    # Materialize each component as a standalone TrainingDAG.
+    subdags: list[TrainingDAG] = []
+    for comp in components:
+        sub = TrainingDAG()
+        for uid in comp:
+            n = training_dag.nodes[uid]
+            sub.add_node(
+                TrainingDAGNode(
+                    uid=n.uid,
+                    node_kind=n.node_kind,
+                    compute_subkind=n.compute_subkind,
+                    tag=dict(n.tag),
+                    device=(None if n.device is None else list(n.device)),
+                    stream=n.stream,
+                    node_meta=dict(n.node_meta),
+                )
+            )
+        for e in training_dag.edges:
+            if e.src_uid in comp and e.dst_uid in comp:
+                sub.add_edge(
+                    TrainingDAGEdge(
+                        src_uid=e.src_uid,
+                        dst_uid=e.dst_uid,
+                        dep_kind=e.dep_kind,
+                        tensor_name=e.tensor_name,
+                    )
+                )
+        subdags.append(sub)
+
+    def _dag_device_key(d: TrainingDAG) -> tuple[int, ...]:
+        keys = {tuple(sorted(n.device)) for n in d.nodes.values() if n.device is not None}
+        if len(keys) != 1:
+            raise ValueError(f"sub-DAG should have exactly one device key, got {keys}")
+        return next(iter(keys))
+
+    subdags.sort(key=_dag_device_key)
+    return subdags
 
 
 @register_backend
 def piper(gm, example_inputs, **kwargs):
-    """
-    torch.compile backend loads the graph module on 
-    a Ray actor and returns a callback that remotely
-    runs the graph module. 
-    """
-    logger.debug(f"Compiling subgraph {id(gm)}")
+    """TrainingDAG backend: split by Piper annotations and lower schedule directives."""
+    del example_inputs, kwargs
 
-    if not piper_metadata.currently_compiling:
-        gm.print_readable()
-        assert False, "Piper backend called outside of compilation"
+    schedule_info = getattr(piper_metadata, "schedule_info", {}) or {}
+    schedule_directives = getattr(piper_metadata, "schedule_directives", None)
+    _top_level_gm, annotation_segments = split_gm_by_annotations(gm)
 
-    # Distribute expert submodules to actors if there are expert annotations
-    stage_id = piper_metadata.current_stage
-    pp_degree = int(os.environ['PIPER_PP_DEGREE'])
-    original_gm = gm
-    gm = split_gm_by_experts(gm, stage_id, pp_degree)
-
-    # For the top-level graph, log which arguments are input tensors
-    # vs parameter tensors and make sure all example inputs are serializable
-
-    placeholders = gm.graph.find_nodes(op="placeholder")
-    graphargs = [node.meta["grapharg"] for node in placeholders]
-
-    # make sure example inputs are serializable by turning symbolic
-    # ints and fake tensors into concrete values
-    serializable_examples = []
-    input_idxs = []
-    param_idxs = []
-    for i, (arg, ex) in enumerate(zip(graphargs, example_inputs)):
-        # save indices of input tensors and model parameters
-        if 'self' not in str(arg):
-            input_idxs.append(i)
-        else:
-            param_idxs.append(i)
-        # convert symbolic ints and fake tensors to concrete values
-        if isinstance(ex, torch.SymInt):
-            serializable_examples.append(int(ex))
-        elif isinstance(ex, torch._subclasses.fake_tensor.FakeTensor):
-            new = torch.full(
-                ex.shape,
-                0,
-                dtype=ex.dtype,
-                device=ex.device,
-                layout=ex.layout,
-                requires_grad=ex.requires_grad,
-            )
-            serializable_examples.append(new)
-        else:
-            serializable_examples.append(ex)
-
-    # serialize the fx.Graph
-    payload = serialize_graphmodule(gm)
-
-    # send the fx.Graph and model attributes to the actor
-    stage_id = piper_metadata.current_stage
-    actor_id = piper_metadata.current_actor
-    actor = get_actor(actor_id)
-
-    dp_rank = int(os.environ['PIPER_DP_RANK'])
-    dp_degree = int(os.environ['PIPER_DP_DEGREE'])
-    global_rank = dp_rank * dp_degree + actor_id
-    
-    ray.get(
-        actor.load_graph.remote(
-            stage_id,
-            payload,
-            torch._dynamo.backends.debugging.eager,
-            serializable_examples,
-            input_idxs,
+    if not annotation_segments:
+        raise ValueError(
+            "No Piper annotations found in the traced graph. Wrap model compute "
+            "with src.piper.annotate(...) before compiling with Piper."
         )
+
+    # Build and store the new directed DAG representation for later scheduling transforms.
+    training_dag = build_training_dag(annotation_segments)
+    _validate_schedule_tags_exist(training_dag, schedule_directives)
+    apply_schedule_directives(
+        training_dag,
+        schedule_directives,
+    )
+    piper_metadata.training_dag = training_dag
+    per_pp_training_dags = _split_global_training_dag_by_pp_rank(training_dag)
+    artifact_dir = getattr(piper_metadata, "artifact_dir", "out")
+    for i, subdag in enumerate(per_pp_training_dags):
+        zero_chains = _prune_zero_lifetime_metadata(subdag)
+        resolve_total_order_per_stream(subdag)
+        _add_inter_chain_temporal_edges(subdag, zero_chains)
+        if getattr(piper_metadata, "visualize_dag", False):
+            log_training_dag_dependencies(subdag)
+            print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=artifact_dir)
+            render_training_dag(subdag, output_path=f"{artifact_dir}/training_dag_pp{i}")
+    piper_metadata.per_pp_training_dags = per_pp_training_dags
+
+    logger.info(
+        "piper: built TrainingDAG with %d nodes and %d edges, split into %d per-PP DAG(s)",
+        len(training_dag.nodes),
+        len(training_dag.edges),
+        len(per_pp_training_dags),
     )
 
-    # Get fake tensor representations of the graph output(s)
-    def symint_to_int(x):
-        return int(x) if isinstance(x, torch.SymInt) else x
-    def int_to_tensor(x):
-        return torch.tensor(x) if isinstance(x, int) else x
-    example_inputs = list(map(symint_to_int, serializable_examples))
-    fakes = original_gm(*example_inputs)
-    fakes = list(map(int_to_tensor, fakes))
+    def callback(*args, _gm=gm):
+        logger.warning(
+            "piper compiled callback invoked directly; running local graph execution"
+        )
+        return _gm(*args)
 
-    # wait for a signal to run this graph if it's the first graph of the stage
-    first_graph_of_stage = piper_metadata.first_graph_of_stage
-    if first_graph_of_stage:
-        piper_metadata.first_graph_of_stage = False
-    
-    # return a wrapper function that runs the fx.Graph on the actor and 
-    # returns remote futures for each graph output
-    def run_remote_subgraph(*args):
+    return callback
 
-        logger.debug(f"Running subgraph {id(gm)}")
 
-        from .piper_utils import events_tls
+def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
+    """Execute one training step using the loaded per-rank TrainingDAG."""
+    actors = piper_metadata.actors
+    run_refs = [
+        actor.run_dag.remote(loss_fn=loss_fn)
+        for actor in actors.values()
+    ]
+    t0 = time.perf_counter()
+    results = ray.get(run_refs)
+    step_time = time.perf_counter() - t0
 
-        mb_idx = events_tls.mb_idx
+    if log_stats:
+        _log_step_stats(step_time, log_stats, actors)
 
-        # wait for a signal to run the partial graph
-        if first_graph_of_stage:
-            logger.debug(f"Thread {mb_idx} global rank {global_rank} waiting for stage {stage_id}")
-            events_tls.events[stage_id].wait()
-            logger.debug(f"Thread {mb_idx} global rank {global_rank} running stage {stage_id}")
+    losses = []
+    for result in results:
+        if isinstance(result, dict):
+            losses.extend(result.get("losses", []))
+        elif result:
+            losses.extend(result)
+    return losses
 
-        # Mutex ensures that only one thread submits a task to this actor at a time
-        logger.debug(f"Thread {mb_idx} global rank {global_rank} waiting for actor mutex {actor_id}")
-        with events_tls.actor_mutexes[actor_id]:
-            logger.debug(f"Thread {mb_idx} global rank {global_rank} got actor mutex {actor_id}")
 
-            # clear the event for the next stage
-            if first_graph_of_stage:
-                events_tls.events[stage_id].clear()
+def _log_step_stats(step_time: float, log_memory: bool, actors: dict) -> None:
+    """Log throughput, MFU, and optionally per-rank peak GPU memory."""
+    stats = [f"step_time={step_time:.3f}s"]
 
-            # ignore model parameter arguments (stored on the actor)
-            input_tensors_only = []
-            for i in input_idxs:
-                input_tensors_only.append(args[i])
-            args = input_tensors_only
-            
-            # track stage dependencies
-            for arg in args:
-                if isinstance(arg, RemoteTensor):
-                    prev_stage = arg.get_stage_id()
-                    if prev_stage != stage_id:
-                        piper_metadata.dag.add((prev_stage, stage_id))
+    tokens = getattr(piper_metadata, "tokens_per_step", None)
+    if tokens is not None:
+        stats.append(f"throughput={tokens / step_time:.1f} tok/s")
 
-            # get Ray ObjectRefs from RemoteTensors
-            def unwrap(x):
-                return x.get_ref() if isinstance(x, RemoteTensor) else x
-            args = list(map(unwrap, args))
-
-            if piper_metadata.currently_compiling:
-                # dispatch task without nccl transport
-                refs = actor.forward_cpu.options(num_returns=len(fakes)).remote(stage_id, mb_idx, *args)
-            else:
-                # dispatch with nccl transport
-                refs = actor.forward.options(num_returns=len(fakes)).remote(stage_id, mb_idx, *args)
-
-            # wrap the remote futures with RemoteTensor
-            # if piper_metadata.currently_compiling:
-            #     return [t.to('cpu') for t in ray.get(refs)]
-
-            if isinstance(refs, list):
-                assert len(fakes) == len(refs)
-                return [RemoteTensor(fake, ref, stage_id) for fake, ref in zip(fakes, refs)]
-            else:
-                assert len(fakes) == 1
-                return [RemoteTensor(fakes[0], refs, stage_id)]
-    return run_remote_subgraph
+    logger.info("  ".join(stats))

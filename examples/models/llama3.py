@@ -13,8 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.utils import parameters_to_vector
-
-from src.piper import distributed_stage
+from src.piper import annotate
 
 # import fairscale.nn.model_parallel.initialize as fs_init
 # from fairscale.nn.model_parallel.layers import (
@@ -25,6 +24,7 @@ from src.piper import distributed_stage
 
 
 logger = logging.getLogger(__name__)
+PP_TAG = "PP"
 
 
 @dataclass
@@ -99,6 +99,20 @@ LLAMA_8B = ModelArgs(
     rope_theta=500000,
     max_batch_size=32,
     max_seq_len=2048,
+)
+
+LLAMA_70B = ModelArgs(
+    dim=8192,
+    n_layers=80,
+    n_heads=64,
+    n_kv_heads=8,
+    vocab_size=128256,
+    multiple_of=4096,
+    ffn_dim_multiplier=1.3,
+    norm_eps=1e-5,
+    rope_theta=500000,
+    max_batch_size=32,
+    max_seq_len=8192,
 )
 
 
@@ -345,17 +359,19 @@ class TransformerBlock(nn.Module):
         return out
 
 
-def partition(*args):
-    pass
-
-
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs, seq_len: int):
+    def __init__(self, params: ModelArgs, seq_len: int, num_stages: int | None = None):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
         self.seq_len = seq_len
+        if num_stages is None:
+            from src.state import piper_metadata
+
+            schedule_info = piper_metadata.schedule_info or {}
+            num_stages = int(schedule_info.get("num_stages", schedule_info.get("pp_degree", 2)))
+        self.num_stages = num_stages
 
         def log_size(layer, indent=0):
             num_params = sum(p.numel() for p in layer.parameters())
@@ -389,6 +405,7 @@ class Transformer(nn.Module):
         )
         log_size(self.output)
 
+        # Register freq_cis and mask as buffers so they are moved with the model
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
             self.seq_len,
@@ -399,87 +416,17 @@ class Transformer(nn.Module):
         mask = torch.triu(mask, diagonal=1)
         self.mask = torch.hstack([torch.zeros((self.seq_len, 0)), mask])
 
-    # """
-    # forward method for interleaved-1f1b schedule
-    # requires:
-    # - 2 devices
-    # - 4 stages
-    # - n_layers is divisible by 4
-    # """
-    # def forward(self, tokens: torch.Tensor):
-
-    #     distributed_stage(0, actor_id=0, optim=torch.optim.Adam)
-
-    #     h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-    #     start_pos = 0
-        
-    #     for layer in self.layers[:self.n_layers//4]:
-    #         h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     distributed_stage(1, actor_id=1, optim=torch.optim.Adam)
-
-    #     for layer in self.layers[self.n_layers//4:self.n_layers//2]:
-    #         h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     distributed_stage(2, actor_id=0, optim=torch.optim.Adam)
-
-    #     for layer in self.layers[self.n_layers//2:3*self.n_layers//4]:
-    #         h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     distributed_stage(3, actor_id=1, optim=torch.optim.Adam)
-
-    #     for layer in self.layers[3*self.n_layers//4:]:
-    #         h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     h = self.norm(h) if self.norm else h
-    #     output = self.output(h).float() if self.output else h
-
-    #     return output
-
-    """
-    forward method for 1f1b schedule
-    requires:
-    - 2 devices
-    - 2 stages
-    - n_layers is divisible by 2
-    """
     def forward(self, tokens: torch.Tensor):
-
-        distributed_stage(0, actor_id=0)
-
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
         start_pos = 0
-        
-        for layer in self.layers[:self.n_layers//2]:
-            h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-        distributed_stage(1, actor_id=1)
-
-        for layer in self.layers[self.n_layers//2:]:
-            h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-        h = self.norm(h) if self.norm else h
-        output = self.output(h).float() if self.output else h
-
+        for stage_id in range(self.num_stages):
+            layer_start = stage_id * self.n_layers // self.num_stages
+            layer_end = (stage_id + 1) * self.n_layers // self.num_stages
+            with annotate(PP_TAG):
+                if stage_id == 0:
+                    h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+                for layer in self.layers[layer_start:layer_end]:
+                    h = layer(h, start_pos, self.freqs_cis, self.mask)
+                if stage_id == self.num_stages - 1:
+                    h = self.norm(h) if self.norm else h
+                    output = self.output(h).float() if self.output else h
         return output
-
-    # """
-    # forward method for no pp
-    # requires:
-    # - 1 device
-    # - 1 stages
-    # """
-    # def forward(self, tokens: torch.Tensor):
-
-    #     distributed_stage(0, actor_id=0, optim=torch.optim.Adam)
-
-    #     h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-    #     start_pos = 0
-        
-    #     for layer in self.layers:
-    #         h = layer(h, start_pos, self.freqs_cis, self.mask)
-
-    #     h = self.norm(h) if self.norm else h
-    #     output = self.output(h).float() if self.output else h
-
-    #     return output

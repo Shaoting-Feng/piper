@@ -1,53 +1,203 @@
 # Piper
 
-Piper is a PyTorch library for training large models with flexible pipeline parallel schedules.
+[![arXiv](https://img.shields.io/badge/arXiv-TODO-b31b1b.svg)](TODO)
 
-## Environment setup: conda
-We assume a Linux-based environment
+New distributed training strategies should not require new distributed runtimes; Piper gives PyTorch users direct control over model placement and GPU scheduling with lightweight annotations and a small scheduling language.
 
-1. Create a conda environment with `python==3.10`
-2. Install the requirements in `requirements.txt`
-3. Modify PyTorch and Ray dependencies according to the instructions below
+## Updates
 
-## Modifying Ray dependency
+* 2026-06 - Blog post: [User-Controlled Distributed Training for PyTorch](TODO).
+* 2025-10 - Paper released on arXiv: [Piper: Towards Flexible Pipeline Parallelism for PyTorch](TODO).
 
-**Ray**
+## Introduction
 
-Tensor transport backends currently only support 1 return value per task.
-- WIP: Upstream this into Ray.
-- Modifications (2): Comment out the [assertion in ActorMethod._remote()](https://github.com/ray-project/ray/blob/b70d990db786a1f2259dec0504acccf2590353f3/python/ray/actor.py#L824-L828) and add logic for [handling multiple return values with a GPU object manager](https://github.com/ray-project/ray/blob/b70d990db786a1f2259dec0504acccf2590353f3/python/ray/actor.py#L880-L887).
+Large training jobs increasingly combine multiple parallelism strategies such as pipeline, data, and expert parallelism with ZeRO-style sharding, creating placement and GPU scheduling choices that current frameworks cannot express cleanly.
+Today, ML researchers and practitioners choose between one-off specialized systems that perform well but are hard to adapt, and general-purpose frameworks that are easier to use but expose limited control.
+
+Piper is a user-controllable distributed training system for PyTorch that separates model placement and GPU scheduling from model code and runtime implementation.
+With lightweight model annotations and a small scheduling language, Piper lets users express, visualize, profile, and run high-performance training schedules such as DualPipe-style pipeline- and expert-parallel overlap.
+
+## Architecture
+
+![Piper architecture](figs/architecture.jpg)
+
+Piper has two user-facing inputs:
+
+* An annotated PyTorch model: standard model code with lightweight tags for schedulable regions such as pipeline stages and MoE experts.
+* A schedule-directive program: instructions that tell the Piper compiler how to shard, replicate, order, and overlap those schedulable regions.
+
+The compiler traces the model with TorchDynamo, splits the graph by Piper annotations, builds a distributed training DAG IR, and applies DAG rewrites according to the schedule directives.
+The directive rewrites insert point-to-point pipeline communication, DP collectives, ZeRO gather/scatter collectives, EP all-to-all communication, temporal edges, device assignments, and logical stream assignments.
+
+The runtime decomposes the global DAG into per-device execution plans and runs them on Ray actors.
+Each actor manages local CUDA streams, process groups/communicators, model-state buffers, and intermediate tensors.
+
+## Installation
+
+Requires Python 3.10+ on Linux with CUDA GPUs.
+The current setup has been tested with Python 3.10 and CUDA 12.x.
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
-####### PIPER MODIFICATION START #######
-# if num_returns != 1:
-#     raise ValueError(
-#         f"Currently, methods with tensor_transport={tensor_transport.name} only support 1 return value. "
-#         "Please make sure the actor method is decorated with `@ray.method(num_returns=1)` (the default)."
-#     )
-####### PIPER MODIFICATION END #######
-```
-```
-####### PIPER MODIFICATION START #######
-gpu_object_manager = ray._private.worker.global_worker.gpu_object_manager
-if isinstance(object_refs, ObjectRef):
-    object_ref = object_refs
-    gpu_object_manager.add_gpu_object_ref(
-        object_ref, self._actor, tensor_transport
-    )
-else:
-    for object_ref in object_refs:
-        assert isinstance(object_ref, ObjectRef)
-        gpu_object_manager.add_gpu_object_ref(
-            object_ref, self._actor, tensor_transport
-        )
-####### PIPER MODIFICATION END #######
+
+If you do not already have Python 3.10 locally:
+
+```bash
+conda create -n piper python=3.10 -y
+conda activate piper
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-## Training Llama in Piper
-The llama test program `test/test_llama.py` supports GPipe, 1F1B and interleaved 1F1B schedules for 2 or 4 devices.
-The `test/models/llama.py` file has example `forward` methods for one stage, two stage, and four stage partitions. 
-Ensure that the correct `forward` method is uncommented for the desired schedule (e.g. two stage for 1F1B on 2 devices, four stage for interleaved 1F1B on two devices). 
-DP training can also be turned on with the `dp_degree` flag.
-Run the Llama test program for the 1F1B schedule for two devices:
+## Quickstart
+
+From the repository root, run the Qwen example with a DualPipeV schedule:
+
+```bash
+python examples/test_harness.py \
+  --test-file examples/test_qwen.py \
+  --base-schedule examples/base-schedules/pp4_dp2_ep2_v_placement.json \
+  --schedule dualpipev \
+  --ranks 2 \
+  --mbs 4
 ```
-python3 -m test.test_llama --model LLAMA_DEBUG --schedule 1f1b --num_stages 2 --pp_degree 2 --dp_degree 1
+
+The base schedule `pp4_dp2_ep2_v_placement.json` describes a PP x DP x EP placement with four annotated pipeline regions mapped onto two physical pipeline ranks in a V layout.
+Regions `PP=0` and `PP=3` run on device group `[0, 2]`, while `PP=1` and `PP=2` run on device group `[1, 3]`.
+Within each device group, Piper replicates non-expert regions for DP and shards expert regions for EP.
+This example expects four visible CUDA devices.
+The harness appends DualPipeV `split` and `order` directives for two physical pipeline ranks and four microbatches.
+
+Run the Qwen example with PP x ZeRO-3 1F1B schedule:
+
+```bash
+python examples/test_harness.py \
+  --test-file examples/test_qwen.py \
+  --base-schedule examples/base-schedules/pp2_dp2_ep2_zero3.json \
+  --schedule 1f1b \
+  --ranks 2 \
+  --mbs 4
+```
+
+The base schedule `pp2_dp2_ep2_zero3.json` describes a PP x DP x EP placement with two pipeline stages, DP degree two, EP sharding, and ZeRO-3-style gradient and parameter sharding.
+Stage `PP=0` runs on device group `[0, 2]`, while `PP=1` runs on device group `[1, 3]`.
+This example also expects four visible CUDA devices.
+The harness appends 1F1B `split` and `order` directives for two pipeline ranks and four microbatches.
+Each run creates `out/<timestamp>/` with the complete generated schedule and metrics.
+
+## Overview of Inputs
+
+### Annotations
+
+`piper.annotate(tag)` is a context manager that attaches Piper metadata to all PyTorch operations traced inside the scope.
+The `tag` is a non-empty string naming a schedulable dimension of the model, such as `PP` for pipeline regions or `EP` for expert regions.
+For each tag name, Piper assigns integer indices in trace order, so repeated `piper.annotate("PP")` scopes become `PP=0`, `PP=1`, and so on.
+
+The schedule directives program uses these tag names and indices in filters to select regions of the traced model.
+For example, a filter can select one concrete region by its tag index, all regions with a tag, or regions that match a combination of tags.
+See the blog walkthrough section on [annotating a Qwen3 MoE model](TODO) for an example and further details.
+
+### Schedule Directives Program
+
+A schedule directive program is a JSON array of directive objects.
+Each directive has an `op` string naming the rewrite to apply to the distributed training DAG IR.
+Most directives use a `filter` object to select the model region to apply the directive to.
+The `order` directive uses `filters` to describe a sequence of filter groups.
+A `filter` is a JSON object whose keys are tag names and whose values are the tag indices to match.
+
+Filter keys can refer to annotation tags, new tags added by previous directives, or the compiler-provided `PASS` tag which supports `F` (forward), `B` (backward), `BI` (backward for inputs), and `BW` (backward for weights) for different training step stages.
+Filter values can be tag indices or the special value `"*"` to match any concrete index for the key.
+
+The empty filter `{}` matches the entire DAG IR.
+All key/value pairs in a filter are conjunctive, so `{"PP": 1, "EP": "*"}` matches nodes that are in pipeline region `PP=1` and have any `EP` index.
+
+Supported directives:
+
+* `place` assigns matched compute regions to device groups and names the stream used for inserted PP send/recv communication.
+  * `op`: `"place"`
+  * `filter`: Selects the model regions to place.
+  * `devices`: Non-empty list of CUDA device IDs for the placement group.
+  * `stream`: Optional logical stream name for inserted point-to-point communication.
+* `replicate` replicates matched regions across devices and inserts DP synchronization.
+  * `op`: `"replicate"`.
+  * `filter`: Selects the model regions to replicate.
+  * `devices`: Non-empty list of CUDA device IDs across which the region is replicated.
+  * `reduce_stream`: Optional logical stream name for gradient reduction collective communication.
+  * `gather_stream`: Optional logical stream name for ZeRO-3 parameter materialization collective communication.
+  * `bucket_size`: Optional parameter bucket size in MB for finer-grained synchronization.
+  * `shard_grads`: Optional boolean enabling ZeRO-2-style gradient sharding.
+  * `shard_params`: Optional boolean enabling ZeRO-3-style parameter sharding.
+* `shard` shards matched regions across devices and inserts all-to-all communication, typically for expert regions.
+  * `op`: `"shard"`
+  * `filter`: Selects the model regions to shard.
+  * `devices`: Non-empty list of CUDA device IDs across which the region is sharded.
+  * `stream`: Optional logical stream name for inserted all-to-all collective communication.
+* `split` duplicates the matched DAG by a named microbatch dimension.
+  * `op`: `"split"`
+  * `filter`: Selects the sub-DAG to duplicate.
+  * `dim_name`: Non-empty string naming the new split dimension.
+  * `num_microbatches`: Positive integer number of copies to create.
+* `order` adds temporal dependencies between filter groups.
+  * `op`: `"order"`
+  * `filters`: List of at least two non-empty filter groups.
+  * Each filter group is a list of filter objects that occupy the same ordering slot.
+  * Consecutive filter groups create temporal dependencies from one slot to the next.
+  * Multiple filters in the same group permit Piper to interleave those sub-DAGs.
+
+In practice, base schedules under `examples/base-schedules/` describe model placement and composed parallelism choices, while `examples/test_harness.py` appends generated `split` and `order` directives for schedule families such as `1f1b`, `interleaved_1f1b`, `zerobubble`, and `dualpipev`.
+For more detail, see the blog walkthrough sections on [PP x DP x EP placement](https://github.com/uw-syfi/uw-syfi.github.io/blob/piper-blog/_posts/2026-06-05-piper.md#scheduling-dualpipe-like-pp-x-dp-x-ep-model-placement), [DualPipe-like pipeline scheduling](https://github.com/uw-syfi/uw-syfi.github.io/blob/piper-blog/_posts/2026-06-05-piper.md#scheduling-a-dualpipe-like-pipeline-schedule), and [schedule builders](https://github.com/uw-syfi/uw-syfi.github.io/blob/piper-blog/_posts/2026-06-05-piper.md#generating-directives-with-schedule-builders).
+
+## Overview of Outputs
+
+Every harness run creates a timestamped directory under `out/`:
+
+```text
+out/<timestamp>/
+|-- <schedule>_pp<ranks>_mbs<mbs>.json
+`-- results.csv
+```
+
+`results.csv` contains a row for each SPMD rank (e.g., each DP rank) reporting the mean/std iteration time, training throughput in tokens/sec, and per-PP-rank peak memory in GB.
+
+Optional artifact generation flags:
+
+* `--viz` renders the generated pipeline schedule and per-PP-rank DAG IRs under the run directory.
+* `--pytorch-profiler --pytorch-profiler-iters <n>` runs extra profiled iterations and writes combined Chrome trace files per SPMD rank; Piper annotates GPU events with DAG IR node labels.
+
+## Development
+
+The GitHub Actions workflow runs the CPU-only pytest suite on pushes and pull requests:
+
+```bash
+python -m pytest -m "not gpu" -v test
+```
+
+There are currently no pytest tests marked `gpu` under `test/`.
+To run the full pytest suite, including any future GPU-marked tests, use:
+
+```bash
+python -m pytest -v test
+```
+
+For GPU end-to-end validation, run the quickstart examples above on a machine with four visible CUDA devices.
+To run all Qwen example schedules, use `examples/run_qwen_examples.py`.
+
+## Citation
+
+If you use Piper in your research, please cite:
+
+```bibtex
+@inproceedings{frisella2025piper,
+  title = {Piper: Towards Flexible Pipeline Parallelism for PyTorch},
+  author = {Frisella, Megan and Oentoro, Arvin and Gao, Xiangyu and Bernstein, Gilbert and Wang, Stephanie},
+  booktitle = {Proceedings of the 4th Workshop on Practical Adoption Challenges of ML for Systems},
+  year = {2025},
+  publisher = {Association for Computing Machinery},
+  doi = {10.1145/3766882.3767187},
+  url = {https://doi.org/10.1145/3766882.3767187}
+}
 ```
