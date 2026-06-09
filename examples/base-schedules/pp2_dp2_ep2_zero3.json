@@ -30,7 +30,8 @@
       0,
       2
     ],
-    "stream": "dp_stream",
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
     "shard_grads": true,
     "shard_params": true
   },
@@ -43,7 +44,8 @@
       1,
       3
     ],
-    "stream": "dp_stream",
+    "gather_stream": "dp_stream",
+    "reduce_stream": "dp_stream",
     "shard_grads": true,
     "shard_params": true
   },

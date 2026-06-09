@@ -7,11 +7,13 @@ from .dag import (
 )
 
 _DEFAULT_STREAM = "default_stream"
-_OTHER_COMM_KINDS = {
-    "REDUCE_COMM",
+_CRITICAL_PATH_COMM_KINDS = {
     "ALL_GATHER_COMM",
-    "REDUCE_SCATTER_COMM",
     "A2A_COMM",
+}
+_REDUCTION_COMM_KINDS = {
+    "REDUCE_COMM",
+    "REDUCE_SCATTER_COMM",
 }
 
 
@@ -22,7 +24,7 @@ def _serial_topological_order(
     """Serialize topological levels into a deterministic dispatch order.
 
     Nodes with lower topological levels always come first. Within a level,
-    priority order is: SEND > other comm > compute > RECV.
+    priority order is: SEND > critical-path comm > reduction comm > compute/other > RECV.
     """
     if topo_levels is None:
         topo_levels = _topological_levels(dag)
@@ -34,11 +36,13 @@ def _serial_topological_order(
         kind = dag.nodes[uid].node_kind
         if kind == "SEND_COMM":
             return 0
-        if kind in _OTHER_COMM_KINDS:
+        if kind in _CRITICAL_PATH_COMM_KINDS:
             return 1
+        if kind in _REDUCTION_COMM_KINDS:
+            return 2
         if kind == "RECV_COMM":
-            return 3
-        return 2
+            return 4
+        return 3
 
     return sorted(
         dag.nodes,

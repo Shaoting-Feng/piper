@@ -9,6 +9,7 @@ from .dag import (
     TrainingDAG,
     TrainingDAGEdge,
     TrainingDAGNode,
+    _has_path,
     _iter_data_edges,
     _remove_edge,
     _remove_node_and_incident_edges,
@@ -1074,6 +1075,7 @@ def _insert_shard_a2a_comm_nodes(
                     )
             _remove_node_and_incident_edges(dag, comm_uid)
         if removable_comm_uids:
+            node.node_meta.pop("zero_alloc_full_grads_before", None)
             node.node_meta.pop("zero_free_full_params_after", None)
         if node.compute_subkind == "BWD_W":
             continue
@@ -1467,7 +1469,48 @@ def _add_order_dummy_node(
     return uid
 
 
-def _add_temporal_order_edge(dag: TrainingDAG, src_uid: str, dst_uid: str) -> None:
+def _device_key_for_order_edge(dag: TrainingDAG, uid: str) -> tuple[int, ...] | None:
+    device = dag.nodes[uid].device
+    if device is None:
+        return None
+    return tuple(sorted(int(d) for d in device))
+
+
+def _validate_order_edge(
+    dag: TrainingDAG,
+    src_uid: str,
+    dst_uid: str,
+    *,
+    directive_idx: int,
+) -> None:
+    if _has_path(dag, dst_uid, src_uid):
+        raise ValueError(
+            f"order directive[{directive_idx}] violates model dataflow: "
+            f"adding temporal edge {src_uid} -> {dst_uid} would create a cycle"
+        )
+
+    src_device = _device_key_for_order_edge(dag, src_uid)
+    dst_device = _device_key_for_order_edge(dag, dst_uid)
+    if src_device is None or dst_device is None:
+        raise ValueError(
+            f"order directive[{directive_idx}] requires placed nodes with a single device set: "
+            f"{src_uid} device={src_device}, {dst_uid} device={dst_device}"
+        )
+    if src_device != dst_device:
+        raise ValueError(
+            f"order directive[{directive_idx}] crosses device placement: "
+            f"{src_uid} device={src_device}, {dst_uid} device={dst_device}"
+        )
+
+
+def _add_temporal_order_edge(
+    dag: TrainingDAG,
+    src_uid: str,
+    dst_uid: str,
+    *,
+    directive_idx: int,
+) -> None:
+    _validate_order_edge(dag, src_uid, dst_uid, directive_idx=directive_idx)
     logger.debug("Adding temporal dependency edge for order directive: %s -> %s", src_uid, dst_uid)
     dag.add_edge(
         TrainingDAGEdge(
@@ -1527,16 +1570,16 @@ def _apply_order_directive(
         )
         for csrcs in group_sources:
             for v in csrcs:
-                _add_temporal_order_edge(dag, src_uid, v)
+                _add_temporal_order_edge(dag, src_uid, v, directive_idx=directive_idx)
         for csnks in group_sinks:
             for u in csnks:
-                _add_temporal_order_edge(dag, u, sink_uid)
+                _add_temporal_order_edge(dag, u, sink_uid, directive_idx=directive_idx)
         segments.append(_OrderSegment(source_uids={src_uid}, sink_uids={sink_uid}))
 
     for i in range(len(segments) - 1):
         for u in segments[i].sink_uids:
             for v in segments[i + 1].source_uids:
-                _add_temporal_order_edge(dag, u, v)
+                _add_temporal_order_edge(dag, u, v, directive_idx=directive_idx)
 
 
 def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] | None) -> None:

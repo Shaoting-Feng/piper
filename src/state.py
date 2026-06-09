@@ -41,7 +41,7 @@ Piper thread local storage for tracking Piper actors, stages, and microbatches
 class PiperMetadata:
     actors = dict()
     visualize_dag: bool = False  # Whether to render per-rank DAG PNGs after compilation
-    output_dir: str = "out"  # Base directory for debug artifacts emitted during runs
+    artifact_dir: str = "out"  # Directory for debug artifacts emitted during runs
     training_dag = None  # DAG of annotated model segments and transform-inserted nodes
     per_pp_training_dags = None  # Per-PP-rank DAGs built by the TrainingDAG backend
     compiled_data_store = None  # Ray actor used to share compiled DAGs across DP ranks

@@ -24,6 +24,13 @@ CLEANUP_MEMORY = False
 
 logger = create_logger("actor", LOG_LEVEL)
 
+def _disable_functorch_donated_buffers() -> None:
+    import importlib
+
+    config = importlib.import_module("torch._functorch.config")
+    config.donated_buffer = False
+
+
 def _get_rank(pp_rank, dp_rank, pp_degree):
     return pp_rank + dp_rank * pp_degree
 
@@ -111,6 +118,8 @@ class PiperActor:
 
         self.optim_class = optim_class
         self.use_inductor = bool(use_inductor)
+        if self.use_inductor:
+            _disable_functorch_donated_buffers()
         self.runtime = RuntimeState(
             pp_rank=pp_rank,
             dp_rank=dp_rank,

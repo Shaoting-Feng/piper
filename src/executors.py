@@ -308,6 +308,14 @@ class ComputeExecutor:
                     w.grad = self.grad_with_param_layout(w, w.grad)
                 w.grad += dw
 
+    def backward_weight_from_outputs(
+        self,
+        stage_outputs_or_loss: list,
+        output_grads: Any,
+        weights: Any,
+    ) -> None:
+        self.fused_backward(stage_outputs_or_loss, output_grads, list(weights))
+
     def bucket_backward_input(
         self,
         stage_outputs_or_loss: list,
@@ -326,7 +334,7 @@ class ComputeExecutor:
             for i, t in enumerate(stage_outputs_or_loss):
                 if isinstance(t, torch.Tensor):
                     stage_outputs_or_loss[i] = t.detach()
-            return (), []
+            return (), [], None
 
         stage_output_grad_fns = list(filter(None, map(_get_grad_fn_or_grad_acc, stage_outputs_or_loss)))
         stage_input_grad_fns = list(filter(None, map(_get_grad_fn_or_grad_acc, input_values)))
@@ -334,7 +342,6 @@ class ComputeExecutor:
 
         reverse_edges_dict = construct_reverse_graph(stage_output_grad_fns)
         param_groups = get_param_groups(stage_input_grad_fns, weight_grad_fns, reverse_edges_dict)
-
         handles = []
         for param_group in param_groups:
             for i, intermediate in enumerate(param_group["intermediates"]):
@@ -359,14 +366,15 @@ class ComputeExecutor:
             else:
                 inp.grad += dinput
 
-        for i, t in enumerate(stage_outputs_or_loss):
-            if isinstance(t, torch.Tensor):
-                stage_outputs_or_loss[i] = t.detach()
+        output_backward_ctx = {
+            "stage_outputs_or_loss": list(stage_outputs_or_loss),
+            "output_grads": output_grads,
+        }
 
         for handle in handles:
             handle.remove()
 
-        return dinputs, param_groups
+        return dinputs, param_groups, output_backward_ctx
 
     def bucket_backward_weight(
         self,
@@ -503,6 +511,26 @@ class DagExecutor:
                 if ag_evt is not None:
                     compute_stream.wait_event(ag_evt)
 
+    def _all_to_all_ep_boundary(
+        self,
+        node: Any,
+        tensor: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        direction = self._node_meta(node).get("direction")
+        if direction == "outgoing":
+            tensor = tensor.contiguous()
+        elif direction != "incoming":
+            raise ValueError(
+                f"A2A node uid={getattr(node, 'uid', '<unknown>')} has invalid "
+                f"direction={direction!r}; expected 'incoming' or 'outgoing'"
+            )
+
+        tensor = self.communication.all_to_all(tensor, stream=stream)
+        if direction == "incoming":
+            tensor = tensor.contiguous()
+        return tensor
+
     def run(
         self,
         dag: Any,
@@ -593,8 +621,8 @@ class DagExecutor:
                     fwd_buf = dict(self.buffers.task[fwd_pred.uid])
                     self.buffers.release(fwd_pred.uid)
                     detached_outs = list(fwd_buf["detached_outs"])
-                    detached_outs[tensor_idx] = self.communication.all_to_all(
-                        detached_outs[tensor_idx], stream=node_stream
+                    detached_outs[tensor_idx] = self._all_to_all_ep_boundary(
+                        node, detached_outs[tensor_idx], node_stream
                     ).requires_grad_(True)
                     fwd_buf["detached_outs"] = detached_outs
                     self.buffers.task[node.uid] = fwd_buf
@@ -616,10 +644,8 @@ class DagExecutor:
                     assert grad_a2a_out is not None, (
                         f"BWD_A2A tag={node_tag}: grad at a2a_tensor_idx={tensor_idx} is None"
                     )
-                    if not grad_a2a_out.is_contiguous():
-                        grad_a2a_out = grad_a2a_out.contiguous()
-                    inp_grads[tensor_idx] = self.communication.all_to_all(
-                        grad_a2a_out, stream=node_stream
+                    inp_grads[tensor_idx] = self._all_to_all_ep_boundary(
+                        node, grad_a2a_out, node_stream
                     )
                     bwd_buf["inp_grads"] = inp_grads
                     self.buffers.task[node.uid] = bwd_buf
@@ -868,7 +894,7 @@ class DagExecutor:
                     weights = self.stages.bucket(ubid).weights()
 
                     with torch.cuda.stream(node_stream):
-                        dinputs, param_groups = self.compute.bucket_backward_input(
+                        dinputs, param_groups, output_backward_ctx = self.compute.bucket_backward_input(
                             stage_outputs_or_loss, output_grads, input_values, iter(weights)
                         )
                     fwd_inputs_full = fwd_out.get("fwd_inputs")
@@ -883,6 +909,8 @@ class DagExecutor:
                         "inp_grads": inp_grads_full,
                         "param_groups": param_groups,
                     }
+                    if output_backward_ctx is not None:
+                        self.buffers.task[node.uid]["output_backward_ctx"] = output_backward_ctx
                     if dinputs:
                         self.buffers.task[node.uid]["send_output"] = list(dinputs)
                     fwd_out.clear()
@@ -901,12 +929,21 @@ class DagExecutor:
                     if self._node_meta(node).get("zero_alloc_full_grads_before"):
                         self.params.alloc_full_grads(ubid, node_stream)
                     bwdi_node = next(p for p in node.data_preds if p.task_type == TaskType.BWD_I)
-                    param_groups = self.buffers.task[bwdi_node.uid]["param_groups"]
+                    bwdi_buf = self.buffers.task[bwdi_node.uid]
+                    param_groups = bwdi_buf["param_groups"]
                     weights = self.stages.bucket(ubid).weights()
                     with torch.cuda.stream(node_stream):
-                        self.compute.bucket_backward_weight(
-                            iter(weights), param_groups, ubid=ubid, mb_idx=mb_idx
-                        )
+                        output_backward_ctx = bwdi_buf.get("output_backward_ctx")
+                        if output_backward_ctx is not None:
+                            self.compute.backward_weight_from_outputs(
+                                output_backward_ctx["stage_outputs_or_loss"],
+                                output_backward_ctx["output_grads"],
+                                iter(weights),
+                            )
+                        else:
+                            self.compute.bucket_backward_weight(
+                                iter(weights), param_groups, ubid=ubid, mb_idx=mb_idx
+                            )
                     self.params.accumulate_zero_param_grads_to_flat(ubid, node_stream)
                     self.buffers.task[node.uid] = {}
                     self.buffers.release(bwdi_node.uid)

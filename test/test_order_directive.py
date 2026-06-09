@@ -217,6 +217,64 @@ def test_apply_order_directive_groups_nested_subdags_with_dummy_source_sink() ->
     assert topo.index(sink_uid) < topo.index("next")
 
 
+def test_apply_order_directive_rejects_reverse_model_dataflow() -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("producer", {"slot": 0}))
+    dag.add_node(_compute("consumer", {"slot": 1}))
+    dag.add_edge(TrainingDAGEdge("producer", "consumer", "data"))
+
+    with pytest.raises(ValueError, match="violates model dataflow"):
+        _apply_order_directive(
+            dag,
+            [
+                [{"slot": 1}],
+                [{"slot": 0}],
+            ],
+            directive_idx=3,
+        )
+
+
+def test_apply_order_directive_rejects_cross_device_order_edge() -> None:
+    dag = TrainingDAG()
+    dag.add_node(_compute("rank0", {"slot": 0}))
+    dag.add_node(_compute("rank1", {"slot": 1}))
+    dag.nodes["rank1"].device = [1]
+
+    with pytest.raises(ValueError, match="crosses device placement"):
+        _apply_order_directive(
+            dag,
+            [
+                [{"slot": 0}],
+                [{"slot": 1}],
+            ],
+            directive_idx=4,
+        )
+
+
+def test_shard_removes_zero_grad_lifetime_metadata_with_reduce_scatter() -> None:
+    dag = TrainingDAG()
+    node = TrainingDAGNode(
+        uid="expert.bwd",
+        node_kind="COMPUTE",
+        compute_subkind="BWD",
+        tag={"PP": 0, "EP": 0, "PASS": "B"},
+        device=[0, 2],
+        stream="default_stream",
+        node_meta={"bucket_key": "expert", "fwd_uid": "expert.fwd"},
+    )
+    dag.add_node(node)
+
+    directives._insert_reduce_scatter_comm_nodes(dag, [{"PP": 0, "EP": 0}], [0, 2])
+
+    assert node.node_meta["zero_alloc_full_grads_before"] is True
+    assert any(n.node_kind == "REDUCE_SCATTER_COMM" for n in dag.nodes.values())
+
+    directives._insert_shard_a2a_comm_nodes(dag, [{"PP": 0, "EP": 0}], [0, 2])
+
+    assert "zero_alloc_full_grads_before" not in node.node_meta
+    assert not any(n.node_kind == "REDUCE_SCATTER_COMM" for n in dag.nodes.values())
+
+
 def test_validate_schedule_tags_exist_rejects_tags_missing_from_model() -> None:
     dag = TrainingDAG()
     dag.add_node(_compute("fwd", {"PP": 0, "PASS": "F"}))

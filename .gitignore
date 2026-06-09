@@ -3,13 +3,6 @@ __pycache__/
 .venv
 piper.egg-info/
 out/
-ray_tmp/
-aws/
-docs/
-figs/
-logs/
 .vscode/
-e2e-eval/
-artifact/ec2-scripts/
 .codex
 ec2-trust-policy.json

@@ -16,7 +16,6 @@ import logging
 import re
 import statistics
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -86,13 +85,6 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--generated-schedule-file",
-        "--output",
-        type=Path,
-        default=None,
-        help="Where to write the generated full schedule JSON.",
-    )
-    parser.add_argument(
         "--keep-existing-order",
         action="store_true",
         help="Keep any order directives already present in the base schedule.",
@@ -101,12 +93,6 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Write the generated schedule and print the test command without running it.",
-    )
-    parser.add_argument(
-        "--schedule-viz-file",
-        type=Path,
-        default=None,
-        help="Where to render the generated schedule visualization (default: out/<schedule>.png).",
     )
     parser.add_argument(
         "--viz",
@@ -118,13 +104,6 @@ def main() -> None:
         action="store_true",
         help="Run extra iterations under torch.profiler and combine the per-actor "
              "chrome traces into one trace per dp-rank under out/.",
-    )
-    parser.add_argument(
-        "--pytorch-profile-dir",
-        type=Path,
-        default=None,
-        help="Shared directory where actors write per-actor chrome traces "
-             "(default: <run_dir>/pytorch_profiles). Removed after combining.",
     )
     parser.add_argument(
         "--address",
@@ -172,23 +151,24 @@ def main() -> None:
 
     generated_schedule, viz_path = build_schedule_file(args, run_dir)
     forwarded_args = _replace_schedule_arg(test_args, generated_schedule)
-    forwarded_args = _replace_arg(forwarded_args, "--output-dir", str(run_dir))
     if args.viz:
         forwarded_args.append("--viz")
 
-    profile_args: list[str] = []
     profile_dir: Path | None = None
-    if args.pytorch_profiler:
+    if args.pytorch_profiler and not args.dry_run:
         # Absolute path on the shared filesystem so remote actors (possibly on
         # other nodes) write to the same place the harness later reads.
-        profile_dir = (args.pytorch_profile_dir or (run_dir / "pytorch_profiles")).resolve()
+        profile_dir = (run_dir / "pytorch_profiles").resolve()
         if profile_dir.exists():
             for stale in profile_dir.glob("dp*_pp*.json"):
                 stale.unlink()
         profile_dir.mkdir(parents=True, exist_ok=True)
-        profile_args = ["--pytorch-profiler", "--pytorch-profile-dir", str(profile_dir)]
 
     if args.dry_run:
+        dry_run_args = list(forwarded_args)
+        if args.pytorch_profiler:
+            dry_run_args.append("--pytorch-profiler")
+        _validate_test_args(args.test_file, dry_run_args)
         cmd = [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -203,41 +183,42 @@ def main() -> None:
             cmd.extend(["--ranks", str(args.ranks)])
         if args.mbs is not None:
             cmd.extend(["--mbs", str(args.mbs)])
-        cmd.extend([*forwarded_args, *profile_args])
+        cmd.extend(dry_run_args)
         print(" ".join(cmd))
         print(f"generated_schedule={generated_schedule}")
         if viz_path is not None:
             print(f"schedule_viz={viz_path}")
         return
 
-    with tempfile.TemporaryDirectory() as tmp:
-        metrics_json = Path(tmp) / "metrics.json"
-        forwarded_args = [
-            *forwarded_args,
-            *profile_args,
-            "--metrics-json-out",
-            str(metrics_json),
-        ]
-        dp_metrics = _run_test_module(args, forwarded_args)
-        if metrics_json.exists():
-            with metrics_json.open(encoding="utf-8") as f:
-                dp_metrics = json.load(f)
-        if dp_metrics:
-            rows = _metrics_rows(dp_metrics)
-            results_csv = run_dir / "results.csv"
-            _write_results_csv(results_csv, rows)
-            print(f"metrics written to {results_csv}")
-        if profile_dir is not None:
-            _combine_pytorch_profiles(
-                profile_dir,
-                run_dir,
-                schedule=args.schedule,
-                pp=args.ranks if args.ranks is not None else "X",
-                mbs=args.mbs if args.mbs is not None else "X",
-            )
+    if args.pytorch_profiler:
+        forwarded_args.append("--pytorch-profiler")
+    dp_metrics = _run_test_module(args, forwarded_args, profile_dir=profile_dir)
+    if dp_metrics:
+        rows = _metrics_rows(dp_metrics)
+        results_csv = run_dir / "results.csv"
+        _write_results_csv(results_csv, rows)
+        print(f"metrics written to {results_csv}")
+    if profile_dir is not None:
+        _combine_pytorch_profiles(
+            profile_dir,
+            run_dir,
+            schedule=args.schedule,
+            pp=args.ranks if args.ranks is not None else "X",
+            mbs=args.mbs if args.mbs is not None else "X",
+        )
 
 
-def _run_test_module(args: argparse.Namespace, test_args: list[str]) -> list[dict]:
+def _validate_test_args(test_file: str, test_args: list[str]) -> None:
+    _, test_module = _load_test_file(test_file)
+    test_module.parse_args(test_args)
+
+
+def _run_test_module(
+    args: argparse.Namespace,
+    test_args: list[str],
+    *,
+    profile_dir: Path | None = None,
+) -> list[dict]:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -246,6 +227,7 @@ def _run_test_module(args: argparse.Namespace, test_args: list[str]) -> list[dic
     test_ns = test_module.parse_args(test_args)
     if hasattr(test_ns, "temp_dir"):
         test_ns.temp_dir = args.temp_dir
+    test_ns.profile_dir = str(profile_dir) if profile_dir is not None else ""
     if hasattr(test_module, "_derive_num_stages"):
         test_ns.num_stages = test_module._derive_num_stages(test_ns.schedule_directives_file)
 
@@ -268,13 +250,6 @@ def _run_test_module(args: argparse.Namespace, test_args: list[str]) -> list[dic
         )
         handles = coordinator.run_program.remote(test_module.main, pg, test_ns, pg)
         dp_metrics = ray.get(handles)
-        metrics_json_out = getattr(test_ns, "metrics_json_out", "")
-        if metrics_json_out:
-            metrics_path = Path(metrics_json_out)
-            metrics_path.parent.mkdir(parents=True, exist_ok=True)
-            with metrics_path.open("w", encoding="utf-8") as f:
-                json.dump(dp_metrics, f)
-            logging.getLogger(module_name).info("Raw metrics written to %s", metrics_path)
         return dp_metrics
     finally:
         ray.shutdown()
@@ -319,6 +294,7 @@ def _combine_pytorch_profiles(
             with path.open(encoding="utf-8") as f:
                 trace = json.load(f)
             events = trace.get("traceEvents", [])
+            annotated = _annotate_cuda_events_with_dag_labels(events)
             pid_map: dict = {}
             for ev in events:
                 opid = ev.get("pid")
@@ -333,6 +309,11 @@ def _combine_pytorch_profiles(
                     ev["args"]["name"] = f"dp{dp_rank} pp{pp_rank}: {pname}"
                 combined_events.append(ev)
             consumed.append(path)
+            if annotated:
+                print(
+                    f"pytorch profiler: annotated {annotated} CUDA event(s) "
+                    f"with DAG labels for dp{dp_rank} pp{pp_rank}"
+                )
         out_name = (
             f"pytorch_profile_{schedule}_pp{pp}_dp{dp_degree}"
             f"_mbs{mbs}_dprank{dp_rank}.json"
@@ -351,6 +332,193 @@ def _combine_pytorch_profiles(
         profile_dir.rmdir()
     except OSError:
         pass
+
+
+def _is_dag_node_label(name: object) -> bool:
+    return isinstance(name, str) and ":uid" in name and not name.startswith("##")
+
+
+def _annotate_cuda_events_with_dag_labels(events: list[dict]) -> int:
+    """Prefix GPU-side profiler events with their enclosing Piper DAG node.
+
+    ``torch.profiler`` emits Piper ``record_function`` ranges on the CPU thread,
+    while CUDA kernels and copies appear on GPU lanes with PyTorch/Inductor
+    names such as ``## Call CompiledFxGraph ...``.  CPU launch events and GPU
+    events share ``args["External id"]``; use that to carry the enclosing DAG
+    node label onto the GPU events in the combined Chrome trace.  Then rewrite
+    nested non-DAG GPU annotations so the visible annotation stack stays rooted
+    in Piper's TrainingDAG labels instead of Inductor's opaque graph hashes.
+    """
+    ranges_by_thread: dict[tuple[object, object], list[tuple[float, float, str]]] = {}
+    for ev in events:
+        if ev.get("ph") != "X" or ev.get("cat") != "user_annotation":
+            continue
+        label = ev.get("name")
+        if not _is_dag_node_label(label):
+            continue
+        ts = ev.get("ts")
+        dur = ev.get("dur")
+        if not isinstance(ts, (int, float)) or not isinstance(dur, (int, float)):
+            continue
+        ranges_by_thread.setdefault((ev.get("pid"), ev.get("tid")), []).append(
+            (float(ts), float(ts) + float(dur), label)
+        )
+    for ranges in ranges_by_thread.values():
+        ranges.sort(key=lambda item: (item[0], -item[1]))
+
+    external_id_to_label: dict[object, str] = {}
+    active: dict[tuple[object, object], list[tuple[float, str]]] = {}
+    cpu_events = sorted(
+        (
+            ev for ev in events
+            if ev.get("ph") == "X"
+            and ev.get("cat") != "kernel"
+            and str(ev.get("cat", "")).startswith(("cpu_op", "user_annotation"))
+        ),
+        key=lambda ev: float(ev.get("ts", 0.0) or 0.0),
+    )
+
+    range_idx = {key: 0 for key in ranges_by_thread}
+    for ev in cpu_events:
+        ts = ev.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        key = (ev.get("pid"), ev.get("tid"))
+        ranges = ranges_by_thread.get(key)
+        if not ranges:
+            continue
+        stack = active.setdefault(key, [])
+        while stack and stack[-1][0] < float(ts):
+            stack.pop()
+        idx = range_idx[key]
+        while idx < len(ranges) and ranges[idx][0] <= float(ts):
+            _start, end, label = ranges[idx]
+            if end >= float(ts):
+                stack.append((end, label))
+            idx += 1
+        range_idx[key] = idx
+        if not stack:
+            continue
+        ext_id = (ev.get("args") or {}).get("External id")
+        if ext_id is not None:
+            external_id_to_label[ext_id] = stack[-1][1]
+
+    annotated = 0
+    cuda_event_cats = {"kernel", "gpu_memcpy", "gpu_memset"}
+    for ev in events:
+        if ev.get("ph") != "X" or ev.get("cat") not in cuda_event_cats:
+            continue
+        args = ev.setdefault("args", {})
+        ext_id = args.get("External id")
+        label = external_id_to_label.get(ext_id)
+        if not label:
+            continue
+        name = ev.get("name", "")
+        prefix = f"{label}::"
+        if isinstance(name, str) and name.startswith(prefix):
+            continue
+        args.setdefault("piper_dag_node", label)
+        args.setdefault("original_cuda_name", name)
+        ev["name"] = f"{prefix}{name}"
+        annotated += 1
+    annotated += _rewrite_nested_gpu_annotations(events)
+    return annotated
+
+
+def _rewrite_nested_gpu_annotations(events: list[dict]) -> int:
+    gpu_annotations = [
+        ev for ev in events
+        if ev.get("ph") == "X" and ev.get("cat") == "gpu_user_annotation"
+    ]
+    dag_ranges_by_lane: dict[tuple[object, object], list[tuple[float, float, str]]] = {}
+    for ev in gpu_annotations:
+        label = ev.get("name")
+        if not _is_dag_node_label(label):
+            continue
+        ts = ev.get("ts")
+        dur = ev.get("dur")
+        if not isinstance(ts, (int, float)) or not isinstance(dur, (int, float)):
+            continue
+        dag_ranges_by_lane.setdefault((ev.get("pid"), ev.get("tid")), []).append(
+            (float(ts), float(ts) + float(dur), label)
+        )
+    for ranges in dag_ranges_by_lane.values():
+        ranges.sort(key=lambda item: (item[0], item[1] - item[0]))
+
+    cuda_events_by_lane: dict[tuple[object, object], list[dict]] = {}
+    for ev in events:
+        if ev.get("ph") == "X" and ev.get("cat") in {"kernel", "gpu_memcpy", "gpu_memset"}:
+            cuda_events_by_lane.setdefault((ev.get("pid"), ev.get("tid")), []).append(ev)
+    for lane_events in cuda_events_by_lane.values():
+        lane_events.sort(key=lambda ev: float(ev.get("ts", 0.0) or 0.0))
+
+    rewritten = 0
+    for ev in gpu_annotations:
+        name = ev.get("name")
+        if _is_dag_node_label(name):
+            continue
+        ts = ev.get("ts")
+        dur = ev.get("dur")
+        if not isinstance(ts, (int, float)) or not isinstance(dur, (int, float)):
+            continue
+        start = float(ts)
+        end = start + float(dur)
+        lane = (ev.get("pid"), ev.get("tid"))
+        label = _enclosing_dag_gpu_label(dag_ranges_by_lane.get(lane, []), start, end)
+        if label is None:
+            label = _contained_cuda_dag_label(
+                cuda_events_by_lane.get(lane, []), start, end
+            )
+        if label is None:
+            continue
+        args = ev.setdefault("args", {})
+        args.setdefault("original_gpu_annotation", name)
+        args.setdefault("piper_dag_node", label)
+        ev["name"] = label
+        rewritten += 1
+    return rewritten
+
+
+def _enclosing_dag_gpu_label(
+    dag_ranges: list[tuple[float, float, str]], start: float, end: float
+) -> str | None:
+    label = None
+    best_duration = None
+    for dag_start, dag_end, dag_label in dag_ranges:
+        if dag_start > start:
+            break
+        if dag_end < end:
+            continue
+        duration = dag_end - dag_start
+        if best_duration is None or duration < best_duration:
+            label = dag_label
+            best_duration = duration
+    return label
+
+
+def _contained_cuda_dag_label(
+    cuda_events: list[dict], start: float, end: float
+) -> str | None:
+    labels: dict[str, float] = {}
+    for ev in cuda_events:
+        ev_start = ev.get("ts")
+        ev_dur = ev.get("dur")
+        if not isinstance(ev_start, (int, float)) or not isinstance(ev_dur, (int, float)):
+            continue
+        ev_start = float(ev_start)
+        if ev_start > end:
+            break
+        ev_end = ev_start + float(ev_dur)
+        if ev_end < start:
+            continue
+        label = (ev.get("args") or {}).get("piper_dag_node")
+        if not label:
+            continue
+        overlap = max(0.0, min(end, ev_end) - max(start, ev_start))
+        labels[label] = labels.get(label, 0.0) + overlap
+    if not labels:
+        return None
+    return max(labels.items(), key=lambda item: item[1])[0]
 
 
 def _metrics_rows(dp_metrics: list[dict]) -> list[dict]:
@@ -460,25 +628,15 @@ def build_schedule_file(args: argparse.Namespace, run_dir: Path) -> tuple[Path, 
         base_schedule=args.base_schedule,
     )
     run_schedule = run_dir / f"{schedule_stem}.json"
-    output = args.generated_schedule_file or run_schedule
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as f:
+    with run_schedule.open("w", encoding="utf-8") as f:
         json.dump(schedule, f, indent=2)
         f.write("\n")
 
-    # Drop a copy of the complete schedule into the run directory so the exact
-    # directives used (base + appended order) are visible alongside results.csv,
-    # profile traces, and the schedule viz.
-    if run_schedule.resolve() != output.resolve():
-        with run_schedule.open("w", encoding="utf-8") as f:
-            json.dump(schedule, f, indent=2)
-            f.write("\n")
-
     viz_path = None
     if args.viz:
-        viz_output = args.schedule_viz_file or run_dir / f"{schedule_stem}.png"
+        viz_output = run_dir / f"{schedule_stem}.png"
         viz_path = visualize_order_directives(order_directives, viz_output)
-    return output, viz_path
+    return run_schedule, viz_path
 
 
 def _schedule_attr_stem(

@@ -27,7 +27,9 @@ def _run_bmm_experts(
     dim = x.shape[-1]
     num_experts = w1.shape[0]
     counts = num_tokens_per_expert.to(device=x.device, dtype=torch.long)
-    capacity = int(counts.max().item()) if counts.numel() else 0
+    # Keep capacity shape-derived so torch.compile never has to materialize a
+    # routed-token count as a Python scalar.
+    capacity = x.shape[0]
     starts = torch.cumsum(counts, dim=0) - counts
     positions = torch.arange(capacity, device=x.device, dtype=torch.long)
     zero = x.new_zeros((capacity, dim))
@@ -164,7 +166,7 @@ def create_qwen3_config(name: str) -> Qwen3ModelArgs:
             return Qwen3ModelArgs(
                 vocab_size=151936,
                 dim=2048,
-                n_layers=24,
+                n_layers=4,
                 n_heads=32,
                 n_kv_heads=8,
                 head_dim=64,
@@ -357,9 +359,7 @@ class AnnotatedMoE(MoE):
 
         # expert component
         with annotate(EP_TAG):
-            dispatched_input = routed_input.contiguous()
-            routed_output = self.experts(dispatched_input, num_tokens_per_expert)
-            gathered_output = routed_output.contiguous()
+            gathered_output = self.experts(routed_input, num_tokens_per_expert)
 
         gathered_output = gathered_output.reshape(-1, dim)
         out = self.shared_experts(x) if self.shared_experts is not None else None

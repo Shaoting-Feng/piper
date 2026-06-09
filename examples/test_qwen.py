@@ -74,7 +74,6 @@ def main(args, pg):
         nsight=args.nsight,
         temp_dir=args.temp_dir,
         visualize_dag=args.viz,
-        output_dir=args.output_dir,
         const_attrs={"rope_cache": rope_cache},
         use_inductor=args.use_inductor,
         pp_outer=args.pp_outer,
@@ -109,6 +108,9 @@ def main(args, pg):
     metrics = _raw_metrics(args, iter_times, peak_memory_stats)
 
     if args.pytorch_profiler:
+        profile_dir = getattr(args, "profile_dir", "") or os.path.join(
+            "out", "pytorch_profiles"
+        )
         logger.info(f"Running {args.pytorch_profiler_iters} PyTorch-profiled iterations")
         ray.get([actor.start_pytorch_profiler.remote() for actor in actors.values()])
         for _ in range(args.pytorch_profiler_iters):
@@ -116,7 +118,7 @@ def main(args, pg):
             if args.iteration_sleep > 0:
                 time.sleep(args.iteration_sleep)
         ray.get([
-            actor.stop_pytorch_profiler.remote(args.pytorch_profile_dir)
+            actor.stop_pytorch_profiler.remote(profile_dir)
             for actor in actors.values()
         ])
 
@@ -162,8 +164,6 @@ def parse_args(argv=None):
                         help="Save schedule and per-rank DAG visualizations")
     parser.add_argument("--temp-dir", default="/tmp/piper/ray_tmp",
                         help="Ray temp directory (default: /tmp/piper/ray_tmp)")
-    parser.add_argument("--output-dir", default="out",
-                        help="Directory for benchmark metrics output (default: out)")
     parser.add_argument(
         "--use-inductor",
         action=argparse.BooleanOptionalAction,
@@ -188,25 +188,11 @@ def parse_args(argv=None):
         help="JSON file containing schedule directives for the piper backend",
     )
     parser.add_argument(
-        "--metrics-json-out",
-        type=str,
-        default="",
-        help="If set, write the raw per-dp-rank metrics list as JSON to this path "
-             "(consumed by test_harness to build the metrics CSV).",
-    )
-    parser.add_argument(
         "--pytorch-profiler",
         action="store_true",
         default=False,
         help="Run extra iterations under torch.profiler on every actor and write "
              "per-actor chrome traces (combined per dp-rank by test_harness).",
-    )
-    parser.add_argument(
-        "--pytorch-profile-dir",
-        type=str,
-        default="",
-        help="Directory where actors write per-actor chrome traces "
-             "(dp{dp}_pp{pp}.json). Set by test_harness.",
     )
     parser.add_argument(
         "--pytorch-profiler-iters",

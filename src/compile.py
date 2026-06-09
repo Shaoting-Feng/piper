@@ -3,6 +3,7 @@ import torch
 import copy
 import os
 import time
+from pathlib import Path
 
 from .actor import _create_actors
 from .state import (
@@ -107,6 +108,11 @@ def _resolve_model_constructor_value(value, schedule_info: dict):
     return value
 
 
+def _artifact_dir_for_schedule(schedule_directives_file: str) -> str:
+    parent = Path(schedule_directives_file).parent
+    return str(parent if str(parent) else Path("out"))
+
+
 def piper_setup(
     model_class,
     model_args=(),
@@ -123,7 +129,6 @@ def piper_setup(
     nsight=False,
     temp_dir: str = None,
     visualize_dag: bool = False,
-    output_dir: str = "out",
     const_attrs: dict = None,
     pp_outer: bool = False,
     schedule_directives_file: str | None = None,
@@ -159,7 +164,7 @@ def piper_setup(
         raise ValueError("piper_setup requires schedule_directives_file")
 
     piper_metadata.visualize_dag = visualize_dag
-    piper_metadata.output_dir = output_dir
+    piper_metadata.artifact_dir = _artifact_dir_for_schedule(schedule_directives_file)
     piper_metadata.schedule_directives = list(schedule_directives or [])
     piper_metadata.schedule_directives_file = schedule_directives_file
     piper_metadata.schedule_info = dict(schedule_info)

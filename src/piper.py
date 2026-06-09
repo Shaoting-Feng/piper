@@ -189,15 +189,15 @@ def piper(gm, example_inputs, **kwargs):
     )
     piper_metadata.training_dag = training_dag
     per_pp_training_dags = _split_global_training_dag_by_pp_rank(training_dag)
-    output_dir = getattr(piper_metadata, "output_dir", "out")
+    artifact_dir = getattr(piper_metadata, "artifact_dir", "out")
     for i, subdag in enumerate(per_pp_training_dags):
         zero_chains = _prune_zero_lifetime_metadata(subdag)
         resolve_total_order_per_stream(subdag)
         _add_inter_chain_temporal_edges(subdag, zero_chains)
         if getattr(piper_metadata, "visualize_dag", False):
             log_training_dag_dependencies(subdag)
-            print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=output_dir)
-            render_training_dag(subdag, output_path=f"{output_dir}/training_dag_pp{i}")
+            print_training_dag_order(subdag, label=f"pp{i}", rank=i, out_dir=artifact_dir)
+            render_training_dag(subdag, output_path=f"{artifact_dir}/training_dag_pp{i}")
     piper_metadata.per_pp_training_dags = per_pp_training_dags
 
     logger.info(
