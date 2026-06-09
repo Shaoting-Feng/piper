@@ -6,8 +6,8 @@ New distributed training strategies should not require new distributed runtimes;
 
 ## Updates
 
-* 2026-06 - Blog post: [A Programmable Distributed Training System](TODO).
-* 2025-10 - Paper released on arXiv: [DOI](TODO).
+* 2026-06 - Blog post: [A Programmable Distributed Training System](https://syfi.cs.washington.edu/blog/2026-06-05-piper/).
+* 2025-10 - Paper pending release on arXiv.
 
 ## Introduction
 
@@ -99,7 +99,7 @@ For each tag name, Piper assigns integer indices in trace order, so repeated `pi
 
 The schedule directives program uses these tag names and indices in filters to select regions of the traced model.
 For example, a filter can select one concrete region by its tag index, all regions with a tag, or regions that match a combination of tags.
-See the blog walkthrough section on [annotating a Qwen3 MoE model](TODO) for an example and further details.
+See the blog walkthrough section on [annotating a Qwen3 MoE model](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#annotating-a-qwen3-moe-model) for an example and further details.
 
 ### Schedule Directives Program
 
@@ -149,7 +149,7 @@ Supported directives:
   * Multiple filters in the same group permit Piper to interleave those sub-DAGs.
 
 In practice, base schedules under `examples/base-schedules/` describe model placement and composed parallelism choices, while `examples/test_harness.py` appends generated `split` and `order` directives for schedule families such as `1f1b`, `interleaved_1f1b`, `zerobubble`, and `dualpipev`.
-For more detail, see the blog walkthrough sections on [PP x DP x EP placement](TODO), [DualPipe-like pipeline scheduling](TODO), and [schedule builders](TODO).
+For more detail, see the blog walkthrough sections on [PP x DP x EP placement](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-dualpipe-like-pp-x-dp-x-ep-model-placement), [DualPipe-like pipeline scheduling](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#scheduling-a-dualpipe-like-pipeline-schedule), and [schedule builders](https://syfi.cs.washington.edu/blog/2026-06-05-piper/#generating-directives-with-schedule-builders).
 
 ## Overview of Outputs
 
@@ -191,5 +191,5 @@ To run all Qwen example schedules, use `examples/run_qwen_examples.py`.
 If you use Piper in your research, please cite:
 
 ```bibtex
-TODO
+arXiv release pending
 ```
