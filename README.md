@@ -1,4 +1,4 @@
-# Piper
+# Piper: A Programmable Distributed Training System
 
 [![arXiv](https://img.shields.io/badge/arXiv-TODO-b31b1b.svg)](TODO)
 
