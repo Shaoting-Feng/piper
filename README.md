@@ -1,13 +1,13 @@
 # Piper: A Programmable Distributed Training System
 
-[![arXiv](https://img.shields.io/badge/arXiv-TODO-b31b1b.svg)](TODO)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.11169-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2606.11169)
 
 New distributed training strategies should not require new distributed runtimes; Piper gives PyTorch users direct control over model placement and GPU scheduling with lightweight annotations and a small scheduling language.
 
 ## Updates
 
-* 2026-06 - Blog post: [A Programmable Distributed Training System](https://syfi.cs.washington.edu/blog/2026-06-05-piper/).
-* 2025-10 - Paper pending release on arXiv.
+* 2026-06 - Blog post: [Introducing Piper: A Programmable Distributed Training System](https://syfi.cs.washington.edu/blog/2026-06-05-piper/).
+* 2026-06 - Paper released on arXiv: [2606.11169](https://arxiv.org/abs/2606.11169).
 
 ## Introduction
 
@@ -191,5 +191,13 @@ To run all Qwen example schedules, use `examples/run_qwen_examples.py`.
 If you use Piper in your research, please cite:
 
 ```bibtex
-arXiv release pending
+@misc{frisella2026piperprogrammabledistributedtraining,
+      title={Piper: A Programmable Distributed Training System}, 
+      author={Megan Frisella and Shubham Tiwari and Andy Ruan and Yi Pan and Parker Gustafson and Mat Jacob and Gilbert Bernstein and Stephanie Wang},
+      year={2026},
+      eprint={2606.11169},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2606.11169}, 
+}
 ```
