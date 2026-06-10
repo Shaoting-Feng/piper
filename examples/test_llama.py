@@ -109,7 +109,8 @@ def main(args, pg):
     logger.info(f"Running {args.warmup} warmup iterations")
     for _ in range(args.warmup):
         piper_exec_dag(loss_fn, log_stats=True)
-        time.sleep(1)
+        if args.iteration_sleep > 0:
+            time.sleep(args.iteration_sleep)
 
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
     logger.info(f"Running {args.iters} timed iterations")
@@ -119,7 +120,8 @@ def main(args, pg):
         piper_exec_dag(loss_fn, log_stats=True)
         end = time.perf_counter()
         iter_times.append(end - start)
-        time.sleep(1)
+        if args.iteration_sleep > 0:
+            time.sleep(args.iteration_sleep)
 
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
@@ -135,7 +137,8 @@ def main(args, pg):
         ray.get([actor.start_pytorch_profiler.remote() for actor in actors.values()])
         for _ in range(args.pytorch_profiler_iters):
             piper_exec_dag(loss_fn)
-            time.sleep(1)
+            if args.iteration_sleep > 0:
+                time.sleep(args.iteration_sleep)
         ray.get([
             actor.stop_pytorch_profiler.remote(profile_dir)
             for actor in actors.values()
@@ -157,6 +160,7 @@ def parse_args(argv=None):
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--iteration-sleep", type=float, default=1.0)
     parser.add_argument("--activation-checkpointing", action="store_true", default=False)
     parser.add_argument(
         "--num-checkpoints",

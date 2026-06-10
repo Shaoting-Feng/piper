@@ -2,7 +2,7 @@ import sys
 import logging
 from typing import Optional
 
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "DEBUG"
 
 """
 Logger utility
