@@ -7,7 +7,7 @@ New distributed training strategies should not require new distributed runtimes;
 ## Updates
 
 * 2026-06 - Blog post: [Introducing Piper: A Programmable Distributed Training System](https://syfi.cs.washington.edu/blog/2026-06-05-piper/).
-* 2025-10 - Paper released on arXiv: [2606.11169](https://arxiv.org/abs/2606.11169).
+* 2026-06 - Paper released on arXiv: [2606.11169](https://arxiv.org/abs/2606.11169).
 
 ## Introduction
 
