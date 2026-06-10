@@ -1,13 +1,13 @@
 # Piper: A Programmable Distributed Training System
 
-[![arXiv](https://img.shields.io/badge/arXiv-2606.11169-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/pdf/2606.11169)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.11169-b31b1b.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2606.11169)
 
 New distributed training strategies should not require new distributed runtimes; Piper gives PyTorch users direct control over model placement and GPU scheduling with lightweight annotations and a small scheduling language.
 
 ## Updates
 
 * 2026-06 - Blog post: [Introducing Piper: A Programmable Distributed Training System](https://syfi.cs.washington.edu/blog/2026-06-05-piper/).
-* 2025-10 - Paper released on arXiv: [2606.11169](https://arxiv.org/pdf/2606.11169).
+* 2025-10 - Paper released on arXiv: [2606.11169](https://arxiv.org/abs/2606.11169).
 
 ## Introduction
 
