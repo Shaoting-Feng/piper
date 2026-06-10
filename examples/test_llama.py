@@ -70,7 +70,6 @@ def _raw_metrics(args, iter_times, peak_memory_stats):
 
 def main(args, pg):
     llama_config = _model_config(args.model)
-    logger.info(args)
 
     loss_mod = torch.nn.CrossEntropyLoss()
     loss_fn = lambda output, labels: loss_mod(output.view(-1, output.size(-1)), labels.view(-1))

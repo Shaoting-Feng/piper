@@ -626,17 +626,6 @@ def _bucket_matched_fwd_nodes(
             ]
 
         pre_bytes = _param_bytes(graphargs, param_idxs)
-        logger.info(
-            "bucket_stage pre-size node=%s stage=%s seg=%s bucket_size_value=%d "
-            "bucket_size_bytes_passed=%d bucket_size_mib_passed=%.6f param_bytes=%d",
-            fwd_uid,
-            fwd_node.node_meta.get("stage_id"),
-            fwd_node.node_meta.get("segment_id"),
-            int(bucket_size_mb),
-            bucket_size_bytes,
-            bucket_size_bytes / (1024 * 1024),
-            pre_bytes,
-        )
 
         try:
             buckets = bucket_stage(
@@ -664,34 +653,16 @@ def _bucket_matched_fwd_nodes(
             post_bytes = _param_bytes(b_args, b_param)
             bucket_param_names = _param_names(_bgm, b_param)
             lowered_param_counts.update(bucket_param_names)
-            logger.info(
-                "bucket_stage bucket-size node=%s bucket=%d/%d param_bytes=%d params=%d names=%s",
-                fwd_uid,
-                bi,
-                len(buckets),
-                post_bytes,
-                len(bucket_param_names),
-                bucket_param_names,
-            )
+
         missing_param_names = sorted(original_param_names - set(lowered_param_counts))
         unknown_param_names = sorted(set(lowered_param_counts) - original_param_names)
         duplicate_param_names = sorted(
             name for name, count in lowered_param_counts.items() if count != 1
         )
-        logger.info(
-            "bucket_stage lowered-ownership node=%s original_params=%d lowered_param_refs=%d "
-            "unique_lowered_params=%d missing_params=%d duplicate_params=%d unknown_params=%d",
-            fwd_uid,
-            len(original_param_names),
-            sum(lowered_param_counts.values()),
-            len(lowered_param_counts),
-            len(missing_param_names),
-            len(duplicate_param_names),
-            len(unknown_param_names),
-        )
+
         if missing_param_names or duplicate_param_names or unknown_param_names:
             logger.warning(
-                "bucket_stage lowered-ownership-invalid node=%s missing=%s duplicates=%s unknown=%s",
+                "invalid bucket node=%s missing=%s duplicates=%s unknown=%s",
                 fwd_uid,
                 missing_param_names[:16],
                 duplicate_param_names[:16],
@@ -1593,7 +1564,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         if not isinstance(raw, dict) or raw.get("op") != "split":
             continue
         flt, dim_name, num_microbatches = _normalize_split_directive(raw)
-        logger.info(
+        logger.debug(
             "Applying directive[%d]: split(filter=%s, dim_name=%s, num_microbatches=%d)",
             i, flt, dim_name, num_microbatches
         )
@@ -1605,7 +1576,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         if isinstance(raw, dict) and raw.get("op") != "place":
             continue
         op, filters, devices, stream, _gather_stream, _reduce_stream, shard_params, shard_grads, bucket_size = _normalize_filter_devices_directive(raw)
-        logger.info(
+        logger.debug(
             "Applying directive[%d]: %s(filters=%s, devices=%s, stream=%s, shard_params=%s, shard_grads=%s, bucket_size=%s)",
             i, op, filters, devices, stream, shard_params, shard_grads, bucket_size
         )
@@ -1634,7 +1605,7 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         if isinstance(raw, dict) and raw.get("op") in ("place", "split", "order"):
             continue
         op, filters, devices, stream, gather_stream, reduce_stream, shard_params, shard_grads, bucket_size = _normalize_filter_devices_directive(raw)
-        logger.info(
+        logger.debug(
             "Applying directive[%d]: %s(filters=%s, devices=%s, stream=%s, gather_stream=%s, reduce_stream=%s, shard_params=%s, shard_grads=%s, bucket_size=%s)",
             i, op, filters, devices, stream, gather_stream, reduce_stream, shard_params, shard_grads, bucket_size
         )
@@ -1665,5 +1636,5 @@ def apply_schedule_directives(training_dag: TrainingDAG, directives: list[Any] |
         if not isinstance(raw, dict) or raw.get("op") != "order":
             continue
         filter_groups = _parse_order_directive(raw)
-        logger.info("Applying directive[%d]: order(filters=%s)", i, filter_groups)
+        logger.debug("Applying directive[%d]: order(filters=%s)", i, filter_groups)
         _apply_order_directive(training_dag, filter_groups, directive_idx=i)

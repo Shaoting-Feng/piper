@@ -115,7 +115,7 @@ def render_training_dag(training_dag: TrainingDAG, output_path: str = "out/train
             dot.edge(edge.src_uid, edge.dst_uid, style="dashed", color="blue")
 
     out = dot.render(output_path, format="png", cleanup=True)
-    logger.info("TrainingDAG debug graph saved to %s", out)
+    logger.info("Local DAG IR visualization saved to %s", out)
 
 
 def log_training_dag_dependencies(training_dag: TrainingDAG) -> None:
@@ -195,7 +195,7 @@ def print_training_dag_order(
     out_path = os.path.join(out_dir, f"training_dag_order_rank{rank}")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    logger.info("TrainingDAG execution order saved to %s", out_path)
+    logger.info("Pipeline schedule visualization saved to %s", out_path)
 
 
 def visualize_order_directives(

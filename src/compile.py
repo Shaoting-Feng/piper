@@ -341,5 +341,3 @@ def piper_setup(
         piper_metadata.actors[pp_rank].load_labels.remote(example_outputs)
         for pp_rank in loss_pp_ranks
     ])
-
-    logger.info(f"DP rank {dp_rank} done.")

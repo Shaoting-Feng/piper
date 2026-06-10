@@ -377,9 +377,6 @@ class Transformer(nn.Module):
             num_params = sum(p.numel() for p in layer.parameters())
             size_mib = num_params * 4 / (1024 * 1024)
             indent_str = "  " * indent
-            logger.info(
-                f"{indent_str}{layer.__class__.__name__}: {round(size_mib)} MiB"
-            )
             if size_mib < 25:
                 return
             for _, child in layer.named_children():

@@ -177,8 +177,8 @@ def _prune_zero_lifetime_metadata(dag: TrainingDAG) -> list[list[str]]:
                     f"zero_lifetime_prune: gradient chain has mixed buckets: "
                     f"{[(uid, _chain_bucket(uid)) for uid in chain]}"
                 )
-                logger.info(
-                    "zero_lifetime_prune_grad_chain bucket=%s nodes=%s keep_alloc_for=%s keep_reduce_scatter_for=%s",
+                logger.debug(
+                    "pruned zero lifetime: bucket=%s nodes=%s keep_alloc_for=%s keep_reduce_scatter_for=%s",
                     bucket,
                     chain,
                     chain[0],

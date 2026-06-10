@@ -195,7 +195,7 @@ class PiperActor:
         )
         self.runtime.torch_profiler.__enter__()
         self.runtime.pytorch_profiler_enabled = True
-        self.logger.info(f"Actor {self.runtime.global_rank}: PyTorch profiler started")
+        self.logger.debug(f"Actor {self.runtime.global_rank}: PyTorch profiler started")
 
     def stop_pytorch_profiler(self, profile_dir: str) -> str:
         """End the profiler session and export a chrome trace.
@@ -242,7 +242,7 @@ class PiperActor:
 
     def _join_process_groups(self, master_addr, master_port):
 
-        self.logger.info(f"Actor {self.runtime.global_rank} using GPU {os.environ['CUDA_VISIBLE_DEVICES']}, master addr {master_addr}:{master_port}")
+        self.logger.debug(f"Actor {self.runtime.global_rank} using GPU {os.environ['CUDA_VISIBLE_DEVICES']}, master addr {master_addr}:{master_port}")
 
         init_method = f"tcp://{master_addr}:{master_port}"
 
@@ -262,7 +262,7 @@ class PiperActor:
             if self.runtime.pp_degree > 1:
                 self._join_pp_process_group()
 
-            self.logger.info(f"Actor {self.runtime.global_rank} joined process groups")
+            self.logger.debug(f"Actor {self.runtime.global_rank} joined process groups")
 
     def _join_dp_process_group(self):
         num_dp_groups = self.runtime.world_size // self.runtime.dp_degree

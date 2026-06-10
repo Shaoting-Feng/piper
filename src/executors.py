@@ -124,7 +124,7 @@ class CommunicationExecutor:
         bucket = self.stages.get_bucket(ubid)
         if bucket is not None and bucket.trainable_param_idxs:
             return True
-        self.logger.warning(
+        self.logger.debug(
             "%s: skipping collective for ubid=%s because it has no trainable param indices",
             op_name,
             ubid,

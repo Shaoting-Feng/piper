@@ -200,8 +200,8 @@ def piper(gm, example_inputs, **kwargs):
             render_training_dag(subdag, output_path=f"{artifact_dir}/training_dag_pp{i}")
     piper_metadata.per_pp_training_dags = per_pp_training_dags
 
-    logger.info(
-        "piper: built TrainingDAG with %d nodes and %d edges, split into %d per-PP DAG(s)",
+    logger.debug(
+        "built TrainingDAG with %d nodes and %d edges, split into %d local PP-rank DAG(s)",
         len(training_dag.nodes),
         len(training_dag.edges),
         len(per_pp_training_dags),
@@ -240,11 +240,8 @@ def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
 
 
 def _log_step_stats(step_time: float, log_memory: bool, actors: dict) -> None:
-    """Log throughput, MFU, and optionally per-rank peak GPU memory."""
     stats = [f"step_time={step_time:.3f}s"]
-
     tokens = getattr(piper_metadata, "tokens_per_step", None)
     if tokens is not None:
         stats.append(f"throughput={tokens / step_time:.1f} tok/s")
-
     logger.info("  ".join(stats))
