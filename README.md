@@ -168,24 +168,6 @@ Optional artifact generation flags:
 * `--viz` renders the generated pipeline schedule and per-PP-rank DAG IRs under the run directory.
 * `--pytorch-profiler --pytorch-profiler-iters <n>` runs extra profiled iterations and writes combined Chrome trace files per SPMD rank; Piper annotates GPU events with DAG IR node labels.
 
-## Development
-
-The GitHub Actions workflow runs the CPU-only pytest suite on pushes and pull requests:
-
-```bash
-python -m pytest -m "not gpu" -v test
-```
-
-There are currently no pytest tests marked `gpu` under `test/`.
-To run the full pytest suite, including any future GPU-marked tests, use:
-
-```bash
-python -m pytest -v test
-```
-
-For GPU end-to-end validation, run the quickstart examples above on a machine with four visible CUDA devices.
-To run all Qwen example schedules, use `examples/run_qwen_examples.py`.
-
 ## Citation
 
 If you use Piper in your research, please cite:
