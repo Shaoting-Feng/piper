@@ -8,6 +8,9 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from .state import create_logger, LOG_LEVEL
 from .schedule import load_schedule_info
 
+# No standby worker exists yet: fail fast on the first dp_rank failure.
+STANDBY_ENABLED = os.environ.get("PIPER_STANDBY_ENABLED", "0") == "1"
+
 
 # Coordinator needs GPUs when using profiling to infer stage boundaries
 # @ray.remote(num_gpus=0.1)
@@ -65,27 +68,46 @@ class PiperProgramCoordinator:
             logger.exception("Failed to kill stale Ray actor named %s", _COMPILED_DATA_ACTOR)
             raise
 
-        return ray.get(
-            [
-                run_dp_rank.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=(
-                            dp_rank % self.pp_degree if self.pp_outer else dp_rank
-                        ),
-                    )
-                ).remote(
-                    dp_rank,
-                    self.dp_degree,
-                    self.pp_degree,
-                    self.world_size,
-                    training_func,
-                    *args,
-                    **kwargs,
+        refs = [
+            run_dp_rank.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=(
+                        dp_rank % self.pp_degree if self.pp_outer else dp_rank
+                    ),
                 )
-                for dp_rank in range(self.dp_degree)
-            ]
-        )
+            ).remote(
+                dp_rank,
+                self.dp_degree,
+                self.pp_degree,
+                self.world_size,
+                training_func,
+                *args,
+                **kwargs,
+            )
+            for dp_rank in range(self.dp_degree)
+        ]
+
+        # React to whichever dp_rank task finishes or fails first.
+        pending = list(refs)
+        results = []
+        failures = 0
+        while pending:
+            done, pending = ray.wait(pending, num_returns=1)
+            try:
+                results.append(ray.get(done[0]))
+            except Exception:
+                failures += 1
+                logger.exception(
+                    f"a dp_rank task failed ({failures}/{self.dp_degree})"
+                )
+                if not STANDBY_ENABLED:
+                    # M1: fail fast on first failure (see STANDBY_ENABLED above).
+                    raise
+                if failures == self.dp_degree:
+                    # Everyone is down — nothing left to wait for.
+                    raise
+        return results
 
 
 def create_piper_placement_group(schedule_directives_file: str, pp_outer: bool = False):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +14,38 @@ from torch.nn import Parameter
 from .backward import construct_reverse_graph, get_param_groups, _get_grad_fn_or_grad_acc
 from .runtime import BufferStore, EventStore, ParamStorage, RuntimeState, StageStore
 from .tasks import TaskType
+
+
+def _maybe_inject_fault(pass_name: str, iter_count: int, dp_rank: int) -> None:
+    """Inject a debug fault when PIPER_FAULT matches the given execution point.
+
+    pass_name: name of the executing pass (e.g. "bwd").
+    iter_count: 0-based run_dag iteration counter (warmup iterations count).
+    dp_rank: this actor's DP rank.
+
+    PIPER_FAULT formats (never set in production runs):
+      "bwd:<iter>:<dp_rank>"            -> raise RuntimeError (loud mode)
+      "bwd:<iter>:<dp_rank>:sleep:<s>"  -> sleep s seconds    (stuck mode)
+    """
+    spec = os.environ.get("PIPER_FAULT")
+    if not spec:
+        return
+    parts = spec.split(":")
+    if parts[:3] != [pass_name, str(iter_count), str(dp_rank)]:
+        return
+    # One BWD node per annotated segment — latch to fire once per iteration.
+    key = (spec, iter_count)
+    if key in _FIRED_FAULTS:
+        return
+    _FIRED_FAULTS.add(key)
+    print(f"PIPER_FAULT firing: {spec}", flush=True)
+    if len(parts) >= 5 and parts[3] == "sleep":
+        time.sleep(float(parts[4]))
+        return
+    raise RuntimeError(f"injected fault ({spec})")
+
+
+_FIRED_FAULTS: set = set()
 
 
 @dataclass
@@ -454,6 +488,9 @@ class DagExecutor:
     communication: CommunicationExecutor
     compute: ComputeExecutor
     logger: Any
+    # 0-based iteration counter, set by PiperActor.run_dag each call.
+    # Debug-only: consumed by _maybe_inject_fault for E2E fault injection.
+    _iter_count: int = 0
 
     @staticmethod
     def _node_meta(node: Any) -> dict:
@@ -737,6 +774,7 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.BWD:
+                    _maybe_inject_fault("bwd", self._iter_count, self.runtime.dp_rank)
                     recv_pred = next(
                         (p for p in node.data_preds if p.task_type == TaskType.RECV), None
                     )

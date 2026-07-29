@@ -216,15 +216,34 @@ def piper(gm, example_inputs, **kwargs):
     return callback
 
 
-def piper_exec_dag(loss_fn, log_stats: bool = False) -> list:
-    """Execute one training step using the loaded per-rank TrainingDAG."""
+def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None = None) -> list:
+    """Execute one training step using the loaded per-rank TrainingDAG.
+
+    loss_fn: loss function forwarded to each actor's run_dag.
+    log_stats: log step time and throughput after the step.
+    step_timeout: optional seconds to wait for the step before logging that it
+        is overdue; None disables the overdue check.
+    """
     actors = piper_metadata.actors
     run_refs = [
         actor.run_dag.remote(loss_fn=loss_fn)
         for actor in actors.values()
     ]
     t0 = time.perf_counter()
-    results = ray.get(run_refs)
+    if step_timeout is None:
+        results = ray.get(run_refs)
+    else:
+        # Keep waiting on the SAME refs (resubmitting would queue a second
+        # step behind a possibly-stuck one); actor errors propagate.
+        while True:
+            try:
+                results = ray.get(run_refs, timeout=step_timeout)
+                break
+            except ray.exceptions.GetTimeoutError:
+                logger.warning(
+                    f"step exceeded step_timeout={step_timeout:.1f}s; "
+                    "still waiting on in-flight step (peer may be down)"
+                )
     step_time = time.perf_counter() - t0
 
     if log_stats:

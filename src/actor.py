@@ -735,6 +735,8 @@ class PiperActor:
         # Mark the entire iteration boundary for the NVTX timeline.
         iter_idx = getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
+        # Debug-only: expose the iteration counter for E2E fault injection.
+        self.dag_executor._iter_count = iter_idx
         self._nvtx_push(f"iter_{iter_idx}_rank_{self.runtime.global_rank}")
         self.dag_executor.run(
             self.dag,

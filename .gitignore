@@ -6,3 +6,4 @@ out/
 .vscode/
 .codex
 ec2-trust-policy.json
+piper_study/

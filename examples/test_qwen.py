@@ -84,18 +84,26 @@ def main(args, pg):
 
     actors = piper_metadata.actors
 
+    # No step_timeout during warmup; afterward 5x the last warmup step
+    # (~steady step time), floored at 5s.
     logger.info(f"Running {args.warmup} warmup iterations")
+    last_warmup_time = None
     for _ in range(args.warmup):
+        t0 = time.perf_counter()
         piper_exec_dag(loss_fn)
+        last_warmup_time = time.perf_counter() - t0
         if args.iteration_sleep > 0:
             time.sleep(args.iteration_sleep)
+    step_timeout = (
+        max(5.0, 5 * last_warmup_time) if last_warmup_time is not None else None
+    )
 
     logger.info(f"Running {args.iters} timed iterations")
     ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
     iter_times = []
     for _ in range(args.iters):
         start = time.perf_counter()
-        piper_exec_dag(loss_fn, log_stats=True)
+        piper_exec_dag(loss_fn, log_stats=True, step_timeout=step_timeout)
         end = time.perf_counter()
         iter_times.append(end - start)
         if args.iteration_sleep > 0:
@@ -114,7 +122,7 @@ def main(args, pg):
         logger.info(f"Running {args.pytorch_profiler_iters} PyTorch-profiled iterations")
         ray.get([actor.start_pytorch_profiler.remote() for actor in actors.values()])
         for _ in range(args.pytorch_profiler_iters):
-            piper_exec_dag(loss_fn)
+            piper_exec_dag(loss_fn, step_timeout=step_timeout)
             if args.iteration_sleep > 0:
                 time.sleep(args.iteration_sleep)
         ray.get([
