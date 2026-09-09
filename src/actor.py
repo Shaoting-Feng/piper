@@ -896,7 +896,7 @@ class PiperActor:
         # Debug-only: expose the iteration counter for E2E fault injection.
         self.dag_executor._iter_count = iter_idx
         self._nvtx_push(f"iter_{iter_idx}_rank_{self.runtime.global_rank}")
-        self.dag_executor.run(
+        result = self.dag_executor.run(
             self.dag,
             self.sorted_dag_nodes,
             self.inputs,
@@ -905,3 +905,4 @@ class PiperActor:
             loss_fn=loss_fn,
         )
         self._nvtx_pop()
+        return result

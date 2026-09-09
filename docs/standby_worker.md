@@ -42,7 +42,7 @@ standby wakes, exits; results.csv identical to a no-standby run.
 | Knob | Where | Meaning |
 |---|---|---|
 | `--num-standby N` (default 0) | `test_harness.py` | Reserve N standby ranks (+N GPU bundles, `world_size = dp*pp + N`). N > 0 enables promotion on trainer failure; 0 keeps fail-fast. pp_degree must be 1. |
-| `PIPER_FAULT` (env, debug) | `executors.py` | Fault injection: `bwd:<iter>:<rank>` (crash) or `bwd:<iter>:<rank>:sleep:<s>` (stall). |
+| `PIPER_FAULT` (env, debug) | `executors.py` | Fault injection: `<pass>:<iter>:<rank>` (crash) or `<pass>:<iter>:<rank>:sleep:<s>` (stall); `<pass>` = `bwd` (before all-reduce) or `upd` (after all-reduce, before optimizer step). |
 
 ## Tests
 

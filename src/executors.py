@@ -24,8 +24,10 @@ def _maybe_inject_fault(pass_name: str, iter_count: int, dp_rank: int) -> None:
     dp_rank: this actor's DP rank.
 
     PIPER_FAULT formats (never set in production runs):
-      "bwd:<iter>:<dp_rank>"            -> raise RuntimeError (loud mode)
-      "bwd:<iter>:<dp_rank>:sleep:<s>"  -> sleep s seconds    (stuck mode)
+      "<pass>:<iter>:<dp_rank>"            -> raise RuntimeError (loud mode)
+      "<pass>:<iter>:<dp_rank>:sleep:<s>"  -> sleep s seconds    (stuck mode)
+    where <pass> is "bwd" (BWD dispatch, before the gradient all-reduce) or
+    "upd" (UPD, after the gradient all-reduce wait, before the optimizer step).
     """
     spec = os.environ.get("PIPER_FAULT")
     if not spec:
@@ -602,6 +604,7 @@ class DagExecutor:
         self.params.zero_grad_buffers(default_stream)
         zero_evt = torch.cuda.Event()
         zero_evt.record(default_stream)
+        step_result = None
         for stream in self.runtime.streams.values():
             if stream is not default_stream:
                 stream.wait_event(zero_evt)
@@ -809,6 +812,7 @@ class DagExecutor:
                             self.compute.log_compute_loss_inputs(labels, node, fwd_key, fwd_out)
                         with torch.cuda.stream(node_stream):
                             outputs_or_loss = [loss_fn(fwd_out["out_with_grad"][0], labels)]
+                        loss_buffer.append(outputs_or_loss[0].detach())
                         upstream_grads = None
                     elif recv_pred is not None:
                         upstream_grads = self.buffers.task[recv_pred.uid]
@@ -1005,13 +1009,14 @@ class DagExecutor:
                         self.params.defer_free_full_params(ubid, evt)
 
                 case TaskType.UPD:
-                    self._update(node_stream, loss_buffer)
+                    step_result = self._update(node_stream, loss_buffer)
 
                 case TaskType.ORDER_DUMMY:
                     pass
 
             self._rf_exit(rf)
             self.runtime.nvtx_pop()
+        return step_result
 
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
         self.params.drain_pending_frees()
@@ -1020,12 +1025,13 @@ class DagExecutor:
                 raise RuntimeError(
                     "fenced during collective; ZeRO optimizer step refused"
                 )
+            _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
             self.params.step_zero_shard_optimizers(stream, self.events.reduce_scatter)
-            losses = loss_buffer
+            losses = list(loss_buffer)
             loss_buffer.clear()
             torch.cuda.synchronize()
             self._last_committed = self._iter_count
-            return losses
+            return [float(l) for l in losses]
 
         if self._cpu_sync_allreduce:
             # An aborted collective fires its events with garbage gradients;
@@ -1041,6 +1047,7 @@ class DagExecutor:
             for ar_evt in self.events.all_reduce.values():
                 stream.wait_event(ar_evt)
 
+        _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue
@@ -1051,7 +1058,7 @@ class DagExecutor:
             with torch.cuda.stream(stream):
                 bucket.optimizer.step()
 
-        losses = loss_buffer
+        losses = list(loss_buffer)
         loss_buffer.clear()
 
         torch.cuda.synchronize()
@@ -1059,5 +1066,5 @@ class DagExecutor:
         self._last_committed = self._iter_count
 
         return {
-            "losses": losses,
+            "losses": [float(l) for l in losses],
         }

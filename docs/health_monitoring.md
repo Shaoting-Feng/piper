@@ -34,12 +34,17 @@ harness (test_harness.py)
 |---|---|---|
 | `step_timeout` (param, seconds, default `None`) | `piper_exec_dag` | Warn when a step is overdue; `None` disables. `test_qwen.py` sets it automatically: `None` during warmup, then `max(5.0, 5 × last warmup step time)`. |
 | `--num-standby` (harness flag, default 0) | coordinator | `0`: fail fast on first dp_rank failure. `>0`: promote a standby instead (see `docs/standby_worker.md`). |
-| `PIPER_FAULT` (env, debug only) | `executors.py` BWD dispatch | Fault injection for tests; fires once per matching iteration and prints `PIPER_FAULT firing: <spec>`. Formats below. |
+| `PIPER_FAULT` (env, debug only) | `executors.py` BWD dispatch / UPD | Fault injection for tests; fires once per matching iteration and prints `PIPER_FAULT firing: <spec>`. Formats below. |
 
 `PIPER_FAULT` formats (`<iter>` is the 0-based `run_dag` counter; warmup counts):
 
-- `bwd:<iter>:<dp_rank>` — raise `RuntimeError` (loud mode)
+- `bwd:<iter>:<dp_rank>` — raise `RuntimeError` at BWD dispatch, before the gradient all-reduce (loud mode)
 - `bwd:<iter>:<dp_rank>:sleep:<seconds>` — sleep in BWD (stuck mode)
+- `upd:<iter>:<dp_rank>[:sleep:<seconds>]` — same, at UPD after the gradient all-reduce wait and before the optimizer step
+
+With a standby, the two points differ in where training resumes: `bwd` leaves
+the survivor's all-reduce incomplete (survivor refuses the step, resumes at
+`<iter>`); `upd` fails after it completed (survivor commits, resumes at `<iter>+1`).
 
 ## Testing the behaviors
 

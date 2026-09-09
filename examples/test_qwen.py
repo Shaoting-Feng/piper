@@ -2,6 +2,7 @@
 import ray
 import torch
 import argparse
+import json
 import time
 import os
 
@@ -42,6 +43,60 @@ def _raw_metrics(args, iter_times, peak_memory_stats):
     }
 
 
+# Synthetic sharded dataset. Sample ``idx`` is an arithmetic progression mod
+# DATA_VOCAB with a seeded start/stride, so next-token prediction is learnable
+# and every (seed, iteration, data_rank) maps to a fixed, disjoint batch.
+DATA_VOCAB = 1024
+DATA_SAMPLES = 4096
+
+
+def _make_batch(seed, it, data_rank, dp_degree, batch_size, seq_len):
+    """Return (x, y) for global batch ``it * dp_degree + data_rank``."""
+    k = it * dp_degree + data_rank
+    xs, ys = [], []
+    for j in range(batch_size):
+        idx = (k * batch_size + j) % DATA_SAMPLES
+        g = torch.Generator().manual_seed(seed * 1_000_003 + idx)
+        start = int(torch.randint(0, DATA_VOCAB, (1,), generator=g))
+        stride = int(torch.randint(1, 9, (1,), generator=g))
+        toks = (start + stride * torch.arange(seq_len + 1)) % DATA_VOCAB
+        xs.append(toks[:-1])
+        ys.append(toks[1:])
+    return torch.stack(xs), torch.stack(ys)
+
+
+def _load_batch(x, y):
+    actors = piper_metadata.actors
+    ray.get(
+        [actors[0].load_input.remote([x])]
+        + [a.load_labels.remote(y) for a in actors.values()]
+    )
+
+
+def _log_loss(data_rank, it, losses):
+    log_dir = os.environ.get("PIPER_LOSS_LOG")
+    if not log_dir or not losses:
+        return
+    rec = {
+        "data_rank": data_rank,
+        "dp_rank": int(os.environ["PIPER_DP_RANK"]),
+        "iter": it,
+        "loss": sum(losses) / len(losses),
+        "time": time.time(),
+    }
+    with open(os.path.join(log_dir, f"loss_dp{data_rank}.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _train_step(args, it, data_rank, dp_degree, loss_fn, **kw):
+    x, y = _make_batch(args.data_seed, it, data_rank, dp_degree,
+                       args.batch_size, args.seq_len)
+    _load_batch(x, y)
+    losses = piper_exec_dag(loss_fn, **kw)
+    _log_loss(data_rank, it, losses)
+    return losses
+
+
 def _run_standby(dp_rank, args, loss_fn):
     """Park until promoted or shut down; on promotion, receive the survivor's
     state and train the remaining iterations as the failed rank's replacement.
@@ -67,8 +122,9 @@ def _run_standby(dp_rank, args, loss_fn):
         total = args.warmup + args.iters
         logger.info(f"standby dp_rank {dp_rank}: state loaded; running "
                     f"iterations {next_iter}..{total - 1} as replacement")
-        for _ in range(total - next_iter):
-            piper_exec_dag(loss_fn)
+        dp_degree = int(os.environ["PIPER_DP_DEGREE"])
+        for it in range(next_iter, total):
+            _train_step(args, it, cmd["failed"], dp_degree, loss_fn)
         logger.info(f"standby dp_rank {dp_rank}: replacement training finished")
     else:
         logger.info(f"standby dp_rank {dp_rank}: shutdown received; exiting")
@@ -84,11 +140,12 @@ def main(args, pg):
         or _derive_num_stages(args.schedule_directives_file)
     )
 
-    x = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
-    y = torch.randint(0, config.vocab_size, (batch_size, args.seq_len))
+    dp_rank = int(os.environ["PIPER_DP_RANK"])
+    dp_degree = int(os.environ["PIPER_DP_DEGREE"])
+    x, y = _make_batch(args.data_seed, 0, dp_rank, dp_degree, batch_size, args.seq_len)
 
     _ce = torch.nn.CrossEntropyLoss()
-    loss_fn = lambda output, labels: _ce(output.view(-1, output.size(-1)), labels.view(-1))
+    loss_fn = lambda output, labels: _ce(output.float().view(-1, output.size(-1)), labels.view(-1))
 
     rope_cache = precompute_rope_cache(
         config.head_dim,
@@ -102,7 +159,7 @@ def main(args, pg):
         example_inputs=[x],
         example_outputs=y,
         activation_checkpointing=args.activation_checkpointing,
-        model_dtype=torch.bfloat16,
+        model_dtype=getattr(torch, args.model_dtype),
         pg=pg,
         nsight=args.nsight,
         temp_dir=args.temp_dir,
@@ -118,8 +175,6 @@ def main(args, pg):
     actors = piper_metadata.actors
 
     # Standby ranks never train: park until promoted or shut down.
-    dp_rank = int(os.environ["PIPER_DP_RANK"])
-    dp_degree = int(os.environ["PIPER_DP_DEGREE"])
     if dp_rank >= dp_degree:
         return _run_standby(dp_rank, args, loss_fn)
 
@@ -135,7 +190,7 @@ def main(args, pg):
         try:
             if it < args.warmup:
                 t0 = time.perf_counter()
-                piper_exec_dag(loss_fn)
+                _train_step(args, it, dp_rank, dp_degree, loss_fn)
                 last_warmup_time = time.perf_counter() - t0
                 if args.iteration_sleep > 0:
                     time.sleep(args.iteration_sleep)
@@ -153,7 +208,8 @@ def main(args, pg):
                     ])
             else:
                 start = time.perf_counter()
-                piper_exec_dag(loss_fn, log_stats=True, step_timeout=step_timeout)
+                _train_step(args, it, dp_rank, dp_degree, loss_fn,
+                            log_stats=True, step_timeout=step_timeout)
                 end = time.perf_counter()
                 iter_times.append(end - start)
                 if args.iteration_sleep > 0:
@@ -222,6 +278,9 @@ def parse_args(argv=None):
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--iteration-sleep", type=float, default=0.0)
+    parser.add_argument("--model-dtype", choices=["bfloat16", "float32"], default="bfloat16")
+    parser.add_argument("--data-seed", type=int, default=0,
+                        help="Seed of the synthetic sharded dataset")
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
     parser.add_argument("--nsight", action="store_true", default=False,
                         help="Whether to use Nsight Systems for tracing")
