@@ -17,34 +17,31 @@ from .tasks import TaskType
 
 
 def _maybe_inject_fault(pass_name: str, iter_count: int, dp_rank: int) -> None:
-    """Inject a debug fault when PIPER_FAULT matches the given execution point.
+    """Raise or sleep if a PIPER_FAULT spec matches this execution point.
 
-    pass_name: name of the executing pass (e.g. "bwd").
+    pass_name: "bwd" or "upd".
     iter_count: 0-based run_dag iteration counter (warmup iterations count).
     dp_rank: this actor's DP rank.
 
-    PIPER_FAULT formats (never set in production runs):
-      "<pass>:<iter>:<dp_rank>"            -> raise RuntimeError (loud mode)
-      "<pass>:<iter>:<dp_rank>:sleep:<s>"  -> sleep s seconds    (stuck mode)
-    where <pass> is "bwd" (BWD dispatch, before the gradient all-reduce) or
-    "upd" (UPD, after the gradient all-reduce wait, before the optimizer step).
+    Spec format: "<pass>:<iter>:<dp_rank>[:sleep:<s>]", comma-separated.
     """
-    spec = os.environ.get("PIPER_FAULT")
-    if not spec:
+    specs = os.environ.get("PIPER_FAULT")
+    if not specs:
         return
-    parts = spec.split(":")
-    if parts[:3] != [pass_name, str(iter_count), str(dp_rank)]:
-        return
-    # One BWD node per annotated segment — latch to fire once per iteration.
-    key = (spec, iter_count)
-    if key in _FIRED_FAULTS:
-        return
-    _FIRED_FAULTS.add(key)
-    print(f"PIPER_FAULT firing: {spec}", flush=True)
-    if len(parts) >= 5 and parts[3] == "sleep":
-        time.sleep(float(parts[4]))
-        return
-    raise RuntimeError(f"injected fault ({spec})")
+    for spec in specs.split(","):
+        parts = spec.split(":")
+        if parts[:3] != [pass_name, str(iter_count), str(dp_rank)]:
+            continue
+        # One BWD node per annotated segment — latch to fire once per iteration.
+        key = (spec, iter_count)
+        if key in _FIRED_FAULTS:
+            continue
+        _FIRED_FAULTS.add(key)
+        print(f"PIPER_FAULT firing: {spec}", flush=True)
+        if len(parts) >= 5 and parts[3] == "sleep":
+            time.sleep(float(parts[4]))
+            continue
+        raise RuntimeError(f"injected fault ({spec})")
 
 
 _FIRED_FAULTS: set = set()
@@ -495,9 +492,11 @@ class DagExecutor:
     _iter_count: int = 0
     # Commit marker: optimizer update fully applied (recovery redoes +1).
     _last_committed: int = -1
-    # Set (before the comm abort) by PiperActor.abort_comms: an aborted
-    # collective releases kernels with garbage, so a fenced step must not commit.
-    _fenced: bool = False
+    # First iteration the fence refuses, None while unfenced.
+    _fenced_from: int | None = None
+    # (iteration, all-reduce events) published at UPD for fence() to query.
+    # A stale entry is harmless: its iteration is older than the current one.
+    _ar_pending: tuple[int, tuple[torch.cuda.Event, ...]] | None = None
     # Standby mode only; off by default to keep the baseline hot path unchanged.
     _cpu_sync_allreduce: bool = False
 
@@ -577,6 +576,15 @@ class DagExecutor:
             tensor = tensor.contiguous()
         return tensor
 
+    def fence(self) -> None:
+        """Raise the fence; must run before the communicator abort."""
+        pending = self._ar_pending
+        complete = pending is not None and all(evt.query() for evt in pending[1])
+        self._fenced_from = pending[0] + 1 if complete else self._iter_count
+        self.logger.info(
+            f"fenced: refusing optimizer steps from iteration {self._fenced_from}"
+        )
+
     def run(
         self,
         dag: Any,
@@ -589,7 +597,7 @@ class DagExecutor:
         """Run one iteration of the loaded TrainingDAG."""
         assert dag is not None, "load_training_dag() must be called before run_dag()"
         assert sorted_dag_nodes is not None, "load_training_dag() must initialize sorted node order"
-        if self._fenced:
+        if self._fenced_from is not None:
             raise RuntimeError(
                 "fenced by coordinator: communicators aborted, iteration refused"
             )
@@ -1021,7 +1029,7 @@ class DagExecutor:
     def _update(self, stream: torch.cuda.Stream, loss_buffer: list):
         self.params.drain_pending_frees()
         if self.params.has_zero_shard_optimizers():
-            if self._fenced:
+            if self._fenced_from is not None:
                 raise RuntimeError(
                     "fenced during collective; ZeRO optimizer step refused"
                 )
@@ -1034,20 +1042,22 @@ class DagExecutor:
             return [float(l) for l in losses]
 
         if self._cpu_sync_allreduce:
-            # An aborted collective fires its events with garbage gradients;
-            # the outcome must be known (and unfenced) before stepping.
-            for ar_evt in self.events.all_reduce.values():
+            self._ar_pending = (
+                self._iter_count,
+                tuple(self.events.all_reduce.values()),
+            )
+            for ar_evt in self._ar_pending[1]:
                 ar_evt.synchronize()
-            if self._fenced:
-                raise RuntimeError(
-                    "fenced during gradient all-reduce; optimizer step refused "
-                    f"(last_committed={self._last_committed})"
-                )
         else:
             for ar_evt in self.events.all_reduce.values():
                 stream.wait_event(ar_evt)
 
         _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
+        if self._fenced_from is not None and self._iter_count >= self._fenced_from:
+            raise RuntimeError(
+                "fenced during gradient all-reduce; optimizer step refused "
+                f"(last_committed={self._last_committed})"
+            )
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue

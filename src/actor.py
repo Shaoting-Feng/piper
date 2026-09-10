@@ -324,9 +324,9 @@ class PiperActor:
         """Abort this actor's dp/ep NCCL communicators (fencing during promotion)."""
         from torch.distributed.distributed_c10d import _abort_process_group
 
-        # The fence flag must be visible BEFORE the abort releases any kernel,
-        # so the executor refuses the poisoned iteration's optimizer step.
-        self.dag_executor._fenced = True
+        # Fence before the abort releases any kernel, so the executor refuses
+        # the poisoned step unless fence() saw its gradients complete.
+        self.dag_executor.fence()
         aborted = []
         if self.runtime.dp_group is not None:
             _abort_process_group(self.runtime.dp_group)
@@ -345,7 +345,7 @@ class PiperActor:
         new_ranks: sorted global ranks of the members; only members call this.
         """
         new_ranks = list(new_ranks)
-        if self.dag_executor._fenced:
+        if self.dag_executor._fenced_from is not None:
             # Building a fresh NCCL comm while an abort is in flight in this
             # process deadlocks; wait for abort_comms to finish.
             if not self._abort_done.wait(timeout=120):
@@ -362,7 +362,7 @@ class PiperActor:
         # resumed training initializes it.
         self.runtime.dp_group = new_dp
         self.runtime.ep_group = new_ep
-        self.dag_executor._fenced = False
+        self.dag_executor._fenced_from = None
         self.logger.info(f"join_standby_group: joined ranks={new_ranks}")
         return new_ranks
 

@@ -36,15 +36,19 @@ harness (test_harness.py)
 | `--num-standby` (harness flag, default 0) | coordinator | `0`: fail fast on first dp_rank failure. `>0`: promote a standby instead (see `docs/standby_worker.md`). |
 | `PIPER_FAULT` (env, debug only) | `executors.py` BWD dispatch / UPD | Fault injection for tests; fires once per matching iteration and prints `PIPER_FAULT firing: <spec>`. Formats below. |
 
-`PIPER_FAULT` formats (`<iter>` is the 0-based `run_dag` counter; warmup counts):
+`PIPER_FAULT` formats (`<iter>` is the 0-based `run_dag` counter; warmup counts;
+several specs may be comma-separated):
 
 - `bwd:<iter>:<dp_rank>` — raise `RuntimeError` at BWD dispatch, before the gradient all-reduce (loud mode)
 - `bwd:<iter>:<dp_rank>:sleep:<seconds>` — sleep in BWD (stuck mode)
-- `upd:<iter>:<dp_rank>[:sleep:<seconds>]` — same, at UPD after the gradient all-reduce wait and before the optimizer step
+- `upd:<iter>:<dp_rank>[:sleep:<seconds>]` — same, at UPD after the gradient all-reduce wait, before the fence check and the optimizer step
 
 With a standby, the two points differ in where training resumes: `bwd` leaves
 the survivor's all-reduce incomplete (survivor refuses the step, resumes at
 `<iter>`); `upd` fails after it completed (survivor commits, resumes at `<iter>+1`).
+The fence records at abort time whether the all-reduce had completed, so this
+does not depend on when the fence reaches the survivor (see
+`docs/standby_worker.md`, "Where the survivor resumes").
 
 ## Testing the behaviors
 

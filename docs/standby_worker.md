@@ -37,12 +37,27 @@ via the handle in `piper_metadata.coordinator`.
 No failure: coordinator sends `{op: shutdown}` after trainers finish; the
 standby wakes, exits; results.csv identical to a no-standby run.
 
+## Where the survivor resumes
+
+`abort_comms` fences before it aborts, and the fence records whether the
+survivor's in-flight gradient all-reduce had already completed. Only the abort
+makes garbage, so a completed reduction is committed even though the fence
+arrived:
+
+| Rank `f` dies | Survivor's all-reduce `N` at fence | Survivor commits `N`? | Resume |
+|---|---|---|---|
+| before all-reduce `N` completes | incomplete | no (step refused) | `N` |
+| after all-reduce `N` completes | complete | yes | `N+1` |
+
+The outcome does not depend on when the fence reaches the survivor. The ZeRO
+(reduce-scatter) path always refuses the step.
+
 ## Knobs
 
 | Knob | Where | Meaning |
 |---|---|---|
 | `--num-standby N` (default 0) | `test_harness.py` | Reserve N standby ranks (+N GPU bundles, `world_size = dp*pp + N`). N > 0 enables promotion on trainer failure; 0 keeps fail-fast. pp_degree must be 1. |
-| `PIPER_FAULT` (env, debug) | `executors.py` | Fault injection: `<pass>:<iter>:<rank>` (crash) or `<pass>:<iter>:<rank>:sleep:<s>` (stall); `<pass>` = `bwd` (before all-reduce) or `upd` (after all-reduce, before optimizer step). |
+| `PIPER_FAULT` (env, debug) | `executors.py` | Fault injection, comma-separated specs: `<pass>:<iter>:<rank>` (crash) or `<pass>:<iter>:<rank>:sleep:<s>` (stall); `<pass>` = `bwd` (before all-reduce) or `upd` (after all-reduce, before the fence check and optimizer step). |
 
 ## Tests
 
@@ -53,6 +68,13 @@ CUDA_VISIBLE_DEVICES=0,1,2 PIPER_FAULT=bwd:4:1 python examples/test_harness.py \
   --schedule 1f1b --ranks 1 --mbs 1 --num-standby 1
 # -> promoting standby 2; fenced, optimizer step refused (last_committed=3);
 #    sanity_allreduce=2.0; "ready to receive weights"; exit 0 (~2 s fault->joined)
+
+# failure after the all-reduce, fence lands before the survivor's check
+CUDA_VISIBLE_DEVICES=0,1,2 PIPER_FAULT=upd:4:1,upd:4:0:sleep:8 python examples/test_harness.py \
+  --test-file examples/test_qwen.py --base-schedule examples/base-schedules/dp2.json \
+  --schedule 1f1b --ranks 1 --mbs 1 --num-standby 1
+# -> "fenced: refusing optimizer steps from iteration 5"; last_committed=4;
+#    both resume at 5; exit 0
 ```
 
 Result (2026-08-10, 3x H200, exit 0):
