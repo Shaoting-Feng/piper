@@ -87,7 +87,9 @@ def _create_actors(
             num_gpus=0.6,
             # Threaded actor:
             # - Survivor: abort_comms must run while run_dag is blocked.
+            # - Standby: load_state must run while wait_state_loaded is blocked.
             max_concurrency=2,
+            enable_tensor_transport=True,
             runtime_env={**nsight_env, **nccl_env},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=pg,
@@ -177,6 +179,9 @@ class PiperActor:
         # Set when abort_comms has fully finished; join_standby_group must not
         # build a new comm while an abort is still in flight in this process.
         self._abort_done = threading.Event()
+        self._state_loaded = threading.Event()
+        self._resume_iter = None
+        self._promotion_tensors = None
 
         # Non-trainable constant tensor attributes (e.g. freqs_cis, mask) pushed
         # from the coordinator before compilation so _load_stage can fill them in
@@ -364,6 +369,87 @@ class PiperActor:
     def get_last_committed(self):
         """Last iteration whose optimizer update fully committed (-1 if none)."""
         return getattr(self.dag_executor, "_last_committed", -1)
+
+    def _promotion_state_tensors(self):
+        """Flat list of param + Adam state tensors transferred at promotion.
+
+        Survivor: the tensors to send. Standby: the buffers to receive
+        into; its missing Adam state is created as zeros.
+        """
+        if self._promotion_tensors is not None:
+            return self._promotion_tensors
+        if self.stages.zero_managed_ubids:
+            raise NotImplementedError(
+                "standby weight transfer supports pure DP only"
+            )
+        tensors = []
+        for _, bucket in self.stages.buckets.items():
+            opt = bucket.optimizer
+            if opt is None:
+                continue
+            for p in bucket.trainable_params():
+                st = opt.state.get(p)
+                if st is None:
+                    # Fused Adam creates state lazily on first step; the
+                    # standby never steps, so materialize matching zeros.
+                    st = {
+                        "step": torch.zeros(
+                            (), dtype=torch.float32, device=p.device
+                        ),
+                        "exp_avg": torch.zeros_like(p),
+                        "exp_avg_sq": torch.zeros_like(p),
+                    }
+                    opt.state[p] = st
+                tensors.extend(
+                    [p.detach(), st["exp_avg"], st["exp_avg_sq"], st["step"]]
+                ) # Flat because set_target_for_ref matches by position.
+        self._promotion_tensors = tensors
+        return tensors
+
+    def prepare_standby_state(self):
+        """Materialize optimizer state and pre-register NIXL buffers while parked."""
+        tensors = self._promotion_state_tensors()
+        try:
+            for t in tensors:
+                ray.experimental.register_nixl_memory(t)
+        except Exception:
+            self.logger.exception(
+                "register_nixl_memory failed; registration will happen at transfer time"
+            )
+        return len(tensors)
+
+    def make_state_ref(self):
+        """Publish params + optimizer state + resume iteration via NIXL RDT.
+
+        Returns a ray.put-created ObjectRef (borrowable, see ray#59644).
+        """
+        state = {
+            "next_iter": self.dag_executor._last_committed + 1,
+            "tensors": self._promotion_state_tensors(),
+        }
+        return ray.put(state, _tensor_transport="nixl")
+
+    def load_state(self, refs):
+        """Receive the survivor's state directly into this actor's buffers.
+
+        refs: single-element list holding the state ObjectRef.
+        """
+        ref, = refs
+        targets = self._promotion_state_tensors()
+        ray.experimental.set_target_for_ref(ref, targets)
+        state = ray.get(ref)
+        next_iter = int(state["next_iter"])
+        self._iter_counter = next_iter
+        self.dag_executor._last_committed = next_iter - 1
+        self._resume_iter = next_iter
+        self._state_loaded.set()
+        return next_iter
+
+    def wait_state_loaded(self):
+        """Block until load_state has landed; returns the iteration to resume at."""
+        if not self._state_loaded.wait(timeout=600):
+            raise RuntimeError("standby state was not loaded within 600s")
+        return self._resume_iter
 
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()

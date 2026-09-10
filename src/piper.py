@@ -217,9 +217,15 @@ def piper(gm, example_inputs, **kwargs):
     return callback
 
 
-class PiperFencedError(Exception):
-    """Raised when a standby promotion fenced this dp_rank's step; the run
-    should stop cleanly."""
+class PiperResume(Exception):
+    """Raised after promotion recovery completes.
+
+    next_iter: first iteration to (re-)execute.
+    """
+
+    def __init__(self, next_iter: int):
+        super().__init__(f"resume at iteration {next_iter}")
+        self.next_iter = next_iter
 
 
 def _promotion_cmd():
@@ -238,7 +244,7 @@ def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None 
     step_timeout: optional seconds to wait for the step before logging that it
         is overdue; None disables the overdue check.
 
-    Raises PiperFencedError when a standby promotion fenced this rank's step.
+    Raises PiperResume after a standby promotion recovers this rank's step.
     """
     actors = piper_metadata.actors
     run_refs = [
@@ -282,7 +288,28 @@ def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None 
                     f"survivor: joined standby group {cmd['new_ranks']}; "
                     f"last_committed={lc}"
                 )
-                raise PiperFencedError(f"fenced at last_committed={lc}") from e
+                if my_rank == cmd.get("source"):
+                    standby_rank = next(
+                        r for r in cmd["new_ranks"] if r != cmd["source"]
+                    )
+                    standby_actor = ray.get(
+                        piper_metadata.coordinator.get_actors.remote(standby_rank)
+                    )[0]
+                    state_ref = ray.get(
+                        survivor_actor.make_state_ref.remote(), timeout=120
+                    )
+                    # Resume barrier: the survivor's live tensors must not
+                    # be stepped until the transfer has landed.
+                    ray.get(
+                        standby_actor.load_state.remote([state_ref]),
+                        timeout=300,
+                    )
+                    del state_ref
+                    logger.info(
+                        f"survivor: transferred state to standby "
+                        f"{standby_rank}; resuming at iteration {lc + 1}"
+                    )
+                raise PiperResume(lc + 1) from e
             if isinstance(e, ray.exceptions.RayTaskError):
                 # ray.get raises a dual instance exposing only .cause and str();
                 # the first line of str() names the actor (pid, ip, actor_id).
