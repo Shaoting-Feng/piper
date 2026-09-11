@@ -451,6 +451,33 @@ class PiperActor:
             raise RuntimeError("standby state was not loaded within 600s")
         return self._resume_iter
 
+    def save_checkpoint(self, path):
+        """Write params, optimizer state and the resume iteration to a file.
+
+        path: destination file.
+        """
+        state = {
+            "next_iter": self.dag_executor._last_committed + 1,
+            "tensors": [t.cpu() for t in self._promotion_state_tensors()],
+        }
+        # A restart must never find a partially written file.
+        torch.save(state, path + ".tmp")
+        os.replace(path + ".tmp", path)
+
+    def load_checkpoint(self, path):
+        """Load a save_checkpoint file into this actor; returns the iteration to resume at.
+
+        path: checkpoint file.
+        """
+        state = torch.load(path)
+        with torch.no_grad():
+            for dst, src in zip(self._promotion_state_tensors(), state["tensors"]):
+                dst.copy_(src)
+        next_iter = int(state["next_iter"])
+        self._iter_counter = next_iter
+        self.dag_executor._last_committed = next_iter - 1
+        return next_iter
+
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()
         self.stages.grad_sharded_ubids = set()

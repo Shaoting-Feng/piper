@@ -288,6 +288,18 @@ def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None 
                     f"survivor: joined standby group {cmd['new_ranks']}; "
                     f"last_committed={lc}"
                 )
+                if piper_metadata.checkpoint_file is not None:
+                    next_iter = ray.get(
+                        survivor_actor.load_checkpoint.remote(
+                            piper_metadata.checkpoint_file
+                        ),
+                        timeout=300,
+                    )
+                    logger.info(
+                        f"survivor: rolled back to checkpoint; "
+                        f"resuming at iteration {next_iter}"
+                    )
+                    raise PiperResume(next_iter) from e
                 if my_rank == cmd.get("source"):
                     standby_rank = next(
                         r for r in cmd["new_ranks"] if r != cmd["source"]

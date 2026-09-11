@@ -88,12 +88,32 @@ def _log_loss(data_rank, it, losses):
         f.write(json.dumps(rec) + "\n")
 
 
+def _ckpt_file(args, pp_rank):
+    return os.path.join(args.ckpt_dir, f"pp{pp_rank}.pt")
+
+
+def _save_checkpoint(args):
+    ray.get([a.save_checkpoint.remote(_ckpt_file(args, k))
+             for k, a in piper_metadata.actors.items()])
+
+
+def _load_checkpoint(args):
+    """Load the latest checkpoint; returns the iteration to resume at (0 if none)."""
+    if not args.ckpt_dir or not os.path.exists(_ckpt_file(args, 0)):
+        return 0
+    return ray.get([a.load_checkpoint.remote(_ckpt_file(args, k))
+                    for k, a in piper_metadata.actors.items()])[0]
+
+
 def _train_step(args, it, data_rank, dp_degree, loss_fn, **kw):
     x, y = _make_batch(args.data_seed, it, data_rank, dp_degree,
                        args.batch_size, args.seq_len)
     _load_batch(x, y)
     losses = piper_exec_dag(loss_fn, **kw)
     _log_loss(data_rank, it, losses)
+    # DP replicas hold identical state; data rank 0's copy suffices.
+    if args.ckpt_dir and data_rank == 0 and (it + 1) % args.ckpt_interval == 0:
+        _save_checkpoint(args)
     return losses
 
 
@@ -107,7 +127,8 @@ def _run_standby(dp_rank, args, loss_fn):
     """
     coordinator = piper_metadata.coordinator
     actor = piper_metadata.actors[0] # pp_degree == 1
-    ray.get(actor.prepare_standby_state.remote())
+    if piper_metadata.checkpoint_file is None:
+        ray.get(actor.prepare_standby_state.remote())
     logger.info(f"standby dp_rank {dp_rank}: initialized and parked; "
                 "waiting for promotion or shutdown")
     cmd = ray.get(coordinator.wait_for_cmd.remote())
@@ -118,7 +139,13 @@ def _run_standby(dp_rank, args, loss_fn):
         )
         logger.info(f"standby dp_rank {dp_rank}: joined NCCL group "
                     f"{cmd['new_ranks']}")
-        next_iter = ray.get(actor.wait_state_loaded.remote(), timeout=600)
+        if piper_metadata.checkpoint_file is not None:
+            next_iter = ray.get(
+                actor.load_checkpoint.remote(piper_metadata.checkpoint_file),
+                timeout=600,
+            )
+        else:
+            next_iter = ray.get(actor.wait_state_loaded.remote(), timeout=600)
         total = args.warmup + args.iters
         logger.info(f"standby dp_rank {dp_rank}: state loaded; running "
                     f"iterations {next_iter}..{total - 1} as replacement")
@@ -174,6 +201,11 @@ def main(args, pg):
 
     actors = piper_metadata.actors
 
+    if args.ckpt_dir:
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+    if args.recovery == "ckpt":
+        piper_metadata.checkpoint_file = _ckpt_file(args, 0)
+
     # Standby ranks never train: park until promoted or shut down.
     if dp_rank >= dp_degree:
         return _run_standby(dp_rank, args, loss_fn)
@@ -185,7 +217,9 @@ def main(args, pg):
     step_timeout = None
     iter_times = []
     total = args.warmup + args.iters
-    it = 0
+    it = _load_checkpoint(args)
+    if it:
+        logger.info(f"resuming from checkpoint at iteration {it}")
     while it < total:
         try:
             if it < args.warmup:
@@ -281,6 +315,13 @@ def parse_args(argv=None):
     parser.add_argument("--model-dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--data-seed", type=int, default=0,
                         help="Seed of the synthetic sharded dataset")
+    parser.add_argument("--ckpt-dir", default=None,
+                        help="Directory for periodic checkpoints; a run resumes from it when one exists")
+    parser.add_argument("--ckpt-interval", type=int, default=25,
+                        help="Iterations between checkpoints")
+    parser.add_argument("--recovery", choices=["transfer", "ckpt"], default="transfer",
+                        help="State a promoted standby starts from: the survivor's live "
+                             "state (transfer) or the last checkpoint (ckpt)")
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
     parser.add_argument("--nsight", action="store_true", default=False,
                         help="Whether to use Nsight Systems for tracing")
@@ -324,4 +365,7 @@ def parse_args(argv=None):
         default=3,
         help="Number of iterations to run under the PyTorch profiler.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.recovery == "ckpt" and not args.ckpt_dir:
+        parser.error("--recovery ckpt requires --ckpt-dir")
+    return args

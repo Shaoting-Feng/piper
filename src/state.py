@@ -49,5 +49,6 @@ class PiperMetadata:
     schedule_directives: list = []  # Program of DAG transform directives (e.g., place(...))
     schedule_directives_file: Optional[str] = None  # JSON source for schedule_directives
     schedule_info: dict = {}  # Derived schedule facts such as pp/dp/mbs
+    checkpoint_file: Optional[str] = None  # Loaded at promotion instead of the survivor's live state
 
 piper_metadata = PiperMetadata()
