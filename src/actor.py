@@ -1,6 +1,7 @@
 import ray
 import threading
 import torch
+import hashlib
 import os
 import re
 from typing import Any
@@ -30,6 +31,11 @@ def _disable_functorch_donated_buffers() -> None:
 
     config = importlib.import_module("torch._functorch.config")
     config.donated_buffer = False
+
+
+def _param_seed(name: str) -> int:
+    """Generator seed for the parameter with FX placeholder ``name``."""
+    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little") >> 1
 
 
 def _get_rank(pp_rank, dp_rank, pp_degree):
@@ -554,7 +560,6 @@ class PiperActor:
         )
 
         g = torch.Generator(device=self.runtime.device)
-        g.manual_seed(1000 * self.runtime.global_rank + stage_id)
 
         first_gm = None
 
@@ -587,11 +592,11 @@ class PiperActor:
             shared_placeholder_names = list(
                 bd.get("shared_placeholder_names", bd.get("placeholder_names", []))
             )
-            # Extract FX placeholder names for each param index.
-            bucket.param_names = [
+            slot_names = [
                 shared_placeholder_names[i] if i < len(shared_placeholder_names) else f"ubid{ubid}_p{i}"
-                for i in b_param_idxs
+                for i in range(len(forward_args))
             ]
+            bucket.param_names = [slot_names[i] for i in b_param_idxs]
 
             # Save input tensor metadata for pre-allocating FWD recv buffers.
             # Stored as a list of (shape, dtype, requires_grad) in input-slot order.
@@ -614,6 +619,8 @@ class PiperActor:
                 t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
                 if arg.requires_grad:
                     t.requires_grad_(True)
+                    # Replicas and shards of one parameter must draw identical values.
+                    g.manual_seed(_param_seed(slot_names[i]))
                     torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
                 else:
                     # Non-trainable slot: try to fill from const attrs (freqs_cis, mask, …)
