@@ -99,8 +99,6 @@ class PiperProgramCoordinator:
         ]
         tasks = [asyncio.ensure_future(ref) for ref in refs]
 
-        # React to whichever dp_rank task finishes or fails first, instead of
-        # ray.get's list order, which can wait behind a hung rank.
         pending = set(tasks)
         results = []
         failures = 0
