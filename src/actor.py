@@ -412,8 +412,8 @@ class PiperActor:
         self._promotion_tensors = tensors
         return tensors
 
-    def prepare_standby_state(self):
-        """Materialize optimizer state and pre-register NIXL buffers while parked."""
+    def prepare_promotion_state(self):
+        """Materialize optimizer state and pre-register it with NIXL."""
         tensors = self._promotion_state_tensors()
         try:
             for t in tensors:

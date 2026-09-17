@@ -127,8 +127,6 @@ def _run_standby(dp_rank, args, loss_fn):
     """
     coordinator = piper_metadata.coordinator
     actor = piper_metadata.actors[0] # pp_degree == 1
-    if piper_metadata.checkpoint_file is None:
-        ray.get(actor.prepare_standby_state.remote())
     logger.info(f"standby dp_rank {dp_rank}: initialized and parked; "
                 "waiting for promotion or shutdown")
     cmd = ray.get(coordinator.wait_for_cmd.remote())
@@ -205,6 +203,8 @@ def main(args, pg):
         os.makedirs(args.ckpt_dir, exist_ok=True)
     if args.recovery == "ckpt":
         piper_metadata.checkpoint_file = _ckpt_file(args, 0)
+    elif int(os.environ.get("PIPER_NUM_STANDBY", "0")) > 0:
+        ray.get([a.prepare_promotion_state.remote() for a in actors.values()])
 
     # Standby ranks never train: park until promoted or shut down.
     if dp_rank >= dp_degree:
