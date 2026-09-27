@@ -112,6 +112,7 @@ class StageStore:
     param_sharded_ubids: set[Any] = field(default_factory=set)
     grad_sharded_ubids: set[Any] = field(default_factory=set)
     zero_managed_ubids: set[Any] = field(default_factory=set)
+    replicated_ubids: set[Any] = field(default_factory=set)
 
     def clear_loaded_modules(self) -> None:
         self.graph_modules.clear()

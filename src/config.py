@@ -5,6 +5,17 @@ from typing import Any
 
 
 @dataclass
+class FTConfig:
+    """Fault-tolerance settings.
+
+    step_timeout: seconds after which an in-flight step is logged as overdue;
+        None disables the check.
+    """
+
+    step_timeout: float | None = None
+
+
+@dataclass
 class ActorConfig:
     """Per-actor runtime knobs that do not depend on the model or schedule.
 

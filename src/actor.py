@@ -66,7 +66,7 @@ def _bundle_index(slot, config) -> int:
     return pp_rank if config.pp_outer else dp_rank
 
 
-def _spawn_actor(slot, global_rank, topology, config, optim_class, pg=None, bundle_index=0):
+def _spawn_actor(slot, global_rank, topology, config, optim_class=None, pg=None, bundle_index=0):
     actor_cls = config.actor_cls or PiperActor
     return actor_cls.options(**_actor_options(config, pg, bundle_index)).remote(
         slot, global_rank, topology, config, optim_class
@@ -92,13 +92,13 @@ def _create_actors(topology, dp_rank, optim_class, config, pg=None):
 
 @ray.remote
 class PiperActor:
-    def __init__(self, slot, global_rank, topology, config, optim_class):
+    def __init__(self, slot, global_rank, topology, config, optim_class=None):
         """
         slot: ``(dp_rank, pp_rank)`` of a trainer, or None for a standby.
         global_rank: rank in the torch.distributed world.
         topology: the job's ``Topology``.
         config: ``ActorConfig``.
-        optim_class: callable ``(params) -> Optimizer``.
+        optim_class: callable ``(params) -> Optimizer``; may instead be given to ``load_training_dag``.
         """
         self.logger = create_logger("actor", LOG_LEVEL)
 
@@ -283,6 +283,7 @@ class PiperActor:
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()
         self.stages.grad_sharded_ubids = set()
+        self.stages.replicated_ubids = set()
         for node in training_dag.nodes.values():
             meta = getattr(node, "node_meta", {}) or {}
             ubid = meta.get("bucket_key")
@@ -292,7 +293,17 @@ class PiperActor:
                 self.stages.param_sharded_ubids.add(ubid)
             elif node.node_kind == "REDUCE_SCATTER_COMM":
                 self.stages.grad_sharded_ubids.add(ubid)
+            elif node.node_kind == "REDUCE_COMM":
+                self.stages.replicated_ubids.add(ubid)
         self.stages.zero_managed_ubids = self.stages.param_sharded_ubids | self.stages.grad_sharded_ubids
+
+    def _sync_dp_params(self, tensors: list) -> None:
+        """Broadcast freshly initialized replicated parameters from the DP group's first rank."""
+        if self.runtime.dp_group is None or not tensors:
+            return
+        src = self.runtime.dp_group_ranks[0]
+        for t in tensors:
+            dist.broadcast(t.detach(), src=src, group=self.runtime.dp_group)
 
     def _relocate_meta_devices(self, gm) -> None:
         """Rewrite baked ``torch.device('meta')`` literals to the actor device.
@@ -515,6 +526,11 @@ class PiperActor:
             )
             params_sharded = ubid in self.stages.param_sharded_ubids
             grads_sharded = ubid in self.stages.grad_sharded_ubids
+            # Replicated (DP all-reduced or ZeRO) buckets must start identical on
+            # every replica; EP-sharded buckets hold different experts per rank.
+            replicated = zero_managed or (
+                self.runtime.dp_degree > 1 and ubid in self.stages.replicated_ubids
+            )
 
             if zero_managed:
                 trainable = [realized[i] for i in trainable_idxs]
@@ -528,6 +544,7 @@ class PiperActor:
                     padded = flat_params.new_zeros(padded_numel)
                     padded[:orig_numel].copy_(flat_params)
                     flat_params = padded
+                self._sync_dp_params([flat_params])
 
                 offset = 0
                 view_specs = []
@@ -584,24 +601,32 @@ class PiperActor:
                 bucket.param_shard_info = None
                 bucket.full_params_fresh = False
                 trainable_for_optim = [realized[i] for i in trainable_idxs]
+                if replicated:
+                    self._sync_dp_params(trainable_for_optim)
                 optim = self.optim_class(trainable_for_optim) if trainable_for_optim else None
             bucket.optimizer = optim
 
         # Keep first GraphModule for compatibility with external inspection tools.
         self.stages.graph_modules[stage_id] = first_gm
 
-    def load_training_dag(self, training_dag: Any) -> None:
+    def load_training_dag(self, training_dag: Any, optim_fn=None) -> None:
         """Load per-PP-rank TrainingDAG compute nodes using existing _load_stage logic.
 
         This is an adapter for the new TrainingDAG representation where each
         COMPUTE/FWD node with ``node_meta['gm']`` is equivalent to one bucket/module.
         The runtime executes TrainingDAG nodes via ``run_dag``; this method
         only populates actor-side bucket/module state.
+
+        optim_fn: callable ``(params) -> Optimizer``; overrides the constructor's.
         """
         if training_dag is None:
             raise ValueError("load_training_dag requires non-None training_dag")
         if not hasattr(training_dag, "nodes"):
             raise TypeError("load_training_dag expected object with 'nodes' field")
+        if optim_fn is not None:
+            self.optim_class = optim_fn
+        if self.optim_class is None:
+            raise ValueError("load_training_dag requires an optimizer constructor")
 
         self._derive_dag_bucket_modes(training_dag)
         self.runtime.initialize_streams_for_training_dag(training_dag)
@@ -718,9 +743,10 @@ class PiperActor:
             training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
         ]
 
-    def run_dag(self, loss_fn=None):
+    def run_dag(self, loss_fn=None, it: int | None = None):
+        """Run one iteration; ``it`` names it explicitly, else a local counter does."""
         # Mark the entire iteration boundary for the NVTX timeline.
-        iter_idx = getattr(self, "_iter_counter", 0)
+        iter_idx = it if it is not None else getattr(self, "_iter_counter", 0)
         self._iter_counter = iter_idx + 1
         # Debug-only: expose the iteration counter for E2E fault injection.
         self.dag_executor._iter_count = iter_idx
