@@ -117,10 +117,13 @@ class Runtime:
             ray.get([actor.load_const_attrs.remote(attrs) for actor in self.all_actors])
 
         refs = [
-            actor.load_training_dag.remote(program.shard_for(pp), optim_fn)
+            actor.load_program.remote(program.shard_for(pp), program.kind, optim_fn)
             for (_dp, pp), actor in self.actors.items()
         ]
-        refs += [actor.load_training_dag.remote(program.shard_for(0), optim_fn) for actor in self.standbys]
+        refs += [
+            actor.load_program.remote(program.shard_for(0), program.kind, optim_fn)
+            for actor in self.standbys
+        ]
         ray.get(refs)
         self.program = program
 
@@ -143,7 +146,7 @@ class Runtime:
                 pending[self.actors[(dp_rank, pp)].load_input.remote(inputs[dp_rank])] = (dp_rank, pp)
             for pp in self.program.loss_pp_ranks:
                 pending[self.actors[(dp_rank, pp)].load_labels.remote(labels[dp_rank])] = (dp_rank, pp)
-        run_refs = {actor.run_dag.remote(loss_fn=loss_fn, it=it): slot for slot, actor in self.actors.items()}
+        run_refs = {actor.run_step.remote(it, loss_fn): slot for slot, actor in self.actors.items()}
         pending.update(run_refs)
 
         losses: list[list[float]] = [[] for _ in range(dp)]

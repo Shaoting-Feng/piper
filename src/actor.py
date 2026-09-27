@@ -66,39 +66,21 @@ def _bundle_index(slot, config) -> int:
     return pp_rank if config.pp_outer else dp_rank
 
 
-def _spawn_actor(slot, global_rank, topology, config, optim_class=None, pg=None, bundle_index=0):
+def _spawn_actor(slot, global_rank, topology, config, pg=None, bundle_index=0):
     actor_cls = config.actor_cls or PiperActor
     return actor_cls.options(**_actor_options(config, pg, bundle_index)).remote(
-        slot, global_rank, topology, config, optim_class
+        slot, global_rank, topology, config
     )
-
-
-def _create_actors(topology, dp_rank, optim_class, config, pg=None):
-    """Spawn this DP rank's ``pp`` actors into ``piper_metadata.actors[pp_rank]``."""
-    from .state import piper_metadata
-
-    for pp_rank in range(topology.pp):
-        slot = (dp_rank, pp_rank)
-        piper_metadata.actors[pp_rank] = _spawn_actor(
-            slot,
-            topology.rank(dp_rank, pp_rank),
-            topology,
-            config,
-            optim_class,
-            pg=pg,
-            bundle_index=_bundle_index(slot, config),
-        )
 
 
 @ray.remote
 class PiperActor:
-    def __init__(self, slot, global_rank, topology, config, optim_class=None):
+    def __init__(self, slot, global_rank, topology, config):
         """
         slot: ``(dp_rank, pp_rank)`` of a trainer, or None for a standby.
         global_rank: rank in the torch.distributed world.
         topology: the job's ``Topology``.
         config: ``ActorConfig``.
-        optim_class: callable ``(params) -> Optimizer``; may instead be given to ``load_training_dag``.
         """
         self.logger = create_logger("actor", LOG_LEVEL)
 
@@ -107,7 +89,7 @@ class PiperActor:
         # Suppress the spurious stream-mismatch warning.
         set_warn_on_accumulate_grad_stream_mismatch(False)
 
-        self.optim_class = optim_class
+        self.optim_class = None
         self.use_inductor = bool(config.use_inductor)
         if self.use_inductor:
             _disable_functorch_donated_buffers()
@@ -154,7 +136,7 @@ class PiperActor:
         )
 
         # Non-trainable constant tensor attributes (e.g. freqs_cis, mask) pushed
-        # from the coordinator before compilation so _load_stage can fill them in
+        # from the driver before loading so _load_stage can fill them in
         # instead of zero-initializing.  Keyed by bare attribute name (e.g. "freqs_cis").
         self.model_const_attrs: dict = {}
 
@@ -185,7 +167,7 @@ class PiperActor:
         self.runtime.nvtx_pop()
 
     def start_pytorch_profiler(self) -> None:
-        """Begin a torch.profiler session spanning the next run_dag iterations.
+        """Begin a torch.profiler session spanning the next run_step iterations.
 
         Each node's execution in DagExecutor is wrapped in a record_function
         labelled the same as its NVTX range, so the resulting trace identifies
@@ -359,7 +341,7 @@ class PiperActor:
         ``gm_data``, ``graphargs``, ``input_idxs``, ``param_idxs``, ``bucket_key``.
 
         A non-bucketed stage is represented as a single-element list.
-        All per-bucket data structures are keyed by ``bucket_key`` so run_dag
+        All per-bucket data structures are keyed by ``bucket_key`` so run_step
         can look up bucket data without knowing which stage owns a bucket.
         """
         self.logger.debug(
@@ -414,7 +396,7 @@ class PiperActor:
                 if meta is not None:
                     recv_meta.append((tuple(meta.shape), meta.dtype,
                                       bool(getattr(meta, "requires_grad", False))))
-                forward_args[i] = None  # clear slot; run_dag will fill it at execution time
+                forward_args[i] = None  # clear slot; run_step will fill it at execution time
             bucket.forward_input_meta = recv_meta
 
             bucket.input_idxs = b_input_idxs
@@ -609,24 +591,24 @@ class PiperActor:
         # Keep first GraphModule for compatibility with external inspection tools.
         self.stages.graph_modules[stage_id] = first_gm
 
-    def load_training_dag(self, training_dag: Any, optim_fn=None) -> None:
-        """Load per-PP-rank TrainingDAG compute nodes using existing _load_stage logic.
+    def load_program(self, shard: Any, kind: str, optim_fn) -> None:
+        """Load this rank's program shard.
 
-        This is an adapter for the new TrainingDAG representation where each
-        COMPUTE/FWD node with ``node_meta['gm']`` is equivalent to one bucket/module.
-        The runtime executes TrainingDAG nodes via ``run_dag``; this method
-        only populates actor-side bucket/module state.
-
-        optim_fn: callable ``(params) -> Optimizer``; overrides the constructor's.
+        shard: per-PP-rank TrainingDAG whose COMPUTE/FWD nodes each carry one
+            serialized GraphModule (one bucket/module); executed by ``run_step``.
+        kind: program kind; only ``"dag"`` is supported.
+        optim_fn: callable ``(params) -> Optimizer``.
         """
+        if kind != "dag":
+            raise NotImplementedError(f"unsupported program kind {kind!r}")
+        training_dag = shard
         if training_dag is None:
-            raise ValueError("load_training_dag requires non-None training_dag")
+            raise ValueError("load_program requires a non-None shard")
         if not hasattr(training_dag, "nodes"):
-            raise TypeError("load_training_dag expected object with 'nodes' field")
-        if optim_fn is not None:
-            self.optim_class = optim_fn
-        if self.optim_class is None:
-            raise ValueError("load_training_dag requires an optimizer constructor")
+            raise TypeError("load_program expected a TrainingDAG with a 'nodes' field")
+        if optim_fn is None:
+            raise ValueError("load_program requires an optimizer constructor")
+        self.optim_class = optim_fn
 
         self._derive_dag_bucket_modes(training_dag)
         self.runtime.initialize_streams_for_training_dag(training_dag)
@@ -670,12 +652,12 @@ class PiperActor:
 
             if gm_data is None and gm is None:
                 raise ValueError(
-                    f"load_training_dag: compute node {getattr(node, 'uid', '<unknown>')} "
+                    f"load_program: compute node {getattr(node, 'uid', '<unknown>')} "
                     f"is missing required metadata field 'gm_data' (or fallback 'gm')"
                 )
             if stage_id is None or input_idxs is None or param_idxs is None or graphargs is None:
                 raise ValueError(
-                    f"load_training_dag: compute node {getattr(node, 'uid', '<unknown>')} "
+                    f"load_program: compute node {getattr(node, 'uid', '<unknown>')} "
                     f"is missing required metadata fields"
                 )
 
@@ -697,7 +679,7 @@ class PiperActor:
             stage_to_modules[int(stage_id)].append(module_data)
 
         assert stage_to_modules, (
-            "load_training_dag: no FWD compute nodes with gm metadata found"
+            "load_program: no FWD compute nodes with gm metadata found"
         )
 
         for stage_id in sorted(stage_to_modules.keys()):
@@ -708,7 +690,7 @@ class PiperActor:
                 use_activation_checkpointing=False,
             )
 
-        # Build runtime adjacency on TrainingDAG nodes so run_dag can execute directly.
+        # Build runtime adjacency on TrainingDAG nodes so run_step can execute directly.
         for n in training_dag.nodes.values():
             n.data_preds = []
             n.data_succs = []
@@ -743,14 +725,12 @@ class PiperActor:
             training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
         ]
 
-    def run_dag(self, loss_fn=None, it: int | None = None):
-        """Run one iteration; ``it`` names it explicitly, else a local counter does."""
-        # Mark the entire iteration boundary for the NVTX timeline.
-        iter_idx = it if it is not None else getattr(self, "_iter_counter", 0)
-        self._iter_counter = iter_idx + 1
+    def run_step(self, it: int, loss_fn):
+        """Run iteration ``it`` of the loaded program and return its losses."""
         # Debug-only: expose the iteration counter for E2E fault injection.
-        self.dag_executor._iter_count = iter_idx
-        self._nvtx_push(f"iter_{iter_idx}_rank_{self.runtime.global_rank}")
+        self.dag_executor._iter_count = it
+        # Mark the entire iteration boundary for the NVTX timeline.
+        self._nvtx_push(f"iter_{it}_rank_{self.runtime.global_rank}")
         result = self.dag_executor.run(
             self.dag,
             self.sorted_dag_nodes,

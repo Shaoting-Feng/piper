@@ -1,8 +1,6 @@
-import time
 from contextlib import contextmanager
 from typing import Iterator
 
-import ray
 import torch.fx as fx
 
 from .fx import PIPER_ANNOTATIONS_META_KEY, split_gm_by_annotations
@@ -26,7 +24,7 @@ from .ordering import (
     _serial_topological_order,
     resolve_total_order_per_stream,
 )
-from .state import LOG_LEVEL, create_logger, piper_metadata
+from .state import LOG_LEVEL, create_logger
 from .visualization import (
     log_training_dag_dependencies,
     print_training_dag_order,
@@ -224,51 +222,3 @@ class DagBackend:
             return _gm(*args)
 
         return callback
-
-
-def piper_exec_dag(loss_fn, log_stats: bool = False, step_timeout: float | None = None) -> list:
-    """Execute one training step using the loaded per-rank TrainingDAG.
-
-    loss_fn: loss function forwarded to each actor's run_dag.
-    log_stats: log step time and throughput after the step.
-    step_timeout: optional seconds to wait for the step before logging that it
-        is overdue; None disables the overdue check.
-    """
-    actors = piper_metadata.actors
-    run_refs = [
-        actor.run_dag.remote(loss_fn=loss_fn)
-        for actor in actors.values()
-    ]
-    t0 = time.perf_counter()
-    while True:
-        try:
-            results = ray.get(run_refs, timeout=step_timeout)
-            break
-        except ray.exceptions.GetTimeoutError:
-            # TODO: stuck ranks cannot be handled here — this timeout
-            # fires identically on the stuck rank and on peers blocked at
-            # its rendezvous, so no local information can name the culprit.
-            logger.warning(
-                f"step exceeded step_timeout={step_timeout:.1f}s; "
-                "still waiting on in-flight step (peer may be down)"
-            )
-    step_time = time.perf_counter() - t0
-
-    if log_stats:
-        _log_step_stats(step_time, log_stats, actors)
-
-    losses = []
-    for result in results:
-        if isinstance(result, dict):
-            losses.extend(result.get("losses", []))
-        elif result:
-            losses.extend(result)
-    return losses
-
-
-def _log_step_stats(step_time: float, log_memory: bool, actors: dict) -> None:
-    stats = [f"step_time={step_time:.3f}s"]
-    tokens = getattr(piper_metadata, "tokens_per_step", None)
-    if tokens is not None:
-        stats.append(f"throughput={tokens / step_time:.1f} tok/s")
-    logger.info("  ".join(stats))

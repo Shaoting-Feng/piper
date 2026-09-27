@@ -175,7 +175,7 @@ class RuntimeState:
 
     def stream_for_id(self, stream_id: str) -> AbstractContextManager:
         assert stream_id in self.streams, (
-            f"TrainingDAG referenced stream={stream_id!r}, but load_training_dag "
+            f"TrainingDAG referenced stream={stream_id!r}, but load_program "
             f"initialized only {sorted(self.streams)}"
         )
         return self.streams[stream_id]
