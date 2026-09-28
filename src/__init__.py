@@ -14,6 +14,7 @@ _EXPORTS = {
     "Runtime": ".driver",
     "StepResult": ".driver",
     "StepFailed": ".driver",
+    "Recovery": ".driver",
     "Topology": ".topology",
     "ActorConfig": ".config",
     "FTConfig": ".config",

@@ -110,6 +110,8 @@ for it in range(num_iters):
 * `load` ships each shard to its actors and synchronizes replicated weights across DP replicas.
 * `step` runs one iteration on every DP slot and returns a `StepResult` with per-slot losses and `next_iter`; a failing slot raises `StepFailed`.
 
+Fault tolerance (DP-only schedules, `pp == 1`): `Topology(..., num_standby=N)` reserves `N` spare actors that join the world and hold the program but no slot. When a slot fails during `step`, the runtime fences the survivors, regroups them with a standby, brings it to the survivors' last committed state (`FTConfig(recovery="transfer")`, over NIXL) or rolls every member back to the last checkpoint (`recovery="checkpoint"`, with `ckpt_dir` / `ckpt_interval`), and returns the iteration to redo in `StepResult.next_iter` and the details in `StepResult.recovery`. `rt.restore()` resumes a relaunched job from `ckpt_dir`.
+
 ## Overview of Inputs
 
 ### Annotations

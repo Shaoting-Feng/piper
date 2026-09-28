@@ -10,6 +10,7 @@ import torch
 
 from examples.models.llama3 import LLAMA_DEBUG, Transformer, precompute_freqs_cis
 from src.compile import compile
+from src.config import FTConfig
 from src.driver import StepFailed, setup
 from src.topology import Topology
 
@@ -55,7 +56,7 @@ def _const_attrs():
     }
 
 
-def _build_runtime(schedule: str):
+def _build_runtime(schedule: str, ft: FTConfig | None = None):
     x, _ = _batch()
     topology = Topology.from_schedule(schedule)
     program = compile(
@@ -64,7 +65,7 @@ def _build_runtime(schedule: str):
         example_inputs=[x],
         schedule_file=schedule,
     )
-    rt = setup(topology)
+    rt = setup(topology, ft=ft)
     rt.load(program, torch.optim.Adam, const_attrs=_const_attrs())
     return rt, program
 
@@ -86,7 +87,7 @@ def test_setup_load_step(ray_session, schedule) -> None:
     assert program.kind == "dag" and program.pp == 1
     assert program.input_pp_ranks == [0] and program.loss_pp_ranks == [0]
     assert sorted(rt.actors) == [(0, 0), (1, 0)]
-    assert rt.groups == {"dp": [[0, 1]], "pp": [[0], [1]]}
+    assert rt.groups == {"dp": [[0, 1]], "pp": []}
     assert rt.standbys == []
 
     # load broadcasts replicated parameters, so both replicas start identical.
@@ -110,6 +111,35 @@ def test_setup_load_step(ray_session, schedule) -> None:
 
     with pytest.raises(ValueError, match="expects 2 input lists"):
         rt.step(2, [[x]], [y], _loss_fn)
+
+
+def test_checkpoint_and_restore(ray_session, schedule, tmp_path) -> None:
+    ft = FTConfig(ckpt_dir=str(tmp_path / "ckpt"), ckpt_interval=2)
+    rt, _ = _build_runtime(schedule, ft)
+    assert rt.restore() == 0
+    x, y = _batch()
+    inputs, labels = [[x], [x]], [y, y]
+    losses = {}
+    it = 0
+    while it < 3:
+        result = rt.step(it, inputs, labels, _loss_fn)
+        losses[it] = result.losses[0]
+        it = result.next_iter
+    # ckpt_interval=2: written after iteration 1 (resume at 2); iteration 2 is not checkpointed.
+    assert torch.load(os.path.join(ft.ckpt_dir, "pp0.pt"))["next_iter"] == 2
+
+    rt2, _ = _build_runtime(schedule, ft)
+    assert rt2.restore() == 2
+    _assert_replicas_equal(rt2)
+    # Replaying iteration 2 from the checkpoint reproduces the original run's loss.
+    replay = rt2.step(2, inputs, labels, _loss_fn)
+    assert replay.next_iter == 3
+    assert replay.losses[0] == losses[2]
+
+
+def test_standby_requires_pp1() -> None:
+    with pytest.raises(NotImplementedError, match="pp == 1"):
+        setup(Topology(dp=2, pp=2, num_standby=1))
 
 
 def test_step_raises_on_dead_actor(ray_session, schedule) -> None:

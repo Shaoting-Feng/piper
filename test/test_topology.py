@@ -20,7 +20,7 @@ def test_standby_ranks_follow_trainers() -> None:
     assert topo.num_trainers == 2
     assert topo.world_size == 3
     assert topo.standby_ranks == [2]
-    assert topo.groups() == {"dp": [[0, 1]], "pp": [[0], [1]]}
+    assert topo.groups() == {"dp": [[0, 1]], "pp": []}
 
 
 def test_from_schedule_reads_degrees(tmp_path) -> None:

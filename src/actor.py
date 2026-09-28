@@ -1,7 +1,10 @@
 import ray
+import threading
 import torch
+import hashlib
 import os
 import re
+import time
 from typing import Any
 import gc
 from torch.autograd.graph import set_warn_on_accumulate_grad_stream_mismatch
@@ -32,6 +35,11 @@ def _disable_functorch_donated_buffers() -> None:
     config.donated_buffer = False
 
 
+def _param_seed(name: str) -> int:
+    """Generator seed for the parameter with FX placeholder ``name``."""
+    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little") >> 1
+
+
 def _actor_options(config, pg, bundle_index: int) -> dict:
     """Ray ``options`` for one PiperActor from an ``ActorConfig`` and placement bundle."""
     nsight_env = {"nsight": {
@@ -51,6 +59,8 @@ def _actor_options(config, pg, bundle_index: int) -> dict:
     }
     if get_device().accelerator_resource == "GPU":
         options["num_gpus"] = config.num_gpus
+    if config.tensor_transport:
+        options["enable_tensor_transport"] = True
     if pg is not None:
         options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
             placement_group=pg,
@@ -93,7 +103,8 @@ class PiperActor:
         self.use_inductor = bool(config.use_inductor)
         if self.use_inductor:
             _disable_functorch_donated_buffers()
-        dp_rank, pp_rank = slot if slot is not None else (-1, 0)
+        # A standby keeps its global rank as dp_rank so PIPER_FAULT can still name it.
+        dp_rank, pp_rank = slot if slot is not None else (global_rank, 0)
         self.runtime = RuntimeState(
             pp_rank=pp_rank,
             dp_rank=dp_rank,
@@ -134,6 +145,11 @@ class PiperActor:
             self.compute,
             self.logger,
         )
+
+        # An aborted collective would otherwise commit garbage gradients.
+        self.dag_executor._cpu_sync_allreduce = topology.num_standby > 0
+        self._abort_done = threading.Event()
+        self._promotion_tensors = None
 
         # Non-trainable constant tensor attributes (e.g. freqs_cis, mask) pushed
         # from the driver before loading so _load_stage can fill them in
@@ -262,6 +278,176 @@ class PiperActor:
                 self.runtime.pp_hi_lo = hi_lo
         self.logger.debug(f"Actor {rank} joined process groups")
 
+    def abort_comms(self):
+        """Abort this actor's dp/ep communicators (fencing during promotion)."""
+        from torch.distributed.distributed_c10d import _abort_process_group
+
+        # Fence before the abort releases any kernel, so the executor refuses
+        # the poisoned step unless fence() saw its gradients complete.
+        self.dag_executor.fence()
+        aborted = []
+        if self.runtime.dp_group is not None:
+            _abort_process_group(self.runtime.dp_group)
+            aborted.append("dp_group")
+        if self.runtime.ep_group is not None:
+            _abort_process_group(self.runtime.ep_group)
+            aborted.append("ep_group")
+        self.logger.info(f"abort_comms: aborted {aborted}")
+        self._abort_done.set()
+        return aborted
+
+    def regroup(self, new_ranks):
+        """Replace the dp/ep groups with fresh ones over ``new_ranks`` and lift the fence.
+
+        new_ranks: sorted global ranks of the members; only members call this.
+        """
+        new_ranks = list(new_ranks)
+        if self.dag_executor._fenced_from is not None:
+            # A new comm deadlocks while an abort is still in flight in this process.
+            if not self._abort_done.wait(timeout=120):
+                raise RuntimeError("abort_comms did not finish within 120s")
+            get_device().synchronize()
+        backend = get_device().dist_backend
+        self.logger.info(f"regroup: creating groups ranks={new_ranks}")
+        new_dp = dist.new_group(ranks=new_ranks, backend=backend, use_local_synchronization=True)
+        new_ep = dist.new_group(ranks=new_ranks, backend=backend, use_local_synchronization=True)
+        self.runtime.dp_group = new_dp
+        self.runtime.ep_group = new_ep
+        self.runtime.dp_group_ranks = new_ranks
+        self.dag_executor._fenced_from = None
+        self._abort_done.clear()
+        self.logger.info(f"regroup: joined ranks={new_ranks}")
+        return new_ranks
+
+    def get_last_committed(self):
+        """Last iteration whose optimizer update fully committed (-1 if none)."""
+        return self.dag_executor._last_committed
+
+    def _promotion_state_tensors(self):
+        """Flat list of param + Adam state tensors transferred at promotion.
+
+        Survivor: the tensors to send. Standby: the buffers to receive
+        into; its missing Adam state is created as zeros.
+        """
+        if self._promotion_tensors is not None:
+            return self._promotion_tensors
+        if self.stages.zero_managed_ubids:
+            raise NotImplementedError(
+                "standby weight transfer supports pure DP only"
+            )
+        tensors = []
+        for _, bucket in self.stages.buckets.items():
+            opt = bucket.optimizer
+            if opt is None:
+                continue
+            for p in bucket.trainable_params():
+                st = opt.state.get(p)
+                if st is None:
+                    # Fused Adam creates state lazily on first step; the
+                    # standby never steps, so materialize matching zeros.
+                    st = {
+                        "step": torch.zeros((), dtype=torch.float32, device=p.device),
+                        "exp_avg": torch.zeros_like(p),
+                        "exp_avg_sq": torch.zeros_like(p),
+                    }
+                    opt.state[p] = st
+                # Flat because set_target_for_ref matches by position.
+                tensors.extend([p.detach(), st["exp_avg"], st["exp_avg_sq"], st["step"]])
+        self._promotion_tensors = tensors
+        return tensors
+
+    def prepare_promotion_state(self):
+        """Materialize optimizer state and pre-register it with NIXL."""
+        tensors = self._promotion_state_tensors()
+        try:
+            for t in tensors:
+                ray.experimental.register_nixl_memory(t)
+        except Exception:
+            self.logger.exception(
+                "register_nixl_memory failed; registration will happen at transfer time"
+            )
+        return len(tensors)
+
+    def warm_stages(self):
+        """Compile every loaded stage ahead of its first real step."""
+        # torch.compile is lazy: without this a promoted standby compiles
+        # inside the recovery window.
+        t0 = time.perf_counter()
+        for bucket in self.stages.buckets.values():
+            args = list(bucket.forward_args)
+            for i, (shape, dtype, requires_grad) in zip(
+                bucket.input_idxs, bucket.forward_input_meta
+            ):
+                # Real boundary activations require grad whatever the traced
+                # meta says; a mismatch would recompile at promotion.
+                args[i] = torch.zeros(
+                    shape, dtype=dtype, device=self.runtime.device,
+                    requires_grad=requires_grad or dtype.is_floating_point,
+                )
+            out = bucket.forward_fn(args)
+            outs = [
+                t for t in (out if isinstance(out, (tuple, list)) else [out])
+                if isinstance(t, torch.Tensor) and t.requires_grad
+            ]
+            params = [bucket.forward_args[i] for i in bucket.trainable_param_idxs]
+            if outs and params:
+                # Not .backward(): params' .grad must stay untouched.
+                torch.autograd.grad(
+                    outs, params, [torch.zeros_like(t) for t in outs],
+                    allow_unused=True,
+                )
+        self.logger.info(f"warm_stages: done in {time.perf_counter() - t0:.2f}s")
+
+    def make_state_ref(self):
+        """Publish params + optimizer state + resume iteration via NIXL RDT.
+
+        Returns a ray.put-created ObjectRef (borrowable, see ray#59644).
+        """
+        state = {
+            "next_iter": self.dag_executor._last_committed + 1,
+            "tensors": self._promotion_state_tensors(),
+        }
+        return ray.put(state, _tensor_transport="nixl")
+
+    def load_state(self, refs):
+        """Receive another actor's state directly into this actor's buffers.
+
+        refs: single-element list holding the state ObjectRef.
+        """
+        ref, = refs
+        targets = self._promotion_state_tensors()
+        ray.experimental.set_target_for_ref(ref, targets)
+        state = ray.get(ref)
+        next_iter = int(state["next_iter"])
+        self.dag_executor._last_committed = next_iter - 1
+        return next_iter
+
+    def save_checkpoint(self, path):
+        """Write params, optimizer state and the resume iteration to a file.
+
+        path: destination file.
+        """
+        state = {
+            "next_iter": self.dag_executor._last_committed + 1,
+            "tensors": [t.cpu() for t in self._promotion_state_tensors()],
+        }
+        # A restart must never find a partially written file.
+        torch.save(state, path + ".tmp")
+        os.replace(path + ".tmp", path)
+
+    def load_checkpoint(self, path):
+        """Load a save_checkpoint file into this actor; returns the iteration to resume at.
+
+        path: checkpoint file.
+        """
+        state = torch.load(path)
+        with torch.no_grad():
+            for dst, src in zip(self._promotion_state_tensors(), state["tensors"]):
+                dst.copy_(src)
+        next_iter = int(state["next_iter"])
+        self.dag_executor._last_committed = next_iter - 1
+        return next_iter
+
     def _derive_dag_bucket_modes(self, training_dag: Any) -> None:
         self.stages.param_sharded_ubids = set()
         self.stages.grad_sharded_ubids = set()
@@ -349,7 +535,6 @@ class PiperActor:
         )
 
         g = torch.Generator(device=self.runtime.device)
-        g.manual_seed(1000 * self.runtime.global_rank + stage_id)
 
         first_gm = None
 
@@ -382,11 +567,11 @@ class PiperActor:
             shared_placeholder_names = list(
                 bd.get("shared_placeholder_names", bd.get("placeholder_names", []))
             )
-            # Extract FX placeholder names for each param index.
-            bucket.param_names = [
+            slot_names = [
                 shared_placeholder_names[i] if i < len(shared_placeholder_names) else f"ubid{ubid}_p{i}"
-                for i in b_param_idxs
+                for i in range(len(forward_args))
             ]
+            bucket.param_names = [slot_names[i] for i in b_param_idxs]
 
             # Save input tensor metadata for pre-allocating FWD recv buffers.
             # Stored as a list of (shape, dtype, requires_grad) in input-slot order.
@@ -409,6 +594,8 @@ class PiperActor:
                 t = torch.empty(arg.shape, dtype=arg.dtype, device=self.runtime.device)
                 if arg.requires_grad:
                     t.requires_grad_(True)
+                    # Replicas and shards of one parameter must draw identical values.
+                    g.manual_seed(_param_seed(slot_names[i]))
                     torch.nn.init.normal_(t, mean=0.0, std=0.02, generator=g)
                 else:
                     # Non-trainable slot: try to fill from const attrs (freqs_cis, mask, …)
@@ -725,8 +912,15 @@ class PiperActor:
             training_dag.nodes[uid] for uid in _serial_topological_order(training_dag)
         ]
 
-    def run_step(self, it: int, loss_fn):
-        """Run iteration ``it`` of the loaded program and return its losses."""
+    def run_step(self, it: int, loss_fn, inputs=None, labels=None):
+        """Run iteration ``it`` of the loaded program and return its losses.
+
+        inputs, labels: this iteration's data, for the ranks that consume them.
+        """
+        if inputs is not None:
+            self.load_input(inputs)
+        if labels is not None:
+            self.load_labels(labels)
         # Debug-only: expose the iteration counter for E2E fault injection.
         self.dag_executor._iter_count = it
         # Mark the entire iteration boundary for the NVTX timeline.

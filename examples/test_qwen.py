@@ -7,7 +7,7 @@ import time
 import os
 
 from src.compile import compile
-from src.config import ActorConfig
+from src.config import ActorConfig, FTConfig
 from src.driver import setup
 from src.schedule import load_schedule_info
 from src.state import create_logger, LOG_LEVEL
@@ -106,7 +106,7 @@ def main(args):
     batch_size = args.batch_size
 
     config = create_qwen3_config(args.model)
-    topology = Topology.from_schedule(args.schedule_directives_file)
+    topology = Topology.from_schedule(args.schedule_directives_file, num_standby=args.num_standby)
     num_stages = int(load_schedule_info(args.schedule_directives_file)["num_stages"])
 
     x, _ = _make_batch(args.data_seed, 0, 0, topology.dp, batch_size, args.seq_len)
@@ -127,47 +127,64 @@ def main(args):
         dtype=getattr(torch, args.model_dtype),
         visualize_dag=args.viz,
     )
+    # Fault injection (PIPER_FAULT=<point>:<iter>:<dp_rank>) is read on the actors.
+    env_vars = {k: os.environ[k] for k in ("PIPER_FAULT",) if k in os.environ}
     rt = setup(
         topology,
+        ft=FTConfig(
+            recovery=args.recovery,
+            ckpt_dir=args.ckpt_dir,
+            ckpt_interval=args.ckpt_interval,
+        ),
         actors=ActorConfig(
             use_inductor=args.use_inductor,
             nsight=args.nsight,
             temp_dir=args.temp_dir,
             pp_outer=args.pp_outer,
+            env_vars=env_vars,
         ),
     )
     rt.load(program, torch.optim.Adam, const_attrs={"rope_cache": rope_cache})
 
     del x
 
-    actors = rt.actors
-
+    total = args.warmup + args.iters
+    it = rt.restore()
+    if it:
+        logger.info(f"resuming from checkpoint at iteration {it}")
     logger.info(f"Running {args.warmup} warmup iterations")
     last_warmup_time = None
-    for it in range(args.warmup):
-        t0 = time.perf_counter()
-        _train_step(rt, args, it, loss_fn)
-        last_warmup_time = time.perf_counter() - t0
-        if args.iteration_sleep > 0:
-            time.sleep(args.iteration_sleep)
-
-    # No step_timeout during warmup; afterward 5x the last warmup step
-    # (~steady step time), floored at 5s.
-    if last_warmup_time is not None:
-        rt.ft.step_timeout = max(5.0, 5 * last_warmup_time)
-
-    logger.info(f"Running {args.iters} timed iterations")
-    ray.get([actor.reset_peak_memory.remote() for actor in actors.values()])
     iter_times = []
-    for it in range(args.warmup, args.warmup + args.iters):
+    while it < total:
         start = time.perf_counter()
-        _train_step(rt, args, it, loss_fn)
-        end = time.perf_counter()
-        iter_times.append(end - start)
-        logger.info(f"step_time={iter_times[-1]:.3f}s")
+        result = _train_step(rt, args, it, loss_fn)
+        elapsed = time.perf_counter() - start
+        if result.recovery is not None:
+            r = result.recovery
+            logger.info(
+                f"recovered from failure of slot {r.failed} ({r.kind}) with standby rank "
+                f"{r.replacement_rank} via {r.strategy} in {r.seconds:.2f}s; "
+                f"resuming at iteration {r.next_iter} (was at {it})"
+            )
+            it = result.next_iter
+            continue
+        if it < args.warmup:
+            last_warmup_time = elapsed
+        else:
+            iter_times.append(elapsed)
+            logger.info(f"step_time={elapsed:.3f}s")
+        it = result.next_iter
+        if it == args.warmup:
+            # No step_timeout during warmup; afterward 5x the last warmup step
+            # (~steady step time), floored at 5s.
+            if last_warmup_time is not None:
+                rt.ft.step_timeout = max(5.0, 5 * last_warmup_time)
+            logger.info(f"Running {args.iters} timed iterations")
+            ray.get([actor.reset_peak_memory.remote() for actor in rt.actors.values()])
         if args.iteration_sleep > 0:
             time.sleep(args.iteration_sleep)
 
+    actors = rt.actors
     peak_memory_stats = ray.get(
         [actor.get_and_reset_peak_memory_stats.remote() for actor in actors.values()]
     )
@@ -214,6 +231,15 @@ def parse_args(argv=None):
     parser.add_argument("--model-dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--data-seed", type=int, default=0,
                         help="Seed of the synthetic sharded dataset")
+    parser.add_argument("--num-standby", type=int, default=0,
+                        help="Standby ranks to reserve (one extra GPU each); requires pp == 1")
+    parser.add_argument("--ckpt-dir", default=None,
+                        help="Directory for periodic checkpoints; a run resumes from it when one exists")
+    parser.add_argument("--ckpt-interval", type=int, default=25,
+                        help="Iterations between checkpoints")
+    parser.add_argument("--recovery", choices=["transfer", "checkpoint"], default="transfer",
+                        help="State a promoted standby starts from: the survivor's live "
+                             "state (transfer) or the last checkpoint (checkpoint)")
     parser.add_argument('--activation-checkpointing', action='store_true', default=False)
     parser.add_argument("--nsight", action="store_true", default=False,
                         help="Whether to use Nsight Systems for tracing")
@@ -257,4 +283,7 @@ def parse_args(argv=None):
         default=3,
         help="Number of iterations to run under the PyTorch profiler.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.recovery == "checkpoint" and not args.ckpt_dir:
+        parser.error("--recovery checkpoint requires --ckpt-dir")
+    return args

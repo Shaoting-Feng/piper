@@ -62,5 +62,10 @@ class Topology:
         return [[self.rank(dp, pp) for dp in range(self.dp)] for pp in range(self.pp)]
 
     def groups(self) -> dict[str, list[list[int]]]:
-        """Explicit membership of every process group ``join_groups`` must create."""
-        return {"dp": self.dp_groups(), "pp": self.pp_groups()}
+        """Explicit membership of every multi-rank process group ``join_groups`` must create."""
+        # torch registers a group only on its members, so single-rank groups
+        # would leave ranks disagreeing on the count that names later groups.
+        return {
+            "dp": [g for g in self.dp_groups() if len(g) > 1],
+            "pp": [g for g in self.pp_groups() if len(g) > 1],
+        }

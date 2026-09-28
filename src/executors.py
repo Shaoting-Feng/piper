@@ -492,6 +492,15 @@ class DagExecutor:
     # 0-based iteration counter, set by PiperActor.run_step each call.
     # Debug-only: consumed by _maybe_inject_fault for E2E fault injection.
     _iter_count: int = 0
+    # Commit marker: optimizer update fully applied (recovery redoes +1).
+    _last_committed: int = -1
+    # First iteration the fence refuses, None while unfenced.
+    _fenced_from: int | None = None
+    # (iteration, all-reduce events) published at UPD for fence() to query.
+    # A stale entry is harmless: its iteration is older than the current one.
+    _ar_pending: tuple[int, tuple] | None = None
+    # Standby mode only; off by default to keep the baseline hot path unchanged.
+    _cpu_sync_allreduce: bool = False
 
     def __post_init__(self):
         self.dev = get_device()
@@ -570,6 +579,17 @@ class DagExecutor:
             tensor = tensor.contiguous()
         return tensor
 
+    def fence(self) -> None:
+        """Raise the fence; must run before the communicator abort."""
+        pending = self._ar_pending
+        complete = pending is not None and all(
+            evt is None or evt.query() for evt in pending[1]
+        )
+        self._fenced_from = pending[0] + 1 if complete else self._iter_count
+        self.logger.info(
+            f"fenced: refusing optimizer steps from iteration {self._fenced_from}"
+        )
+
     def run(
         self,
         dag: Any,
@@ -582,6 +602,12 @@ class DagExecutor:
         """Run one iteration of the loaded TrainingDAG."""
         assert dag is not None, "load_program() must be called before run_step()"
         assert sorted_dag_nodes is not None, "load_program() must initialize sorted node order"
+        if self._fenced_from is not None:
+            raise RuntimeError(
+                "fenced: communicators aborted, iteration refused"
+            )
+        # A fenced or failed attempt may have left its microbatch losses behind.
+        loss_buffer.clear()
 
         self.params.drain_pending_frees()
         debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
@@ -993,17 +1019,36 @@ class DagExecutor:
     def _update(self, stream_ctx: AbstractContextManager, loss_buffer: list):
         self.params.drain_pending_frees()
         if self.params.has_zero_shard_optimizers():
+            if self._fenced_from is not None:
+                raise RuntimeError(
+                    "fenced during collective; ZeRO optimizer step refused"
+                )
             _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
             self.params.step_zero_shard_optimizers(stream_ctx, self.events.reduce_scatter)
             losses = list(loss_buffer)
             loss_buffer.clear()
             self.dev.synchronize()
+            self._last_committed = self._iter_count
             return [float(l) for l in losses]
 
-        for ar_evt in self.events.all_reduce.values():
-            self.dev.wait_event(stream_ctx, ar_evt)
+        if self._cpu_sync_allreduce:
+            self._ar_pending = (
+                self._iter_count,
+                tuple(self.events.all_reduce.values()),
+            )
+            for ar_evt in self._ar_pending[1]:
+                if ar_evt is not None:
+                    ar_evt.synchronize()
+        else:
+            for ar_evt in self.events.all_reduce.values():
+                self.dev.wait_event(stream_ctx, ar_evt)
 
         _maybe_inject_fault("upd", self._iter_count, self.runtime.dp_rank)
+        if self._fenced_from is not None and self._iter_count >= self._fenced_from:
+            raise RuntimeError(
+                "fenced during gradient all-reduce; optimizer step refused "
+                f"(last_committed={self._last_committed})"
+            )
         for ubid, bucket in self.stages.buckets.items():
             if bucket.optimizer is None:
                 continue
@@ -1016,6 +1061,8 @@ class DagExecutor:
         loss_buffer.clear()
 
         self.dev.synchronize()
+        # Only after synchronize returns are the weight updates provably applied.
+        self._last_committed = self._iter_count
 
         return {
             "losses": [float(l) for l in losses],
