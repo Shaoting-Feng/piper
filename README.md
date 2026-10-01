@@ -44,6 +44,18 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+Piper's NCCL backend needs our NCCL fork, which adds `ncclWarmup`. Build it,
+build Piper's binding against it, and launch with the fork preloaded so that
+torch uses it instead of the stock `nvidia-nccl-cu12`:
+
+```bash
+git clone https://github.com/Shaoting-Feng/nccl.git
+make -C nccl -j src.build                # NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90" builds faster for one GPU arch
+NCCL_HOME=$PWD/nccl python -m pip install -e .
+export LD_PRELOAD=$PWD/nccl/build/lib/libnccl.so.2   # needed on every launch
+python -c "import torch, src._nccl"      # fails with 'undefined symbol: ncclWarmup' if LD_PRELOAD is missing
+```
+
 If you do not already have Python 3.10 locally:
 
 ```bash

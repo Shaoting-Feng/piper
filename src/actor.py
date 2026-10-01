@@ -250,6 +250,12 @@ class PiperActor:
 
         dev = get_device()
         self.runtime.device = dev.set_device(self.runtime.global_rank)
+        if dev.dist_backend == "nccl":
+            from ._nccl import warmup
+
+            # NCCL's once-per-process setup (kernel load, NVML, net plugins)
+            # would otherwise land on a promoted standby's first collective.
+            warmup(torch.cuda.current_device())
         if self.runtime.world_size <= 1:
             return
 
