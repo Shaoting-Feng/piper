@@ -83,7 +83,9 @@ def _spawn_actor(slot, global_rank, topology, config, pg=None, bundle_index=0):
     )
 
 
-@ray.remote
+# abort_comms runs on its own thread so it can interrupt a run_step blocked in NCCL;
+# everything else stays on one thread because the CUDA current device is thread-local.
+@ray.remote(concurrency_groups={"control": 1})
 class PiperActor:
     def __init__(self, slot, global_rank, topology, config):
         """
@@ -284,6 +286,7 @@ class PiperActor:
                 self.runtime.pp_hi_lo = hi_lo
         self.logger.debug(f"Actor {rank} joined process groups")
 
+    @ray.method(concurrency_group="control")
     def abort_comms(self):
         """Abort this actor's dp/ep communicators (fencing during promotion)."""
         from torch.distributed.distributed_c10d import _abort_process_group

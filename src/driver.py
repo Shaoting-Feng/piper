@@ -83,11 +83,10 @@ def _resolve_actor_config(topology: Topology, config: ActorConfig) -> ActorConfi
         return config
     if topology.pp != 1 or config.pp_outer:
         raise NotImplementedError("standby ranks require pp == 1 and pp_inner placement")
-    # abort_comms must run while run_step blocks; the NCCL watchdog would
-    # answer the intentional abort by tearing down every communicator.
+    # The NCCL watchdog would answer the intentional abort by tearing down
+    # every communicator.
     return dataclasses.replace(
         config,
-        max_concurrency=max(config.max_concurrency, 2),
         tensor_transport=True,
         env_vars={**config.env_vars, "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"},
     )
