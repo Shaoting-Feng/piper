@@ -140,7 +140,19 @@ class CudaDevice(Device):
         torch.cuda.synchronize()
 
     def set_device(self, global_rank: int) -> str:
-        device = f"cuda:{global_rank % torch.cuda.device_count()}"
+        noset = os.environ.get("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "0").lower() in ("1", "true")
+        if noset:
+            # Ray left every GPU visible, so pick the one it reserved for us.
+            # get_gpu_ids names the physical card; torch indexes into the
+            # CUDA_VISIBLE_DEVICES the launcher itself inherited.
+            import ray
+
+            gpu_id = str(ray.get_gpu_ids()[0])
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            index = visible.split(",").index(gpu_id) if visible else int(gpu_id)
+        else:
+            index = global_rank % torch.cuda.device_count()
+        device = f"cuda:{index}"
         torch.cuda.set_device(device)
         return device
 
